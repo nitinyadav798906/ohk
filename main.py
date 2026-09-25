@@ -1,9 +1,12 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import re
-from typing import Optional
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Optional, List, Dict
 from urllib.parse import unquote, urljoin
 
 from bs4 import BeautifulSoup
@@ -17,20 +20,49 @@ from telegram.ext import (
     filters,
 )
 
+# Logging Setup
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # ------------------------------------------------------------------
-# Render Environment Variables se Token Automatically Read hoga
-BOT_TOKEN = "7673015455:AAFrMbFSEpPXV33WMUud-bRFPUxvzN7znBk"
+# Token & Headers Setup
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7673015455:AAFrMbFSEpPXV33WMUud-bRFPUxvzN7znBk")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
-    "Referer": "https://www.google.com/",
+    "Referer": "https://xhaccess.com/",
 }
+
+# User Sessions for Persistent Logins
+USER_SESSIONS: Dict[int, httpx.AsyncClient] = {}
 # ------------------------------------------------------------------
 
+# Dummy HTTP Server to pass Render Port Scanning
+class DummyPortServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Telegram Bot is Running smoothly!")
+    
+    def log_message(self, format, *args):
+        return
+
+def run_dummy_server():
+    port = int(os.getenv("PORT", 8080))
+    try:
+        server = HTTPServer(('0.0.0.0', port), DummyPortServer)
+        print(f"🌐 Fake HTTP Server active on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"HTTP Server failure: {e}")
+
+
 def process_tpl_link(hls_link: str) -> str:
-    """_TPL_ wale template links ko best resolution se replace karta hai."""
     try:
         if "_TPL_" not in hls_link:
             return hls_link
@@ -46,33 +78,72 @@ def process_tpl_link(hls_link: str) -> str:
         return hls_link
 
 
-async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optional[dict]:
-    """Single Video Page se .m3u8 ya .mp4 link extract karta hai."""
+async def get_user_client(user_id: int) -> httpx.AsyncClient:
+    """Creates or returns an active HTTP client for the user."""
+    if user_id not in USER_SESSIONS:
+        USER_SESSIONS[user_id] = httpx.AsyncClient(
+            headers=HEADERS, 
+            verify=False, 
+            follow_redirects=True, 
+            timeout=20.0
+        )
+    return USER_SESSIONS[user_id]
+
+
+async def login_to_xhaccess(user_id: int, username: str, password: str) -> bool:
+    """Logs into xhaccess.com and keeps session cookies active."""
+    client = await get_user_client(user_id)
+    login_url = "https://xhaccess.com/login"
+    
     try:
-        response = await client.get(video_url, timeout=15.0)
+        resp = await client.get(login_url)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        csrf_token = None
+        csrf_input = soup.find('input', {'name': '_token'}) or soup.find('input', {'name': 'csrf_token'})
+        if csrf_input:
+            csrf_token = csrf_input.get('value')
+
+        payload = {
+            "login[username]": username,
+            "login[password]": password,
+        }
+        if csrf_token:
+            payload["_token"] = csrf_token
+
+        post_resp = await client.post(login_url, data=payload)
+        
+        if post_resp.status_code == 200 and ("logout" in post_resp.text.lower() or "my/" in post_resp.text.lower()):
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Login failure for user {user_id}: {e}")
+        return False
+
+
+async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optional[dict]:
+    try:
+        response = await client.get(video_url)
         if response.status_code != 200:
             return None
 
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Title Extractions
         title = "Unknown Title"
         if soup.select_one('h1'):
             title = soup.select_one('h1').get_text(strip=True)
-        elif soup.title:
+        elif soup.title and soup.title.string:
             title = soup.title.string.replace(" - xHamster.com", "").replace(" - xhaccess.com", "").strip()
 
         stream_link = None
         file_type = None
 
-        # ------------------ 1. SEARCH FOR .M3U8 (HLS) ------------------
-        # Method A: Preload tag
+        # 1. HLS (.m3u8) Search
         preload = soup.find('link', rel='preload', attrs={'as': 'fetch'})
         if preload and preload.get('href') and '.m3u8' in preload.get('href'):
             stream_link = preload.get('href')
             file_type = "M3U8"
 
-        # Method B: window.initials JSON Script
         if not stream_link:
             script = soup.find('script', id='initials-script')
             if script and script.string:
@@ -89,7 +160,7 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
                 except Exception:
                     pass
 
-        # ------------------ 2. SEARCH FOR .MP4 (DIRECT LINK) ------------------
+        # 2. MP4 Search
         if not stream_link:
             video_tag = soup.find('video')
             if video_tag:
@@ -102,7 +173,7 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
                         stream_link = source.get('src')
                         file_type = "MP4"
 
-        # ------------------ 3. REGEX FALLBACK SEARCH ------------------
+        # 3. Fallback Regex
         if not stream_link:
             regex_hls = r'(https.*?\.m3u8[^"\s]*)'
             regex_mp4 = r'(https.*?\.mp4[^"\s]*)'
@@ -121,7 +192,6 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
                         file_type = "MP4"
                         break
 
-        # Result Payload
         if stream_link:
             final_link = process_tpl_link(stream_link) if file_type == "M3U8" else stream_link
             return {
@@ -131,22 +201,21 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
                 "download_link": final_link
             }
 
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Error scraping link from {video_url}: {e}")
     return None
 
 
-async def scrape_xhaccess(url: str, pages: int = 1):
-    """Category/Search ya Direct Video Link ko process karta hai."""
+async def scrape_xhaccess(client: httpx.AsyncClient, url: str, pages: int = 1) -> List[dict]:
     base_domain = "https://xhaccess.com"
 
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
+    try:
         # Direct Video URL
-        if "/videos/" in url:
+        if "/videos/" in url and not url.rstrip('/').endswith('/videos'):
             result = await extract_video_link(client, url)
             return [result] if result else []
 
-        # Multi-page Crawling
+        # Category, Folder, Favorites or Watch Later Pages
         current_url = url
         visited = set()
         all_video_urls = set()
@@ -157,26 +226,31 @@ async def scrape_xhaccess(url: str, pages: int = 1):
             visited.add(current_url)
 
             try:
-                response = await client.get(current_url, timeout=15.0)
+                response = await client.get(current_url)
                 if response.status_code != 200:
                     break
 
                 soup = BeautifulSoup(response.text, 'html.parser')
-                video_links = soup.select('a.video-thumb__image-container')
+                video_links = soup.select('a.video-thumb__image-container, a[href*="/videos/"]')
+                
                 for a in video_links:
                     href = a.get('href', '')
-                    if "/videos/" in href:
+                    if "/videos/" in href and not href.endswith('/videos/'):
                         all_video_urls.add(urljoin(base_domain, href))
 
-                next_btn = soup.select_one('a[rel="next"]')
+                next_btn = soup.select_one('a[rel="next"], a.pagination__next')
                 current_url = urljoin(base_domain, next_btn.get('href')) if next_btn else None
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error pagination on {current_url}: {e}")
                 break
 
-        # Parallel Scraping
         tasks = [extract_video_link(client, v_url) for v_url in all_video_urls]
         results = await asyncio.gather(*tasks)
         return [res for res in results if res is not None]
+
+    except Exception as e:
+        logger.error(f"Global Scraper Error: {e}")
+        return []
 
 
 # ------------------------------------------------------------------
@@ -185,36 +259,57 @@ async def scrape_xhaccess(url: str, pages: int = 1):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **Namaste!**\n\n"
-        "Mujhe kisi bhi **xhaccess.com** page ka URL bhejein.\n"
-        "Main video ke **.m3u8** (HLS) aur **.mp4** links scrap karke **.txt** aur **.html** file me bhej dunga."
+        "👋 **Namaste! Multi-Functional Scraper Ready.**\n\n"
+        "1. **Normal Scrape:** Direct xhaccess video ya category URL bhejein.\n"
+        "2. **Login Account:** `/login <username> <password>` bhej kar login karein.\n"
+        "3. **Folders Scrape:** Login ke baad Watch Later, Favorites ya Saved Playlists URL bhej kar poora folder extract karein."
     )
 
 
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Usage: `/login <username> <password>`")
+        return
+
+    username = context.args[0]
+    password = context.args[1]
+
+    status = await update.message.reply_text("🔑 **Logging into xhaccess.com...**")
+    success = await login_to_xhaccess(user_id, username, password)
+
+    if success:
+        await status.edit_text("✅ **Login Successful!** Ab aap apne Watch Later/Favorites URL bhej kar scrape kar sakte hain.")
+    else:
+        await status.edit_text("❌ **Login Fail hua!** Credentials check karein ya bina login ke direct URL scrap karein.")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
     text = update.message.text.strip()
 
     if not ("xhaccess.com" in text or "xhamster" in text):
-        await update.message.reply_text("❌ Kripya ek valid **xhaccess.com** link bhejein.")
+        await update.message.reply_text("❌ Kripya ek valid **xhaccess.com** URL bhejein.")
         return
 
-    status_msg = await update.message.reply_text("🔎 **Scraping shuru ho gayi hai, kripya thoda intezar karein...**")
-
-    results = await scrape_xhaccess(text, pages=1)
+    status_msg = await update.message.reply_text("🔎 **Scraping shuru ho gayi hai, thoda intezar karein...**")
+    
+    client = await get_user_client(user_id)
+    results = await scrape_xhaccess(client, text, pages=1)
 
     if not results:
         await status_msg.edit_text("❌ Koi bhi `.m3u8` ya `.mp4` video link nahi mil saka.")
         return
 
-    await status_msg.edit_text(f"✅ Total **{len(results)}** videos milli! File taiyar ki ja rahi hai...")
+    await status_msg.edit_text(f"✅ Total **{len(results)}** videos milli! Files generate ho rahi hain...")
 
     # 1. TXT FILE
-    txt_content = f"--- Scraped Links ({len(results)} videos) ---\n\n"
+    txt_content = f"--- Scraped Video Links ({len(results)} items) ---\n\n"
     for idx, item in enumerate(results, 1):
         txt_content += f"{idx}. Title: {item['title']}\n"
         txt_content += f"   Format: [{item['type']}]\n"
-        txt_content += f"   Page URL: {item['url']}\n"
-        txt_content += f"   Stream/Download Link: {item['download_link']}\n\n"
+        txt_content += f"   Source URL: {item['url']}\n"
+        txt_content += f"   Direct Stream Link: {item['download_link']}\n\n"
 
     txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
     txt_bytes.name = "scraped_links.txt"
@@ -255,21 +350,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html_bytes = io.BytesIO(html_content.encode('utf-8'))
     html_bytes.name = "scraped_links.html"
 
-    # Send Documents to User
-    await update.message.reply_document(document=txt_bytes, caption="📁 **TXT File Format**")
-    await update.message.reply_document(document=html_bytes, caption="🌐 **HTML File Format**")
+    # Send Documents
+    await update.message.reply_document(document=txt_bytes, caption="📁 **TXT Format Result**")
+    await update.message.reply_document(document=html_bytes, caption="🌐 **HTML Format Result**")
 
     await status_msg.delete()
 
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling update:", exc_info=context.error)
+
+
 def main():
     if not BOT_TOKEN:
-        print("❌ ERROR: BOT_TOKEN Environment Variable nahi mila!")
+        print("❌ ERROR: BOT_TOKEN missing!")
         return
 
+    # Start Fake Server for Render Port Check
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("login", login_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(global_error_handler)
 
     print("🤖 Bot start ho chuka hai!")
     app.run_polling()
