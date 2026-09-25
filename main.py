@@ -6,7 +6,7 @@ import os
 import re
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Set
 from urllib.parse import unquote, urljoin
 
 from bs4 import BeautifulSoup
@@ -28,8 +28,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
-# Token & Headers Setup
+# CONFIGURATION & ACCESS CONTROL
+# ------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7673015455:AAFrMbFSEpPXV33WMUud-bRFPUxvzN7znBk")
+
+# Yahan apna Telegram Numeric ID dalein (e.g., 123456789)
+# ID janne ke liye Telegram par @userinfobot se message karein.
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1714266885")) 
+
+# Memory Storage for Allowed Users & HTTP Sessions
+ALLOWED_USERS: Set[int] = {ADMIN_ID}
+USER_SESSIONS: Dict[int, httpx.AsyncClient] = {}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
@@ -37,17 +46,15 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
     "Referer": "https://xhaccess.com/",
 }
-
-# User Sessions for Persistent Logins
-USER_SESSIONS: Dict[int, httpx.AsyncClient] = {}
 # ------------------------------------------------------------------
 
-# Dummy HTTP Server to pass Render Port Scanning
+
+# Dummy HTTP Server (Render Port Binding Bypass)
 class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Telegram Bot is Running smoothly!")
+        self.wfile.write(b"Admin-Protected Scraper Bot Active!")
     
     def log_message(self, format, *args):
         return
@@ -56,10 +63,10 @@ def run_dummy_server():
     port = int(os.getenv("PORT", 8080))
     try:
         server = HTTPServer(('0.0.0.0', port), DummyPortServer)
-        print(f"🌐 Fake HTTP Server active on port {port}")
+        print(f"🌐 Fake HTTP Server running on port {port}")
         server.serve_forever()
     except Exception as e:
-        logger.error(f"HTTP Server failure: {e}")
+        logger.error(f"HTTP Server Exception: {e}")
 
 
 def process_tpl_link(hls_link: str) -> str:
@@ -79,7 +86,6 @@ def process_tpl_link(hls_link: str) -> str:
 
 
 async def get_user_client(user_id: int) -> httpx.AsyncClient:
-    """Creates or returns an active HTTP client for the user."""
     if user_id not in USER_SESSIONS:
         USER_SESSIONS[user_id] = httpx.AsyncClient(
             headers=HEADERS, 
@@ -91,7 +97,6 @@ async def get_user_client(user_id: int) -> httpx.AsyncClient:
 
 
 async def login_to_xhaccess(user_id: int, username: str, password: str) -> bool:
-    """Logs into xhaccess.com and keeps session cookies active."""
     client = await get_user_client(user_id)
     login_url = "https://xhaccess.com/login"
     
@@ -117,7 +122,7 @@ async def login_to_xhaccess(user_id: int, username: str, password: str) -> bool:
             return True
         return False
     except Exception as e:
-        logger.error(f"Login failure for user {user_id}: {e}")
+        logger.error(f"Login failed for user {user_id}: {e}")
         return False
 
 
@@ -160,7 +165,7 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
                 except Exception:
                     pass
 
-        # 2. MP4 Search
+        # 2. MP4 Direct Link Search
         if not stream_link:
             video_tag = soup.find('video')
             if video_tag:
@@ -202,7 +207,7 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
             }
 
     except Exception as e:
-        logger.error(f"Error scraping link from {video_url}: {e}")
+        logger.error(f"Error scraping {video_url}: {e}")
     return None
 
 
@@ -210,12 +215,10 @@ async def scrape_xhaccess(client: httpx.AsyncClient, url: str, pages: int = 1) -
     base_domain = "https://xhaccess.com"
 
     try:
-        # Direct Video URL
         if "/videos/" in url and not url.rstrip('/').endswith('/videos'):
             result = await extract_video_link(client, url)
             return [result] if result else []
 
-        # Category, Folder, Favorites or Watch Later Pages
         current_url = url
         visited = set()
         all_video_urls = set()
@@ -254,20 +257,93 @@ async def scrape_xhaccess(client: httpx.AsyncClient, url: str, pages: int = 1) -
 
 
 # ------------------------------------------------------------------
-# Telegram Handlers
+# TELEGRAM HANDLERS (ADMIN & PERMISSION LOGIC)
 # ------------------------------------------------------------------
 
+def is_authorized(user_id: int) -> bool:
+    """Check constraint for authorized users."""
+    return user_id in ALLOWED_USERS or user_id == ADMIN_ID
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ **Access Denied!** Aapko is bot ko use karne ki permission nahi hai.")
+        return
+
+    admin_info = "\n\n👑 **Admin Commands:**\n`/add <user_id>` - Add user\n`/remove <user_id>` - Remove user\n`/users` - Allowed users list" if user_id == ADMIN_ID else ""
+
     await update.message.reply_text(
-        "👋 **Namaste! Multi-Functional Scraper Ready.**\n\n"
-        "1. **Normal Scrape:** Direct xhaccess video ya category URL bhejein.\n"
+        "👋 **Namaste! Private Scraper Bot Ready.**\n\n"
+        "1. **Normal Scrape:** Direct Video/Category URL bhejein.\n"
         "2. **Login Account:** `/login <username> <password>` bhej kar login karein.\n"
-        "3. **Folders Scrape:** Login ke baad Watch Later, Favorites ya Saved Playlists URL bhej kar poora folder extract karein."
+        "3. **Folders Scrape:** Favorites/Watch Later URL se poora folder extract karein.\n"
+        "4. **Logout:** `/logout` se saved session clear karein."
+        f"{admin_info}"
     )
+
+
+async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to add new users."""
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Sirf **Admin** new users add kar sakta hai.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: `/add <user_id>`")
+        return
+
+    try:
+        new_user = int(context.args[0])
+        ALLOWED_USERS.add(new_user)
+        await update.message.reply_text(f"✅ User `{new_user}` successfully add ho gaya!")
+    except ValueError:
+        await update.message.reply_text("❌ Valid User ID enter karein (Numerical ID).")
+
+
+async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to remove users."""
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Sirf **Admin** users ko remove kar sakta hai.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: `/remove <user_id>`")
+        return
+
+    try:
+        target_user = int(context.args[0])
+        if target_user == ADMIN_ID:
+            await update.message.reply_text("❌ Admin ko remove nahi kiya ja sakta.")
+            return
+
+        if target_user in ALLOWED_USERS:
+            ALLOWED_USERS.remove(target_user)
+            await update.message.reply_text(f"🚫 User `{target_user}` remove ho gaya!")
+        else:
+            await update.message.reply_text("❌ User list me nahi mila.")
+    except ValueError:
+        await update.message.reply_text("❌ Valid User ID enter karein.")
+
+
+async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to list authorized users."""
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+
+    users_str = "\n".join([f"- `{uid}`" for uid in ALLOWED_USERS])
+    await update.message.reply_text(f"📋 **Allowed Users List:**\n{users_str}")
 
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ **Access Denied!**")
+        return
+
     if len(context.args) < 2:
         await update.message.reply_text("❌ Usage: `/login <username> <password>`")
         return
@@ -275,24 +351,37 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = context.args[0]
     password = context.args[1]
 
-    status = await update.message.reply_text("🔑 **Logging into xhaccess.com...**")
+    status = await update.message.reply_text("🔑 **Logging in...**")
     success = await login_to_xhaccess(user_id, username, password)
 
     if success:
-        await status.edit_text("✅ **Login Successful!** Ab aap apne Watch Later/Favorites URL bhej kar scrape kar sakte hain.")
+        await status.edit_text("✅ **Login Successful!** Ab aap private Watch Later/Favorites URL scrape kar sakte hain.")
     else:
-        await status.edit_text("❌ **Login Fail hua!** Credentials check karein ya bina login ke direct URL scrap karein.")
+        await status.edit_text("❌ **Login Failed!** Username/Password check karein.")
+
+
+async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id in USER_SESSIONS:
+        del USER_SESSIONS[user_id]
+        await update.message.reply_text("🔒 Account **Logged Out** aur session cookies delete ho gayi hain.")
+    else:
+        await update.message.reply_text("❌ Aap logged in nahi hain.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ **Access Denied!** You are not allowed to use this bot.")
+        return
+
     text = update.message.text.strip()
 
     if not ("xhaccess.com" in text or "xhamster" in text):
         await update.message.reply_text("❌ Kripya ek valid **xhaccess.com** URL bhejein.")
         return
 
-    status_msg = await update.message.reply_text("🔎 **Scraping shuru ho gayi hai, thoda intezar karein...**")
+    status_msg = await update.message.reply_text("🔎 **Scraping in progress...**")
     
     client = await get_user_client(user_id)
     results = await scrape_xhaccess(client, text, pages=1)
@@ -301,9 +390,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ Koi bhi `.m3u8` ya `.mp4` video link nahi mil saka.")
         return
 
-    await status_msg.edit_text(f"✅ Total **{len(results)}** videos milli! Files generate ho rahi hain...")
+    await status_msg.edit_text(f"✅ Total **{len(results)}** videos milli! File generate ho rahi hain...")
 
-    # 1. TXT FILE
+    # TXT FILE
     txt_content = f"--- Scraped Video Links ({len(results)} items) ---\n\n"
     for idx, item in enumerate(results, 1):
         txt_content += f"{idx}. Title: {item['title']}\n"
@@ -314,7 +403,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
     txt_bytes.name = "scraped_links.txt"
 
-    # 2. HTML FILE
+    # HTML FILE
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -324,13 +413,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     <style>
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
         h2 {{ color: #0088cc; text-align: center; }}
-        .card {{ background: #1e1e1e; padding: 15px; margin-bottom: 15px; border-radius: 8px; border-left: 5px solid #0088cc; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}
+        .card {{ background: #1e1e1e; padding: 15px; margin-bottom: 15px; border-radius: 8px; border-left: 5px solid #0088cc; }}
         .badge {{ background: #0088cc; color: white; padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
         .badge-mp4 {{ background: #28a745; }}
         h3 {{ margin-top: 0; font-size: 18px; color: #ffffff; }}
         a {{ color: #4da6ff; word-break: break-all; text-decoration: none; }}
         a:hover {{ text-decoration: underline; }}
-        .label {{ font-weight: bold; color: #aaa; display: inline-block; width: 110px; }}
     </style>
 </head>
 <body>
@@ -341,8 +429,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         html_content += f"""
     <div class="card">
         <h3>{idx}. {item['title']} <span class="badge {badge_class}">{item['type']}</span></h3>
-        <p><span class="label">Page URL:</span> <a href="{item['url']}" target="_blank">{item['url']}</a></p>
-        <p><span class="label">Media Link:</span> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p>
+        <p><strong>Page:</strong> <a href="{item['url']}" target="_blank">{item['url']}</a></p>
+        <p><strong>Media Link:</strong> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p>
     </div>"""
 
     html_content += "\n</body>\n</html>"
@@ -371,12 +459,18 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
+    # Register Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("login", login_command))
+    app.add_handler(CommandHandler("logout", logout_command))
+    app.add_handler(CommandHandler("add", add_user_command))
+    app.add_handler(CommandHandler("remove", remove_user_command))
+    app.add_handler(CommandHandler("users", list_users_command))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(global_error_handler)
 
-    print("🤖 Bot start ho chuka hai!")
+    print("🤖 Admin-Protected Bot start ho chuka hai!")
     app.run_polling()
 
 
