@@ -19,7 +19,7 @@ from telegram.ext import (
 
 # ------------------------------------------------------------------
 # Render Environment Variables se Token Automatically Read hoga
-BOT_TOKEN = os.getenv("7673015455:AAFrMbFSEpPXV33WMUud-bRFPUxvzN7znBk")
+BOT_TOKEN = "7673015455:AAFrMbFSEpPXV33WMUud-bRFPUxvzN7znBk"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
