@@ -5,3 +5,7 @@ urllib3
 python-telegram-bot
 httpx
 beautifulsoup4
+python-telegram-bot
+httpx
+beautifulsoup4
+yt-dlp
