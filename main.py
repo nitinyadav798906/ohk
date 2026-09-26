@@ -142,15 +142,25 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     base_domain = "https://xhaccess.com"
     all_video_urls = set()
 
+    # Direct home URL fix
+    clean_url = url.rstrip('/')
+    if clean_url in ["https://xhaccess.com", "http://xhaccess.com"]:
+        target_base = f"{base_domain}/search/porn"
+    else:
+        target_base = url
+
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=300)
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, http2=True, timeout=10.0) as client:
-        if "/videos/" in url and not url.rstrip('/').endswith('/videos'):
-            res = await extract_video_link(client, url)
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, timeout=10.0) as client:
+        if "/videos/" in target_base and not target_base.rstrip('/').endswith('/videos'):
+            res = await extract_video_link(client, target_base)
             return [res] if res else []
 
         page_urls = []
         for p in range(start_page, end_page + 1):
-            p_url = f"{url}&page={p}" if "?" in url else (f"{url}?page={p}" if p > 1 else url)
+            if "?" in target_base:
+                p_url = f"{target_base}&page={p}"
+            else:
+                p_url = f"{target_base}?page={p}" if p > 1 else target_base
             page_urls.append(p_url)
 
         async def fetch_page_links(p_url):
@@ -365,7 +375,7 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
         results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
 
         if not results:
-            await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi valid video links nahi mile.\n\n📌 **Note:** Direct domain (`https://xhaccess.com`) ke bajaye search ya category page URL bhejein.")
+            await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.")
             return
 
         await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! Preparing files...")
