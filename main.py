@@ -8,7 +8,7 @@ import subprocess
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, List, Set, Dict
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -38,15 +38,32 @@ ALLOWED_USERS: Set[int] = {ADMIN_ID}
 STOP_PROCESS: Dict[int, bool] = {}
 USER_LIBRARY: Dict[int, List[Dict[str, str]]] = {}
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://xhaccess.com/",
-}
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+
+# Dynamic Headers Generator
+def get_custom_headers(url: str) -> dict:
+    parsed = urlparse(url)
+    domain = parsed.netloc or "joysporn.com"
+    referer = f"https://{domain}/"
+    
+    return {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": referer,
+        "Origin": referer.rstrip('/'),
+        "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1"
+    }
 
 # ==========================================================
-# DUMMY HTTP SERVER
+# DUMMY HTTP SERVER (For Render/Koyeb 24/7 Deployment)
 # ==========================================================
 class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -65,7 +82,7 @@ def run_dummy_server():
         logger.error(f"HTTP Server Exception: {e}")
 
 # ==========================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS & EXTRACTION ENGINE
 # ==========================================================
 def process_tpl_link(hls_link: str) -> str:
     try:
@@ -84,7 +101,8 @@ def process_tpl_link(hls_link: str) -> str:
 
 async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optional[dict]:
     try:
-        response = await client.get(video_url, timeout=10.0)
+        headers = get_custom_headers(video_url)
+        response = await client.get(video_url, headers=headers, timeout=12.0)
         if response.status_code != 200:
             return None
 
@@ -92,8 +110,12 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
         title = "Video"
 
         title_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE | re.DOTALL)
+        if not title_match:
+            title_match = re.search(r'<title>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
+            
         if title_match:
             title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+            title = title.replace("\n", "").replace("\r", "")
 
         stream_link = None
         file_type = None
@@ -122,10 +144,11 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
 
 async def download_video_ffmpeg(url: str, output_path: str) -> bool:
     try:
+        headers = get_custom_headers(url)
         cmd = [
             "ffmpeg",
             "-y",
-            "-headers", f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: {HEADERS['Referer']}\r\n",
+            "-headers", f"User-Agent: {headers['User-Agent']}\r\nReferer: {headers['Referer']}\r\n",
             "-i", url,
             "-c", "copy",
             "-bsf:a", "aac_adtstoasc",
@@ -139,13 +162,16 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 6) -> List[dict]:
-    base_domain = "https://xhaccess.com"
     all_video_urls = set()
+    parsed = urlparse(url)
+    domain_name = parsed.netloc or "joysporn.com"
+    base_domain = f"https://{domain_name}"
 
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=300)
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, timeout=10.0) as client:
-        # Single Video URL check
-        if "/videos/" in url and not url.rstrip('/').endswith('/videos'):
+    async with httpx.AsyncClient(verify=False, follow_redirects=True, limits=limits, timeout=12.0) as client:
+        
+        # Single Video Link Direct Extraction
+        if url.endswith('.html') or ("/videos/" in url and not url.rstrip('/').endswith('/videos')) or ("/video/" in url and not url.rstrip('/').endswith('/video')):
             res = await extract_video_link(client, url)
             return [res] if res else []
 
@@ -159,17 +185,37 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 
         async def fetch_page_links(p_url):
             try:
-                resp = await client.get(p_url)
+                headers = get_custom_headers(p_url)
+                resp = await client.get(p_url, headers=headers)
                 if resp.status_code == 200:
-                    # Extended Flexible Regex for Video Links
-                    found_links = re.findall(r'href=["\'](/videos/[^"\']+)["\']', resp.text)
-                    if not found_links:
-                        found_links = re.findall(r'href=["\'](https?://[^"\']*/videos/[^"\']+)["\']', resp.text)
-                    
-                    for href in found_links:
-                        if not href.endswith('/videos/') and not href.endswith('/videos'):
+                    # Multi-Site Link Pattern Extraction (Joysporn + xHamster + Xhaccess)
+                    html_links = re.findall(r'href=["\'](/[^"\']+\.html)["\']', resp.text)
+                    video_links = re.findall(r'href=["\'](/video[s]?/[^"\']+)["\']', resp.text)
+                    abs_links = re.findall(r'href=["\'](https?://' + re.escape(domain_name) + r'/[^"\']+)["\']', resp.text)
+
+                    combined = html_links + video_links + abs_links
+
+                    for href in combined:
+                        clean_href = href.split('?')[0].split('#')[0]
+                        
+                        if any(clean_href.endswith(ext) for ext in ['.css', '.js', '.jpg', '.png', '.gif', '.svg']):
+                            continue
+                        if clean_href.rstrip('/') in [f"https://{domain_name}", f"http://{domain_name}", "", "/"]:
+                            continue
+
+                        is_valid = False
+                        if "joysporn" in domain_name and clean_href.endswith('.html'):
+                            is_valid = True
+                        elif ("xhamster" in domain_name or "xhaccess" in domain_name) and ("/video" in clean_href):
+                            if not clean_href.rstrip('/').endswith(('/videos', '/video')):
+                                is_valid = True
+                        elif clean_href.endswith('.html') or "/video" in clean_href:
+                            is_valid = True
+
+                        if is_valid:
                             full_u = href if href.startswith("http") else urljoin(base_domain, href)
                             all_video_urls.add(full_u)
+
             except Exception as e:
                 logger.error(f"Failed crawling page {p_url}: {e}")
 
@@ -200,17 +246,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚡ **Ultra-Fast Continuous Scraper & Downloader Bot**\n\n"
+        "⚡ **Multi-Site Scraper & Downloader Bot Active!**\n"
+        "🌐 **Supported Sites:** Joysporn, Xhaccess, xHamster\n\n"
         "📌 **General Commands:**\n"
-        "• URL bhejein: Ultra-Fast speed se 6 pages scan karke continuous button option dega.\n"
-        "• `.txt` file upload karein: Live stream auto-refresh karke FFmpeg se video upload karega.\n"
-        "• `/stop` - Running download process ko rokne ke liye.\n"
-        "• `/mylibrary` - Apni saved `.txt` files dekhne ke liye.\n"
-        "• `/stats` - Total active users aur bot status dekhne ke liye.\n\n"
+        "• URL bhejein: Continuous 6 Pages Scrape karke .txt + .html file dega.\n"
+        "• `.txt` file upload karein: FFmpeg se direct video download & upload karega.\n"
+        "• `/stop` - Running task rokne ke liye.\n"
+        "• `/mylibrary` - Saved files list.\n"
+        "• `/stats` - Engine status.\n\n"
         "👑 **Admin Commands:**\n"
-        "• `/adduser <user_id>` - Access dene ke liye.\n"
-        "• `/removeuser <user_id>` - Access hatane ke liye.\n"
-        "• `/userlist` - Authorized users ki list dekhne ke liye."
+        "• `/adduser <user_id>`\n"
+        "• `/removeuser <user_id>`\n"
+        "• `/userlist`"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -259,7 +306,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 **Bot Status & Stats:**\n\n"
         f"• **Authorized Users:** {len(ALLOWED_USERS)}\n"
         f"• **Total Processed Files:** {total_files}\n"
-        f"• **Engine:** Concurrency 100 HTTP/2 + FFmpeg Engine\n"
+        f"• **Supported Sites:** Joysporn, Xhaccess, xHamster\n"
+        f"• **Engine:** Concurrency 100 HTTP/2 + Dynamic Header Engine\n"
         f"• **Status:** 🟢 Active & Ready"
     )
 
@@ -317,7 +365,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"🚀 Total **{total}** links processing me hain! Rokne ke liye `/stop` likhein.")
 
         limits = httpx.Limits(max_keepalive_connections=50, max_connections=100)
-        async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, timeout=10.0) as client:
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, limits=limits, timeout=12.0) as client:
             for idx, raw_url in enumerate(urls, 1):
                 if STOP_PROCESS.get(user_id, False):
                     await update.message.reply_text("🛑 **Task Stopped By User!**")
@@ -328,7 +376,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stream_url = raw_url
                 video_title = f"Video #{idx}"
 
-                if "/videos/" in raw_url and not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
+                if ("video" in raw_url or raw_url.endswith('.html')) and not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
                     extracted = await extract_video_link(client, raw_url)
                     if extracted and extracted.get('download_link'):
                         stream_url = extracted['download_link']
@@ -379,7 +427,6 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
 
         await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! Preparing files...")
 
-        # TXT File Generation
         txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
         for idx, item in enumerate(results, 1):
             txt_content += f"{idx}. Title: {item['title']}\n"
@@ -389,7 +436,6 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
         txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
         txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
 
-        # HTML File Generation
         html_content = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
 <style>
@@ -444,7 +490,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_url = url_match.group(1)
 
-    if not ("xhaccess" in target_url or "xhamster" in target_url):
+    if not ("joysporn" in target_url or "xhaccess" in target_url or "xhamster" in target_url):
         await update.message.reply_text("❌ Yeh domain supported nahi hai. Kripya valid URL bhejein.")
         return
 
