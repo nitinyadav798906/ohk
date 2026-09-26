@@ -9,3 +9,6 @@ python-telegram-bot
 httpx
 beautifulsoup4
 yt-dlp
+python-telegram-bot>=20.0
+httpx[http2]
+h2
