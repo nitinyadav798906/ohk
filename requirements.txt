@@ -14,3 +14,6 @@ httpx[http2]
 h2
 cloudscraper
 asyncio
+python-telegram-bot
+cloudscraper
+requests
