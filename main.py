@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7673015455:AAFrMbFSEpPXV33WMUud-bRFPUxvzN7znBk")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1714266885"))
 
-# Access Control & In-Memory Storage
 ALLOWED_USERS: Set[int] = {ADMIN_ID}
 STOP_PROCESS: Dict[int, bool] = {}
 USER_LIBRARY: Dict[int, List[Dict[str, str]]] = {}
@@ -47,13 +46,13 @@ HEADERS = {
 }
 
 # ==========================================================
-# DUMMY HTTP SERVER (For Render/Koyeb Port Binding)
+# DUMMY HTTP SERVER
 # ==========================================================
 class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Ultra-Fast Multi-Feature Telegram Bot is Active!")
+        self.wfile.write(b"Bot is Active!")
     def log_message(self, format, *args):
         return
 
@@ -66,7 +65,7 @@ def run_dummy_server():
         logger.error(f"HTTP Server Exception: {e}")
 
 # ==========================================================
-# HELPER FUNCTIONS & ULTRA-FAST SCRAPING ENGINE
+# HELPER FUNCTIONS
 # ==========================================================
 def process_tpl_link(hls_link: str) -> str:
     try:
@@ -85,7 +84,7 @@ def process_tpl_link(hls_link: str) -> str:
 
 async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optional[dict]:
     try:
-        response = await client.get(video_url, timeout=4.5)
+        response = await client.get(video_url, timeout=10.0)
         if response.status_code != 200:
             return None
 
@@ -117,8 +116,8 @@ async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optio
                 "page_url": video_url,
                 "download_link": final_link
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Extraction Error for {video_url}: {e}")
     return None
 
 async def download_video_ffmpeg(url: str, output_path: str) -> bool:
@@ -144,7 +143,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     all_video_urls = set()
 
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=300)
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, http2=True, timeout=5.0) as client:
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, http2=True, timeout=10.0) as client:
         if "/videos/" in url and not url.rstrip('/').endswith('/videos'):
             res = await extract_video_link(client, url)
             return [res] if res else []
@@ -166,6 +165,9 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
                 logger.error(f"Failed crawling page {p_url}: {e}")
 
         await asyncio.gather(*[fetch_page_links(pu) for pu in page_urls])
+
+        if not all_video_urls:
+            return []
 
         semaphore = asyncio.Semaphore(100)
         async def sem_extract(v_url):
@@ -306,7 +308,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"🚀 Total **{total}** links processing me hain! Rokne ke liye `/stop` likhein.")
 
         limits = httpx.Limits(max_keepalive_connections=50, max_connections=100)
-        async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, timeout=6.0) as client:
+        async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, timeout=10.0) as client:
             for idx, raw_url in enumerate(urls, 1):
                 if STOP_PROCESS.get(user_id, False):
                     await update.message.reply_text("🛑 **Task Stopped By User!**")
@@ -356,73 +358,67 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error processing document: {e}")
         await status_msg.edit_text(f"❌ File Process Error: {str(e)}")
 
-# Continuous Pagination Scraping Logic
 async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
-    user_id = update_or_query.from_user.id
-    
-    send_func = update_or_query.message.reply_text
+    status_msg = await update_or_query.message.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page}...**")
 
-    status_msg = await send_func(f"⚡ **Ultra-Fast Scraping Pages {start_page} to {end_page}...**")
+    try:
+        results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
 
-    results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
+        if not results:
+            await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi valid video links nahi mile.\n\n📌 **Note:** Direct domain (`https://xhaccess.com`) ke bajaye search ya category page URL bhejein.")
+            return
 
-    if not results:
-        await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi links nahi mile ya scraping complete ho gayi.")
-        return
+        await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! Preparing files...")
 
-    await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted Super-Fast! Preparing files...")
+        # TXT File Generation
+        txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
+        for idx, item in enumerate(results, 1):
+            txt_content += f"{idx}. Title: {item['title']}\n"
+            txt_content += f"   Permanent Page Link: {item['page_url']}\n"
+            txt_content += f"   Live Stream Link: {item['download_link']}\n\n"
 
-    # TXT File Generation
-    txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
-    for idx, item in enumerate(results, 1):
-        txt_content += f"{idx}. Title: {item['title']}\n"
-        txt_content += f"   Permanent Page Link: {item['page_url']}\n"
-        txt_content += f"   Live Stream Link: {item['download_link']}\n\n"
+        txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
+        txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
 
-    txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
-    txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
-
-    if user_id not in USER_LIBRARY:
-        USER_LIBRARY[user_id] = []
-    USER_LIBRARY[user_id].append({"filename": txt_bytes.name, "count": str(len(results))})
-
-    # HTML File Generation
-    html_content = f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
+        # HTML File Generation
+        html_content = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
 <style>
 body {{ font-family: sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
 .card {{ background: #1e1e1e; padding: 15px; margin-bottom: 12px; border-radius: 8px; border-left: 5px solid #0088cc; }}
 a {{ color: #4da6ff; word-break: break-all; }}
 </style></head><body><h2>Scraped Videos Pages {start_page} to {end_page} ({len(results)} Total)</h2>"""
-    for idx, item in enumerate(results, 1):
-        html_content += f"""<div class="card"><h3>{idx}. {item['title']} [{item['type']}]</h3>
+        for idx, item in enumerate(results, 1):
+            html_content += f"""<div class="card"><h3>{idx}. {item['title']} [{item['type']}]</h3>
 <p><strong>Permanent Page Link:</strong> <a href="{item['page_url']}" target="_blank">{item['page_url']}</a></p>
 <p><strong>Live Stream Link:</strong> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p></div>"""
-    html_content += "</body></html>"
+        html_content += "</body></html>"
 
-    html_bytes = io.BytesIO(html_content.encode('utf-8'))
-    html_bytes.name = f"scraped_p{start_page}_to_p{end_page}.html"
+        html_bytes = io.BytesIO(html_content.encode('utf-8'))
+        html_bytes.name = f"scraped_p{start_page}_to_p{end_page}.html"
 
-    # Context Persistence for Interactive Buttons
-    context.user_data['last_url'] = target_url
-    context.user_data['next_start'] = end_page + 1
+        context.user_data['last_url'] = target_url
+        context.user_data['next_start'] = end_page + 1
 
-    next_start = end_page + 1
-    next_end = next_start + 5
+        next_start = end_page + 1
+        next_end = next_start + 5
 
-    keyboard = [
-        [InlineKeyboardButton(f"▶️ Continue (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
-        [InlineKeyboardButton("🛑 Stop Scraping", callback_data="stop_scrape")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+        keyboard = [
+            [InlineKeyboardButton(f"▶️ Continue (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
+            [InlineKeyboardButton("🛑 Stop Scraping", callback_data="stop_scrape")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update_or_query.message.reply_document(document=txt_bytes, caption=f"📁 **Pages {start_page}-{end_page} TXT File** ({len(results)} Links)")
-    await update_or_query.message.reply_document(
-        document=html_bytes, 
-        caption=f"🌐 **Pages {start_page}-{end_page} HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye niche button par click karein:",
-        reply_markup=reply_markup
-    )
-    await status_msg.delete()
+        await update_or_query.message.reply_document(document=txt_bytes, caption=f"📁 **Pages {start_page}-{end_page} TXT File** ({len(results)} Links)")
+        await update_or_query.message.reply_document(
+            document=html_bytes, 
+            caption=f"🌐 **Pages {start_page}-{end_page} HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye niche button par click karein:",
+            reply_markup=reply_markup
+        )
+        await status_msg.delete()
+    except Exception as e:
+        logger.error(f"Error in run_scrape_chunk: {e}")
+        await status_msg.edit_text(f"❌ Scraping error: {str(e)}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -430,11 +426,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ **Access Denied!**")
         return
 
-    text_parts = update.message.text.strip().split()
-    target_url = text_parts[0]
+    text = update.message.text.strip()
+    url_match = re.search(r'(https?://[^\s]+)', text)
 
-    if not ("xhaccess.com" in target_url or "xhamster" in target_url):
-        await update.message.reply_text("❌ Valid URL bhejein, `.txt` file upload karein ya `/start` likhein.")
+    if not url_match:
+        await update.message.reply_text("❌ Valid URL bhejein!")
+        return
+
+    target_url = url_match.group(1)
+
+    if not ("xhaccess" in target_url or "xhamster" in target_url):
+        await update.message.reply_text("❌ Yeh domain supported nahi hai. Kripya valid URL bhejein.")
         return
 
     await run_scrape_chunk(update, context, target_url, start_page=1, end_page=6)
@@ -460,7 +462,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.message.reply_text("❌ Target URL lost. Kripya URL firse bhej kar start karein.")
             return
 
-        await query.edit_message_caption(caption=query.message.caption + f"\n\n⏳ **Scraping Pages {start_page} to {end_page}...**")
         await run_scrape_chunk(query, context, target_url, start_page=start_page, end_page=end_page)
 
 # ==========================================================
@@ -470,18 +471,15 @@ def main():
     threading.Thread(target=run_dummy_server, daemon=True).start()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # User Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("mylibrary", mylibrary_command))
     app.add_handler(CommandHandler("stats", stats_command))
     
-    # Admin Commands
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
     app.add_handler(CommandHandler("userlist", userlist_command))
     
-    # Callbacks & Message Handlers
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
