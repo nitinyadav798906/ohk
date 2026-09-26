@@ -142,35 +142,34 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     base_domain = "https://xhaccess.com"
     all_video_urls = set()
 
-    # Direct home URL fix
-    clean_url = url.rstrip('/')
-    if clean_url in ["https://xhaccess.com", "http://xhaccess.com"]:
-        target_base = f"{base_domain}/search/porn"
-    else:
-        target_base = url
-
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=300)
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, limits=limits, timeout=10.0) as client:
-        if "/videos/" in target_base and not target_base.rstrip('/').endswith('/videos'):
-            res = await extract_video_link(client, target_base)
+        # Single Video URL check
+        if "/videos/" in url and not url.rstrip('/').endswith('/videos'):
+            res = await extract_video_link(client, url)
             return [res] if res else []
 
         page_urls = []
         for p in range(start_page, end_page + 1):
-            if "?" in target_base:
-                p_url = f"{target_base}&page={p}"
+            if "?" in url:
+                p_url = f"{url}&page={p}"
             else:
-                p_url = f"{target_base}?page={p}" if p > 1 else target_base
+                p_url = f"{url}?page={p}" if p > 1 else url
             page_urls.append(p_url)
 
         async def fetch_page_links(p_url):
             try:
                 resp = await client.get(p_url)
                 if resp.status_code == 200:
-                    found_links = re.findall(r'href="(/videos/[^"]+)"', resp.text)
+                    # Extended Flexible Regex for Video Links
+                    found_links = re.findall(r'href=["\'](/videos/[^"\']+)["\']', resp.text)
+                    if not found_links:
+                        found_links = re.findall(r'href=["\'](https?://[^"\']*/videos/[^"\']+)["\']', resp.text)
+                    
                     for href in found_links:
-                        if not href.endswith('/videos/'):
-                            all_video_urls.add(urljoin(base_domain, href))
+                        if not href.endswith('/videos/') and not href.endswith('/videos'):
+                            full_u = href if href.startswith("http") else urljoin(base_domain, href)
+                            all_video_urls.add(full_u)
             except Exception as e:
                 logger.error(f"Failed crawling page {p_url}: {e}")
 
