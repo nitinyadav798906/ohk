@@ -140,6 +140,7 @@ async def extract_video_link(video_url: str) -> Optional[dict]:
         if not text:
             return None
 
+        # Title extraction
         title = "Video"
         title_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE | re.DOTALL)
         if not title_match:
@@ -152,15 +153,24 @@ async def extract_video_link(video_url: str) -> Optional[dict]:
         stream_link = None
         file_type = None
 
+        # Standard .m3u8 check
         m_hls = re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
         if m_hls:
             stream_link = m_hls.group(1).replace('\\/', '/')
             file_type = "M3U8"
         else:
+            # Standard .mp4 check
             m_mp4 = re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
             if m_mp4:
                 stream_link = m_mp4.group(1).replace('\\/', '/')
                 file_type = "MP4"
+
+        # Special extraction logic for Sxyprn JS config
+        if not stream_link and "sxyprn" in video_url:
+            sxy_match = re.search(r'data-s=["\'](https?:[^\s"\']+?)["\']', text) or re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if sxy_match:
+                stream_link = sxy_match.group(1)
+                file_type = "MP4" if ".mp4" in stream_link else "M3U8"
 
         if stream_link:
             final_link = process_tpl_link(stream_link) if file_type == "M3U8" else stream_link
@@ -202,7 +212,8 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     is_single_video = (
         url.endswith('.html') or 
         re.search(r'/videos?/[^/]+-\d+', url) or 
-        re.search(r'/video/\d+', url)
+        re.search(r'/video/\d+', url) or
+        re.search(r'/post/\d+', url)
     )
     
     if is_single_video and not any(url.endswith(x) for x in ['index.html', 'ilisting.html', '/']):
@@ -225,6 +236,13 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             else:
                 page_urls.append(f"{base_u}/{p}/")
                 page_urls.append(f"{base_u}?page={p}")
+
+        elif "sxyprn" in domain_name:
+            # Sxyprn pagination support
+            page_urls.append(f"{base_u}?page={p}")
+            page_urls.append(f"{base_u}/{p}")
+            if "?" in url:
+                page_urls.append(f"{url}&page={p}")
 
         elif "xhamster" in domain_name or "xhaccess" in domain_name:
             page_urls.append(f"{base_u}/{p}")
@@ -252,6 +270,11 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
                     if clean_href.endswith('.html') or "/video/" in clean_href or "/videos/" in clean_href:
                         if not any(clean_href.endswith(x) for x in ['index.html', 'main.html', 'ilisting.html']):
                             all_video_urls.add(full_u)
+
+                elif "sxyprn" in domain_name:
+                    # Sxyprn video post regex
+                    if re.search(r'/post/\w+', clean_href) or re.search(r'/video/\w+', clean_href) or clean_href.endswith('.html'):
+                        all_video_urls.add(full_u)
 
                 elif "xhamster" in domain_name or "xhaccess" in domain_name:
                     if "/videos/" in clean_href or "/video/" in clean_href:
@@ -296,7 +319,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "⚡ **Multi-Site Complete Scraper & Downloader Bot Active!**\n\n"
-        "🌐 **Supported Sites:** xHamster, Joysporn, Xhaccess\n\n"
+        "🌐 **Supported Sites:** xHamster, Joysporn, Xhaccess, Sxyprn\n\n"
         "📌 **Features & Usage:**\n"
         "1. **Direct Link Scraping:** Koi bhi URL bhejein, bot Pages 1 to 6 tak ka total ~200-300 video links nikal kar `.txt` aur `.html` file dega.\n"
         "2. **Auto Continue Button:** Next pages (7 to 12) scrape karne ke liye inline button milega.\n"
@@ -423,7 +446,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stream_url = raw_url
             video_title = f"Video #{idx}"
 
-            if ("video" in raw_url or raw_url.endswith('.html')) and not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
+            if ("video" in raw_url or "post" in raw_url or raw_url.endswith('.html')) and not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
                 extracted = await extract_video_link(raw_url)
                 if extracted and extracted.get('download_link'):
                     stream_url = extracted['download_link']
@@ -431,7 +454,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             output_file = f"temp_video_{user_id}_{idx}.mp4"
 
-            # Pre-cleanup
             if os.path.exists(output_file):
                 try:
                     os.remove(output_file)
@@ -457,7 +479,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await progress_msg.edit_text(f"❌ **[{idx}/{total}] Download Failed!**")
 
-            # Post-cleanup to release RAM/Disk
             if os.path.exists(output_file):
                 try:
                     os.remove(output_file)
@@ -545,7 +566,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_url = url_match.group(1)
 
-    if not ("joysporn" in target_url or "xhaccess" in target_url or "xhamster" in target_url):
+    if not ("joysporn" in target_url or "xhaccess" in target_url or "xhamster" in target_url or "sxyprn" in target_url):
         await update.message.reply_text("❌ Yeh domain supported nahi hai. Kripya valid URL bhejein.")
         return
 
@@ -578,7 +599,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 # MAIN EXECUTION ENTRYPOINT
 # ==========================================================
 def main():
-    # Start Dummy Web Server & Keep-Alive Ping
     threading.Thread(target=run_dummy_server, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
     
