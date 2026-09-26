@@ -6,12 +6,13 @@ import os
 import re
 import subprocess
 import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, List, Set, Dict
 from urllib.parse import unquote, urljoin, urlparse
 
-import httpx
 import cloudscraper
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -22,7 +23,9 @@ from telegram.ext import (
     filters,
 )
 
-# Logging Setup
+# ==========================================================
+# LOGGING SETUP
+# ==========================================================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -30,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================================
-# CONFIGURATION
+# CONFIGURATION & GLOBAL VARIABLES
 # ==========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7673015455:AAFrMbFSEpPXV33WMUud-bRFPUxvzN7znBk")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1714266885"))
@@ -41,14 +44,14 @@ USER_LIBRARY: Dict[int, List[Dict[str, str]]] = {}
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
-# Create CloudScraper Instance (Bypasses Cloudflare Anti-Bot)
+# Cloudscraper Instance
 scraper = cloudscraper.create_scraper(
     browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
 )
 
 def get_custom_headers(url: str) -> dict:
     parsed = urlparse(url)
-    domain = parsed.netloc or "joysporn.com"
+    domain = parsed.netloc or "xhamster.com"
     referer = f"https://{domain}/"
     
     return {
@@ -68,13 +71,14 @@ def get_custom_headers(url: str) -> dict:
     }
 
 # ==========================================================
-# DUMMY HTTP SERVER (For Render/Koyeb 24/7 Deployment)
+# DUMMY HTTP SERVER & AUTO-PING KEEP ALIVE (24/7)
 # ==========================================================
 class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is Active!")
+        self.wfile.write(b"Bot Status: Active and Running 24/7!")
+        
     def log_message(self, format, *args):
         return
 
@@ -82,12 +86,25 @@ def run_dummy_server():
     port = int(os.getenv("PORT", 8080))
     try:
         server = HTTPServer(('0.0.0.0', port), DummyPortServer)
+        logger.info(f"Dummy Web Server running on port {port}")
         server.serve_forever()
     except Exception as e:
         logger.error(f"HTTP Server Exception: {e}")
 
+def self_ping_loop():
+    """ Self ping to prevent Render/Koyeb sleeping """
+    render_app_url = os.getenv("RENDER_EXTERNAL_URL")
+    while True:
+        time.sleep(600)  # Ping every 10 minutes
+        if render_app_url:
+            try:
+                requests.get(render_app_url, timeout=10)
+                logger.info("Self-ping sent successfully!")
+            except Exception as e:
+                logger.error(f"Self-ping failed: {e}")
+
 # ==========================================================
-# HELPER FUNCTIONS & EXTRACTION ENGINE
+# EXTRACTION & SCRAPING CORE ENGINE
 # ==========================================================
 def process_tpl_link(hls_link: str) -> str:
     try:
@@ -104,20 +121,22 @@ def process_tpl_link(hls_link: str) -> str:
     except Exception:
         return hls_link
 
-def fetch_url_with_cloudscraper(url: str) -> Optional[str]:
-    """Cloudflare bypass karke HTML page fetch karega."""
+def fetch_url_sync(url: str) -> Optional[str]:
     try:
         headers = get_custom_headers(url)
         resp = scraper.get(url, headers=headers, timeout=15)
         if resp.status_code == 200:
             return resp.text
     except Exception as e:
-        logger.error(f"Cloudscraper fetch error on {url}: {e}")
+        logger.error(f"Scraper fetch error on {url}: {e}")
     return None
+
+async def fetch_url_with_cloudscraper(url: str) -> Optional[str]:
+    return await asyncio.to_thread(fetch_url_sync, url)
 
 async def extract_video_link(video_url: str) -> Optional[dict]:
     try:
-        text = await asyncio.to_thread(fetch_url_with_cloudscraper, video_url)
+        text = await fetch_url_with_cloudscraper(video_url)
         if not text:
             return None
 
@@ -133,7 +152,6 @@ async def extract_video_link(video_url: str) -> Optional[dict]:
         stream_link = None
         file_type = None
 
-        # Search for M3U8 or MP4 links
         m_hls = re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
         if m_hls:
             stream_link = m_hls.group(1).replace('\\/', '/')
@@ -172,73 +190,100 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         await proc.wait()
         return os.path.exists(output_path) and os.path.getsize(output_path) > 0
     except Exception as e:
-        logger.error(f"FFmpeg error: {e}")
+        logger.error(f"FFmpeg download error: {e}")
         return False
 
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 6) -> List[dict]:
     all_video_urls = set()
     parsed = urlparse(url)
-    domain_name = parsed.netloc or "joysporn.com"
+    domain_name = parsed.netloc or "xhamster.com"
     base_domain = f"https://{domain_name}"
 
-    # Single Video Link Check
-    if url.endswith('.html') or ("/videos/" in url and not url.rstrip('/').endswith('/videos')) or ("/video/" in url and not url.rstrip('/').endswith('/video')):
+    is_single_video = (
+        url.endswith('.html') or 
+        re.search(r'/videos?/[^/]+-\d+', url) or 
+        re.search(r'/video/\d+', url)
+    )
+    
+    if is_single_video and not any(url.endswith(x) for x in ['index.html', 'ilisting.html', '/']):
         res = await extract_video_link(url)
         return [res] if res else []
 
     page_urls = []
+    base_u = url.rstrip('/')
+
     for p in range(start_page, end_page + 1):
+        if p == 1:
+            page_urls.append(url)
+            continue
+        
         if "joysporn" in domain_name:
-            if p == 1:
+            if base_u == base_domain:
+                page_urls.append(f"{base_domain}/apapu/{p}/")
+            elif base_u.endswith('.html'):
                 page_urls.append(url)
             else:
-                base_u = url.rstrip('/')
                 page_urls.append(f"{base_u}/{p}/")
                 page_urls.append(f"{base_u}?page={p}")
-        else:
-            p_url = f"{url}&page={p}" if "?" in url else (f"{url}?page={p}" if p > 1 else url)
-            page_urls.append(p_url)
+
+        elif "xhamster" in domain_name or "xhaccess" in domain_name:
+            page_urls.append(f"{base_u}/{p}")
+            page_urls.append(f"{base_u}?page={p}")
+            if "?" in url:
+                page_urls.append(f"{url}&page={p}")
 
     async def fetch_page_links(p_url):
         try:
-            html_text = await asyncio.to_thread(fetch_url_with_cloudscraper, p_url)
-            if html_text:
-                raw_links = re.findall(r'href=["\']([^"\']+)["\']', html_text)
+            html_text = await fetch_url_with_cloudscraper(p_url)
+            if not html_text:
+                return
 
-                for href in raw_links:
-                    clean_href = href.split('?')[0].split('#')[0]
-                    
-                    if any(clean_href.endswith(ext) for ext in ['.css', '.js', '.jpg', '.png', '.gif', '.svg', '.jpeg']):
-                        continue
+            raw_links = re.findall(r'href=["\']([^"\']+)["\']', html_text)
 
-                    full_u = href if href.startswith("http") else urljoin(base_domain, href)
-                    
-                    if "joysporn" in domain_name:
-                        if clean_href.endswith('.html') and not clean_href.endswith(('index.html', 'main.html')):
+            for href in raw_links:
+                clean_href = href.split('?')[0].split('#')[0]
+                
+                if any(clean_href.endswith(ext) for ext in ['.css', '.js', '.jpg', '.png', '.gif', '.svg', '.jpeg', '.webp']):
+                    continue
+
+                full_u = href if href.startswith("http") else urljoin(base_domain, href)
+                
+                if "joysporn" in domain_name:
+                    if clean_href.endswith('.html') or "/video/" in clean_href or "/videos/" in clean_href:
+                        if not any(clean_href.endswith(x) for x in ['index.html', 'main.html', 'ilisting.html']):
                             all_video_urls.add(full_u)
-                    elif "xhamster" in domain_name or "xhaccess" in domain_name:
-                        if "/videos/" in clean_href or "/video/" in clean_href:
-                            if not clean_href.rstrip('/').endswith(('/videos', '/video')):
+
+                elif "xhamster" in domain_name or "xhaccess" in domain_name:
+                    if "/videos/" in clean_href or "/video/" in clean_href:
+                        if not re.search(r'/videos?/?$', clean_href):
+                            if (
+                                re.search(r'-\d+$', clean_href) or 
+                                re.search(r'/\d+$', clean_href) or 
+                                clean_href.endswith('.html') or
+                                len(clean_href.strip('/').split('/')) >= 3
+                            ):
                                 all_video_urls.add(full_u)
+
         except Exception as e:
-            logger.error(f"Failed crawling page {p_url}: {e}")
+            logger.error(f"Error crawling page {p_url}: {e}")
 
     await asyncio.gather(*[fetch_page_links(pu) for pu in page_urls])
 
     if not all_video_urls:
         return []
 
-    semaphore = asyncio.Semaphore(20)
+    semaphore = asyncio.Semaphore(25)
     async def sem_extract(v_url):
         async with semaphore:
             return await extract_video_link(v_url)
 
     tasks = [sem_extract(v_url) for v_url in all_video_urls]
     results = await asyncio.gather(*tasks)
+    
     return [res for res in results if res is not None]
 
 # ==========================================================
-# TELEGRAM HANDLERS
+# TELEGRAM BOT HANDLERS
 # ==========================================================
 def is_authorized(user_id: int) -> bool:
     return user_id in ALLOWED_USERS or user_id == ADMIN_ID
@@ -246,18 +291,20 @@ def is_authorized(user_id: int) -> bool:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if not is_authorized(user_id):
-        await update.message.reply_text("⛔ **Access Denied!**")
+        await update.message.reply_text("⛔ **Access Denied! Aap is bot ko use nahi kar sakte.**")
         return
 
     await update.message.reply_text(
-        "⚡ **Multi-Site Scraper & Downloader Bot Active!**\n"
-        "🌐 **Supported Sites:** Joysporn, Xhaccess, xHamster (Cloudflare Bypass Enabled)\n\n"
-        "📌 **General Commands:**\n"
-        "• URL bhejein: Continuous 6 Pages Scrape karke .txt + .html file dega.\n"
-        "• `.txt` file upload karein: FFmpeg se direct video download & upload karega.\n"
-        "• `/stop` - Running task rokne ke liye.\n"
-        "• `/mylibrary` - Saved files list.\n"
-        "• `/stats` - Engine status.\n\n"
+        "⚡ **Multi-Site Complete Scraper & Downloader Bot Active!**\n\n"
+        "🌐 **Supported Sites:** xHamster, Joysporn, Xhaccess\n\n"
+        "📌 **Features & Usage:**\n"
+        "1. **Direct Link Scraping:** Koi bhi URL bhejein, bot Pages 1 to 6 tak ka total ~200-300 video links nikal kar `.txt` aur `.html` file dega.\n"
+        "2. **Auto Continue Button:** Next pages (7 to 12) scrape karne ke liye inline button milega.\n"
+        "3. **Video Downloader:** Kisi bhi `.txt` file ko upload karein, bot FFmpeg se videos download karke direct Telegram par upload karega.\n\n"
+        "🛠️ **Commands:**\n"
+        "• `/stop` - Running task ko rokne ke liye.\n"
+        "• `/mylibrary` - Apni saved files dekhein.\n"
+        "• `/stats` - Bot status dekhein.\n\n"
         "👑 **Admin Commands:**\n"
         "• `/adduser <user_id>`\n"
         "• `/removeuser <user_id>`\n"
@@ -274,7 +321,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     new_user = int(context.args[0])
     ALLOWED_USERS.add(new_user)
-    await update.message.reply_text(f"✅ User ID `{new_user}` ko add kar diya gaya hai!", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ User ID `{new_user}` ko whitelist kar diya gaya hai!", parse_mode="Markdown")
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -289,13 +336,13 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Admin ko remove nahi kiya ja sakta!")
         return
     ALLOWED_USERS.discard(rem_user)
-    await update.message.reply_text(f"🗑️ User ID `{rem_user}` ko remove kar diya gaya hai!", parse_mode="Markdown")
+    await update.message.reply_text(f"🗑️ User ID `{rem_user}` ko access se hata diya gaya hai!", parse_mode="Markdown")
 
 async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if not is_authorized(user_id):
         return
-    msg = "👥 **Authorized Users List:**\n\n"
+    msg = "👥 **Authorized Users:**\n\n"
     for uid in ALLOWED_USERS:
         role = "👑 Admin" if uid == ADMIN_ID else "👤 User"
         msg += f"• `{uid}` ({role})\n"
@@ -307,18 +354,17 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     total_files = sum(len(files) for files in USER_LIBRARY.values())
     await update.message.reply_text(
-        f"📊 **Bot Status & Stats:**\n\n"
+        f"📊 **Bot Operational Status:**\n\n"
         f"• **Authorized Users:** {len(ALLOWED_USERS)}\n"
-        f"• **Total Processed Files:** {total_files}\n"
-        f"• **Supported Sites:** Joysporn, Xhaccess, xHamster\n"
-        f"• **Bypass Engine:** Cloudflare Anti-Bot Bypass Active\n"
+        f"• **Total Files Processed:** {total_files}\n"
+        f"• **Bypass Engine:** Cloudflare Bypass Active\n"
         f"• **Status:** 🟢 Active & Ready"
     )
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     STOP_PROCESS[user_id] = True
-    await update.message.reply_text("🛑 **Process Stop Request Bhej Diya Gaya!**")
+    await update.message.reply_text("🛑 **Process Stop Request Bhej Diya Gaya Hai!**")
 
 async def mylibrary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -328,7 +374,7 @@ async def mylibrary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_files:
         await update.message.reply_text("📚 **Aapki Library Khaali Hai!**")
         return
-    msg = "📚 **Aapki Library (Saved Files):**\n\n"
+    msg = "📚 **Aapki Saved Files:**\n\n"
     for idx, item in enumerate(user_files, 1):
         msg += f"{idx}. 📁 `{item['filename']}` ({item['count']} Links)\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -336,7 +382,6 @@ async def mylibrary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if not is_authorized(user_id):
-        await update.message.reply_text("⛔ **Access Denied!**")
         return
 
     doc = update.message.document
@@ -366,7 +411,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             USER_LIBRARY[user_id] = []
         USER_LIBRARY[user_id].append({"filename": doc.file_name, "count": str(total)})
 
-        await status_msg.edit_text(f"🚀 Total **{total}** links processing me hain! Rokne ke liye `/stop` likhein.")
+        await status_msg.edit_text(f"🚀 Total **{total}** links processing me hain! Rokne ke liye `/stop` bhejein.")
 
         for idx, raw_url in enumerate(urls, 1):
             if STOP_PROCESS.get(user_id, False):
@@ -384,10 +429,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     stream_url = extracted['download_link']
                     video_title = extracted.get('title', video_title)
 
-            output_file = f"temp_video_{user_id}.mp4"
+            output_file = f"temp_video_{user_id}_{idx}.mp4"
 
+            # Pre-cleanup
             if os.path.exists(output_file):
-                os.remove(output_file)
+                try:
+                    os.remove(output_file)
+                except Exception:
+                    pass
 
             await progress_msg.edit_text(f"📥 **[{idx}/{total}] FFmpeg Downloader Active...**\n`{video_title[:30]}...`")
             
@@ -408,8 +457,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await progress_msg.edit_text(f"❌ **[{idx}/{total}] Download Failed!**")
 
+            # Post-cleanup to release RAM/Disk
             if os.path.exists(output_file):
-                os.remove(output_file)
+                try:
+                    os.remove(output_file)
+                except Exception:
+                    pass
 
         await status_msg.edit_text("✅ **All videos processing completed!**")
 
@@ -427,7 +480,7 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
             await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.")
             return
 
-        await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! Preparing files...")
+        await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! Files tayar ho rahi hain...")
 
         txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
         for idx, item in enumerate(results, 1):
@@ -522,10 +575,13 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await run_scrape_chunk(query, context, target_url, start_page=start_page, end_page=end_page)
 
 # ==========================================================
-# MAIN EXECUTION
+# MAIN EXECUTION ENTRYPOINT
 # ==========================================================
 def main():
+    # Start Dummy Web Server & Keep-Alive Ping
     threading.Thread(target=run_dummy_server, daemon=True).start()
+    threading.Thread(target=self_ping_loop, daemon=True).start()
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start_command))
