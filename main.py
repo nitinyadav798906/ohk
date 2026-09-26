@@ -11,6 +11,7 @@ from typing import Optional, List, Set, Dict
 from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
+import cloudscraper
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -40,7 +41,11 @@ USER_LIBRARY: Dict[int, List[Dict[str, str]]] = {}
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
-# Dynamic Headers Generator
+# Create CloudScraper Instance (Bypasses Cloudflare Anti-Bot)
+scraper = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
+)
+
 def get_custom_headers(url: str) -> dict:
     parsed = urlparse(url)
     domain = parsed.netloc or "joysporn.com"
@@ -99,33 +104,42 @@ def process_tpl_link(hls_link: str) -> str:
     except Exception:
         return hls_link
 
-async def extract_video_link(client: httpx.AsyncClient, video_url: str) -> Optional[dict]:
+def fetch_url_with_cloudscraper(url: str) -> Optional[str]:
+    """Cloudflare bypass karke HTML page fetch karega."""
     try:
-        headers = get_custom_headers(video_url)
-        response = await client.get(video_url, headers=headers, timeout=12.0)
-        if response.status_code != 200:
+        headers = get_custom_headers(url)
+        resp = scraper.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            return resp.text
+    except Exception as e:
+        logger.error(f"Cloudscraper fetch error on {url}: {e}")
+    return None
+
+async def extract_video_link(video_url: str) -> Optional[dict]:
+    try:
+        text = await asyncio.to_thread(fetch_url_with_cloudscraper, video_url)
+        if not text:
             return None
 
-        text = response.text
         title = "Video"
-
         title_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE | re.DOTALL)
         if not title_match:
             title_match = re.search(r'<title>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
             
         if title_match:
             title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-            title = title.replace("\n", "").replace("\r", "")
+            title = re.sub(r'\s+', ' ', title)
 
         stream_link = None
         file_type = None
 
-        m_hls = re.search(r'(https[^\s"\']*?\.m3u8[^\s"\']*)', text)
+        # Search for M3U8 or MP4 links
+        m_hls = re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
         if m_hls:
             stream_link = m_hls.group(1).replace('\\/', '/')
             file_type = "M3U8"
         else:
-            m_mp4 = re.search(r'(https[^\s"\']*?\.mp4[^\s"\']*)', text)
+            m_mp4 = re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
             if m_mp4:
                 stream_link = m_mp4.group(1).replace('\\/', '/')
                 file_type = "MP4"
@@ -167,71 +181,61 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     domain_name = parsed.netloc or "joysporn.com"
     base_domain = f"https://{domain_name}"
 
-    limits = httpx.Limits(max_keepalive_connections=200, max_connections=300)
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, limits=limits, timeout=12.0) as client:
-        
-        # Single Video Link Direct Extraction
-        if url.endswith('.html') or ("/videos/" in url and not url.rstrip('/').endswith('/videos')) or ("/video/" in url and not url.rstrip('/').endswith('/video')):
-            res = await extract_video_link(client, url)
-            return [res] if res else []
+    # Single Video Link Check
+    if url.endswith('.html') or ("/videos/" in url and not url.rstrip('/').endswith('/videos')) or ("/video/" in url and not url.rstrip('/').endswith('/video')):
+        res = await extract_video_link(url)
+        return [res] if res else []
 
-        page_urls = []
-        for p in range(start_page, end_page + 1):
-            if "?" in url:
-                p_url = f"{url}&page={p}"
+    page_urls = []
+    for p in range(start_page, end_page + 1):
+        if "joysporn" in domain_name:
+            if p == 1:
+                page_urls.append(url)
             else:
-                p_url = f"{url}?page={p}" if p > 1 else url
+                base_u = url.rstrip('/')
+                page_urls.append(f"{base_u}/{p}/")
+                page_urls.append(f"{base_u}?page={p}")
+        else:
+            p_url = f"{url}&page={p}" if "?" in url else (f"{url}?page={p}" if p > 1 else url)
             page_urls.append(p_url)
 
-        async def fetch_page_links(p_url):
-            try:
-                headers = get_custom_headers(p_url)
-                resp = await client.get(p_url, headers=headers)
-                if resp.status_code == 200:
-                    # Multi-Site Link Pattern Extraction (Joysporn + xHamster + Xhaccess)
-                    html_links = re.findall(r'href=["\'](/[^"\']+\.html)["\']', resp.text)
-                    video_links = re.findall(r'href=["\'](/video[s]?/[^"\']+)["\']', resp.text)
-                    abs_links = re.findall(r'href=["\'](https?://' + re.escape(domain_name) + r'/[^"\']+)["\']', resp.text)
+    async def fetch_page_links(p_url):
+        try:
+            html_text = await asyncio.to_thread(fetch_url_with_cloudscraper, p_url)
+            if html_text:
+                raw_links = re.findall(r'href=["\']([^"\']+)["\']', html_text)
 
-                    combined = html_links + video_links + abs_links
+                for href in raw_links:
+                    clean_href = href.split('?')[0].split('#')[0]
+                    
+                    if any(clean_href.endswith(ext) for ext in ['.css', '.js', '.jpg', '.png', '.gif', '.svg', '.jpeg']):
+                        continue
 
-                    for href in combined:
-                        clean_href = href.split('?')[0].split('#')[0]
-                        
-                        if any(clean_href.endswith(ext) for ext in ['.css', '.js', '.jpg', '.png', '.gif', '.svg']):
-                            continue
-                        if clean_href.rstrip('/') in [f"https://{domain_name}", f"http://{domain_name}", "", "/"]:
-                            continue
-
-                        is_valid = False
-                        if "joysporn" in domain_name and clean_href.endswith('.html'):
-                            is_valid = True
-                        elif ("xhamster" in domain_name or "xhaccess" in domain_name) and ("/video" in clean_href):
-                            if not clean_href.rstrip('/').endswith(('/videos', '/video')):
-                                is_valid = True
-                        elif clean_href.endswith('.html') or "/video" in clean_href:
-                            is_valid = True
-
-                        if is_valid:
-                            full_u = href if href.startswith("http") else urljoin(base_domain, href)
+                    full_u = href if href.startswith("http") else urljoin(base_domain, href)
+                    
+                    if "joysporn" in domain_name:
+                        if clean_href.endswith('.html') and not clean_href.endswith(('index.html', 'main.html')):
                             all_video_urls.add(full_u)
+                    elif "xhamster" in domain_name or "xhaccess" in domain_name:
+                        if "/videos/" in clean_href or "/video/" in clean_href:
+                            if not clean_href.rstrip('/').endswith(('/videos', '/video')):
+                                all_video_urls.add(full_u)
+        except Exception as e:
+            logger.error(f"Failed crawling page {p_url}: {e}")
 
-            except Exception as e:
-                logger.error(f"Failed crawling page {p_url}: {e}")
+    await asyncio.gather(*[fetch_page_links(pu) for pu in page_urls])
 
-        await asyncio.gather(*[fetch_page_links(pu) for pu in page_urls])
+    if not all_video_urls:
+        return []
 
-        if not all_video_urls:
-            return []
+    semaphore = asyncio.Semaphore(20)
+    async def sem_extract(v_url):
+        async with semaphore:
+            return await extract_video_link(v_url)
 
-        semaphore = asyncio.Semaphore(100)
-        async def sem_extract(v_url):
-            async with semaphore:
-                return await extract_video_link(client, v_url)
-
-        tasks = [sem_extract(v_url) for v_url in all_video_urls]
-        results = await asyncio.gather(*tasks)
-        return [res for res in results if res is not None]
+    tasks = [sem_extract(v_url) for v_url in all_video_urls]
+    results = await asyncio.gather(*tasks)
+    return [res for res in results if res is not None]
 
 # ==========================================================
 # TELEGRAM HANDLERS
@@ -247,7 +251,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "⚡ **Multi-Site Scraper & Downloader Bot Active!**\n"
-        "🌐 **Supported Sites:** Joysporn, Xhaccess, xHamster\n\n"
+        "🌐 **Supported Sites:** Joysporn, Xhaccess, xHamster (Cloudflare Bypass Enabled)\n\n"
         "📌 **General Commands:**\n"
         "• URL bhejein: Continuous 6 Pages Scrape karke .txt + .html file dega.\n"
         "• `.txt` file upload karein: FFmpeg se direct video download & upload karega.\n"
@@ -307,7 +311,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• **Authorized Users:** {len(ALLOWED_USERS)}\n"
         f"• **Total Processed Files:** {total_files}\n"
         f"• **Supported Sites:** Joysporn, Xhaccess, xHamster\n"
-        f"• **Engine:** Concurrency 100 HTTP/2 + Dynamic Header Engine\n"
+        f"• **Bypass Engine:** Cloudflare Anti-Bot Bypass Active\n"
         f"• **Status:** 🟢 Active & Ready"
     )
 
@@ -364,50 +368,48 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text(f"🚀 Total **{total}** links processing me hain! Rokne ke liye `/stop` likhein.")
 
-        limits = httpx.Limits(max_keepalive_connections=50, max_connections=100)
-        async with httpx.AsyncClient(verify=False, follow_redirects=True, limits=limits, timeout=12.0) as client:
-            for idx, raw_url in enumerate(urls, 1):
-                if STOP_PROCESS.get(user_id, False):
-                    await update.message.reply_text("🛑 **Task Stopped By User!**")
-                    break
+        for idx, raw_url in enumerate(urls, 1):
+            if STOP_PROCESS.get(user_id, False):
+                await update.message.reply_text("🛑 **Task Stopped By User!**")
+                break
 
-                progress_msg = await update.message.reply_text(f"⏳ **[{idx}/{total}] Link Extract Ho Raha Hai...**")
-                
-                stream_url = raw_url
-                video_title = f"Video #{idx}"
+            progress_msg = await update.message.reply_text(f"⏳ **[{idx}/{total}] Link Extract Ho Raha Hai...**")
+            
+            stream_url = raw_url
+            video_title = f"Video #{idx}"
 
-                if ("video" in raw_url or raw_url.endswith('.html')) and not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
-                    extracted = await extract_video_link(client, raw_url)
-                    if extracted and extracted.get('download_link'):
-                        stream_url = extracted['download_link']
-                        video_title = extracted.get('title', video_title)
+            if ("video" in raw_url or raw_url.endswith('.html')) and not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
+                extracted = await extract_video_link(raw_url)
+                if extracted and extracted.get('download_link'):
+                    stream_url = extracted['download_link']
+                    video_title = extracted.get('title', video_title)
 
-                output_file = f"temp_video_{user_id}.mp4"
+            output_file = f"temp_video_{user_id}.mp4"
 
-                if os.path.exists(output_file):
-                    os.remove(output_file)
+            if os.path.exists(output_file):
+                os.remove(output_file)
 
-                await progress_msg.edit_text(f"📥 **[{idx}/{total}] FFmpeg Downloader Active...**\n`{video_title[:30]}...`")
-                
-                success = await download_video_ffmpeg(stream_url, output_file)
+            await progress_msg.edit_text(f"📥 **[{idx}/{total}] FFmpeg Downloader Active...**\n`{video_title[:30]}...`")
+            
+            success = await download_video_ffmpeg(stream_url, output_file)
 
-                if success:
-                    await progress_msg.edit_text(f"📤 **[{idx}/{total}] Telegram Par Upload Ho Raha Hai...**")
-                    try:
-                        with open(output_file, 'rb') as vf:
-                            await update.message.reply_video(
-                                video=vf, 
-                                caption=f"🎥 **{video_title}**\n\n🔗 **Link {idx}/{total}**",
-                                supports_streaming=True
-                            )
-                        await progress_msg.delete()
-                    except Exception as upload_err:
-                        await progress_msg.edit_text(f"❌ Upload Error: {str(upload_err)}")
-                else:
-                    await progress_msg.edit_text(f"❌ **[{idx}/{total}] Download Failed!**")
+            if success:
+                await progress_msg.edit_text(f"📤 **[{idx}/{total}] Telegram Par Upload Ho Raha Hai...**")
+                try:
+                    with open(output_file, 'rb') as vf:
+                        await update.message.reply_video(
+                            video=vf, 
+                            caption=f"🎥 **{video_title}**\n\n🔗 **Link {idx}/{total}**",
+                            supports_streaming=True
+                        )
+                    await progress_msg.delete()
+                except Exception as upload_err:
+                    await progress_msg.edit_text(f"❌ Upload Error: {str(upload_err)}")
+            else:
+                await progress_msg.edit_text(f"❌ **[{idx}/{total}] Download Failed!**")
 
-                if os.path.exists(output_file):
-                    os.remove(output_file)
+            if os.path.exists(output_file):
+                os.remove(output_file)
 
         await status_msg.edit_text("✅ **All videos processing completed!**")
 
@@ -539,7 +541,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🤖 Ultra-Fast Infinite Scraper & Downloader Bot Active!")
+    print("🤖 Ultra-Fast Cloudflare-Bypassed Scraper & Downloader Active!")
     app.run_polling()
 
 if __name__ == "__main__":
