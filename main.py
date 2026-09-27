@@ -8,11 +8,10 @@ import subprocess
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional, List, Dict
-from urllib.parse import urlparse
-
+from typing import List, Dict
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -44,6 +43,7 @@ except ValueError:
 DB_FILE = "bot_data.db"
 STOP_PROCESS: Dict[int, bool] = {}
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+PARALLEL_WORKERS = 5
 
 # ==========================================================
 # DATABASE HANDLER
@@ -93,13 +93,13 @@ def get_all_users() -> List[int]:
     return users
 
 # ==========================================================
-# DUMMY HTTP SERVER & KEEP ALIVE
+# DUMMY HTTP SERVER & KEEP-ALIVE LOOP
 # ==========================================================
 class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Status: Fully Active & Operational!")
+        self.wfile.write(b"Ultra-Fast Scraping Engine Online!")
 
     def log_message(self, format, *args):
         return
@@ -120,26 +120,68 @@ def self_ping_loop():
         if render_app_url:
             try:
                 requests.get(render_app_url, timeout=10)
-                logger.info("Self-ping sent successfully!")
+                logger.info("Self-ping successful!")
             except Exception as e:
                 logger.error(f"Self-ping failed: {e}")
 
 # ==========================================================
-# TURBO ULTRA-FAST PLAYWRIGHT SCRAPING ENGINE
+# HIGH-SPEED PARSING ENGINE
 # ==========================================================
-async def scrape_single_url_fast(browser, url: str) -> dict:
+def fast_http_scrape_single(url: str) -> dict:
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     video_links = set()
-    stream_link = None
+    found_streams = set()
+    title = "Extracted Video"
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=3.5)
+        if resp.status_code == 200:
+            html = resp.text
+            
+            t_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
+            if t_match:
+                title = t_match.group(1).strip().replace("\n", " ")
+
+            streams = re.findall(r'https?://[^\s"\'<>]+\.(?:m3u8|mp4)[^\s"\'<>]*', html)
+            for st in streams:
+                if not any(x in st.lower() for x in [".jpg", ".png", ".gif", ".jpeg", ".ts", "thumb", "preview"]):
+                    clean_st = st.replace('\\/', '/')
+                    found_streams.add(clean_st)
+
+            hrefs = re.findall(r'href=["\'](https?://[^\s"\']+)["\']', html)
+            for href in hrefs:
+                clean = href.split('?')[0].split('#')[0]
+                if any(k in clean.lower() for k in ["/videos/", "/video/", "/movies/", "/watch/", "/post/", "/v/"]):
+                    if not any(x in clean.lower() for x in ["/categories/", "/tags/", "/search/", "/page/", "/users/"]):
+                        video_links.add(href)
+    except Exception:
+        pass
+
+    stream_link = list(found_streams)[0] if found_streams else None
+    file_type = "M3U8" if stream_link and ".m3u8" in stream_link else "MP4"
+
+    return {
+        "title": title[:50],
+        "type": file_type,
+        "page_url": url,
+        "download_link": stream_link,
+        "video_links": list(video_links)
+    }
+
+async def scrape_playwright_fallback(browser, url: str) -> dict:
+    video_links = set()
+    found_streams = set()
     title = "Video"
 
     context = await browser.new_context(
         user_agent=DEFAULT_USER_AGENT,
-        viewport={'width': 640, 'height': 360},
-        java_script_enabled=True,
-        has_touch=False
+        viewport={'width': 480, 'height': 320},
+        java_script_enabled=True
     )
     
-    # Resource blocking for 90% bandwidth saving and maximum speed
     await context.route(
         "**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2,ttf,otf,ico,mp3,wav,ogg,webp,avif,pdf}", 
         lambda route: route.abort()
@@ -148,73 +190,57 @@ async def scrape_single_url_fast(browser, url: str) -> dict:
     page = await context.new_page()
 
     def handle_response(response):
-        nonlocal stream_link
         res_url = response.url
-        if (".m3u8" in res_url or ".mp4" in res_url) and not stream_link:
+        if (".m3u8" in res_url or ".mp4" in res_url):
             if not any(x in res_url.lower() for x in [".jpg", ".png", ".gif", ".jpeg", ".ts", "thumb"]):
-                stream_link = res_url
+                found_streams.add(res_url)
 
     page.on("response", handle_response)
 
     try:
-        # Strict hard cutoff at 3.5 seconds
-        await page.goto(url, wait_until="domcontentloaded", timeout=3500)
+        await page.goto(url, wait_until="commit", timeout=2800)
         await asyncio.sleep(0.3)
 
-        try:
-            title = await page.title()
-        except Exception:
-            title = "Extracted Video"
+        try: title = await page.title()
+        except Exception: title = "Extracted Video"
+
+        html_content = await page.content()
+        regex_matches = re.findall(r'https?://[^\s"\'<>]+\.(?:m3u8|mp4)[^\s"\'<>]*', html_content)
+        for match in regex_matches:
+            if not any(x in match.lower() for x in [".jpg", ".png", ".gif", ".jpeg", ".ts", "thumb"]):
+                found_streams.add(match.replace('\\/', '/'))
 
         hrefs = await page.eval_on_selector_all("a[href]", "elements => elements.map(e => e.href)")
         for href in hrefs:
             clean = href.split('?')[0].split('#')[0]
-            if any(k in clean.lower() for k in [
-                "/video/", "/videos/", "/post/", "/watch/", "/v/", "/embed/", "/view/", "/play/", ".html"
-            ]) and not any(x in clean.lower() for x in [
-                "/page/", "/category/", "/tag/", "/index.html", "/search/", "/channels/", "/actors/", "/login"
-            ]):
-                video_links.add(href)
-
-    except Exception as e:
-        logger.debug(f"Fast Scrape Timeout/Error on {url}: {e}")
+            if any(k in clean.lower() for k in ["/video/", "/videos/", "/post/", "/watch/", "/v/", "/embed/"]):
+                if not any(x in clean.lower() for x in ["/page/", "/category/", "/tag/", "/search/"]):
+                    video_links.add(href)
+    except Exception:
+        pass
     finally:
         await context.close()
 
+    stream_link = list(found_streams)[0] if found_streams else None
     file_type = "M3U8" if stream_link and ".m3u8" in stream_link else "MP4"
 
     return {
-        "title": title,
+        "title": title[:50],
         "type": file_type,
         "page_url": url,
         "download_link": stream_link,
         "video_links": list(video_links)
     }
 
-async def download_video_ffmpeg(url: str, output_path: str) -> bool:
-    try:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-headers", f"User-Agent: {DEFAULT_USER_AGENT}\r\n",
-            "-i", url,
-            "-c", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            output_path
-        ]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        await proc.wait()
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
-    except Exception as e:
-        logger.error(f"FFmpeg download error: {e}")
-        return False
-
 # ==========================================================
-# BATCH SCRAPING LOGIC WITH LIVE COUNTER
+# PARALLEL BATCH SCRAPING ENGINE WITH STOP CHECK
 # ==========================================================
 async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
     message_target = update_or_query.message if isinstance(update_or_query, Update) else update_or_query.message
-    status_msg = await message_target.reply_text(f"🚀 **Turbo Scraping Started (Pages {start_page} to {end_page})...**")
+    user_id = update_or_query.effective_user.id
+    STOP_PROCESS[user_id] = False
+
+    status_msg = await message_target.reply_text(f"⚡ **Ultra-Fast Scraping Started (Pages {start_page}-{end_page})...**")
 
     base_u = target_url.rstrip('/')
     page_urls = []
@@ -223,350 +249,208 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
             page_urls.append(target_url)
         else:
             page_urls.append(f"{base_u}/page/{p}/")
-            page_urls.append(f"{base_u}/page/{p}")
+            page_urls.append(f"{base_u}/{p}")
             page_urls.append(f"{base_u}/?page={p}")
 
     page_urls = list(set(page_urls))
 
+    all_video_pages = set()
+    for pu in page_urls:
+        if STOP_PROCESS.get(user_id, False):
+            await status_msg.edit_text("🛑 **Scraping stopped.**")
+            return
+        res = fast_http_scrape_single(pu)
+        if res.get("video_links"):
+            all_video_pages.update(res["video_links"])
+
+    if not all_video_pages:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
+            tasks = [scrape_playwright_fallback(browser, pu) for pu in page_urls]
+            results = await asyncio.gather(*tasks)
+            await browser.close()
+
+            for r in results:
+                if r.get("video_links"):
+                    all_video_pages.update(r["video_links"])
+
+    if not all_video_pages:
+        await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.")
+        return
+
+    targets = list(all_video_pages)[:30]
+    total_targets = len(targets)
+    extracted_results = []
+    last_update_time = time.time()
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled"
-            ]
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
 
-        # STEP 1: Scan Pages Concurrently
-        await status_msg.edit_text(f"🔍 **Scanning Pages {start_page}-{end_page} concurrently...**")
-        index_tasks = [scrape_single_url_fast(browser, pu) for pu in page_urls]
-        index_results = await asyncio.gather(*index_tasks)
+        semaphore = asyncio.Semaphore(PARALLEL_WORKERS)
 
-        all_video_pages = set()
-        for res in index_results:
-            if res.get("video_links"):
-                all_video_pages.update(res["video_links"])
+        async def worker(v_url, idx):
+            if STOP_PROCESS.get(user_id, False):
+                return
+            async with semaphore:
+                if STOP_PROCESS.get(user_id, False):
+                    return
+                res = fast_http_scrape_single(v_url)
+                if not res.get("download_link"):
+                    res = await scrape_playwright_fallback(browser, v_url)
 
-        if not all_video_pages:
-            await browser.close()
-            await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi valid video links nahi mile.")
-            return
+                if res.get("download_link"):
+                    extracted_results.append(res)
 
-        targets_to_scrape = list(all_video_pages)[:25]
-        total_targets = len(targets_to_scrape)
-        
-        extracted_results = []
-        last_update_time = time.time()
+                nonlocal last_update_time
+                if time.time() - last_update_time > 1.0 or idx == total_targets:
+                    last_update_time = time.time()
+                    count = len(extracted_results)
+                    progress_pct = int((idx / total_targets) * 100)
+                    
+                    live_text = (
+                        f"⚡ **ULTRA-FAST PARALLEL SCRAPING**\n"
+                        f"📑 **Pages:** `{start_page}` to `{end_page}`\n"
+                        f"⏳ **Scanned:** `{idx}/{total_targets}` (`{progress_pct}%`)\n"
+                        f"🎯 **Extracted Streams:** `{count}` Found! 🔥\n\n"
+                    )
+                    for item in extracted_results[-3:]:
+                        live_text += f"• `{item['title'][:20]}` → [Link]({item['download_link']})\n"
 
-        # STEP 2: Live Extraction Loop
-        for idx, v_url in enumerate(targets_to_scrape, 1):
-            res = await scrape_single_url_fast(browser, v_url)
-            if res.get("download_link"):
-                extracted_results.append(res)
+                    try:
+                        await status_msg.edit_text(live_text, parse_mode="Markdown", disable_web_page_preview=True)
+                    except Exception:
+                        pass
 
-            # Throttle status updates to every 1.5 seconds to respect Telegram Limits
-            if time.time() - last_update_time > 1.5 or idx == total_targets:
-                last_update_time = time.time()
-                
-                count = len(extracted_results)
-                progress_pct = int((idx / total_targets) * 100)
-                
-                live_text = (
-                    f"⚡ **LIVE SCRAPING IN PROGRESS**\n"
-                    f"📑 **Pages:** `{start_page}` to `{end_page}`\n"
-                    f"⏳ **Scanned:** `{idx}/{total_targets}` Links (`{progress_pct}%`)\n"
-                    f"🎯 **Extracted Direct Streams:** `{count}` Found! 🔥\n\n"
-                    f"👇 **Recent Streams Found:**\n"
-                )
-                
-                for item in extracted_results[-3:]:
-                    title_clean = item['title'][:22]
-                    live_text += f"• `{title_clean}` → [Stream Link]({item['download_link']})\n"
-
-                try:
-                    await status_msg.edit_text(live_text, parse_mode="Markdown", disable_web_page_preview=True)
-                except Exception:
-                    pass
-
+        tasks = [worker(url, idx) for idx, url in enumerate(targets, 1)]
+        await asyncio.gather(*tasks)
         await browser.close()
 
-    if not extracted_results:
-        await status_msg.edit_text("❌ Video pages mile par direct stream URLs extract nahi ho sake.")
+    if STOP_PROCESS.get(user_id, False):
+        await status_msg.edit_text("🛑 **Process stopped by user.**")
         return
 
-    # Generate TXT Output File
-    txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | Total: {len(extracted_results)} Items) ---\n\n"
+    if not extracted_results:
+        await status_msg.edit_text("❌ Direct Stream URLs extract nahi ho paaye.")
+        return
+
+    txt_content = f"--- Scraped Links (Pages {start_page}-{end_page} | Total: {len(extracted_results)}) ---\n\n"
     for idx, item in enumerate(extracted_results, 1):
-        txt_content += f"{idx}. Title: {item['title']}\n"
-        txt_content += f"   Page URL: {item['page_url']}\n"
-        txt_content += f"   Direct Stream URL: {item['download_link']}\n\n"
+        txt_content += f"{idx}. {item['title']}\nPage: {item['page_url']}\nStream: {item['download_link']}\n\n"
 
     txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
     txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
 
-    # Generate HTML Output File
-    html_content = f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
-<style>
-body {{ font-family: sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
-.card {{ background: #1e1e1e; padding: 15px; margin-bottom: 12px; border-radius: 8px; border-left: 5px solid #0088cc; }}
-a {{ color: #4da6ff; word-break: break-all; text-decoration: none; }}
-.tag {{ background: #0088cc; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 11px; margin-left: 8px; }}
-</style></head><body><h2>Scraped Videos Pages {start_page} to {end_page} ({len(extracted_results)} Items Extracted)</h2>"""
-
-    for idx, item in enumerate(extracted_results, 1):
-        html_content += f"""<div class="card">
-<h3>{idx}. {item['title']} <span class="tag">{item['type']}</span></h3>
-<p><strong>🔗 Page URL:</strong> <a href="{item['page_url']}" target="_blank">{item['page_url']}</a></p>
-<p><strong>⚡ Direct Stream URL:</strong> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p>
-</div>"""
-    html_content += "</body></html>"
-
-    html_bytes = io.BytesIO(html_content.encode('utf-8'))
-    html_bytes.name = f"scraped_p{start_page}_to_p{end_page}.html"
-
     next_start = end_page + 1
     next_end = next_start + 9
     keyboard = [
-        [InlineKeyboardButton(f"▶️ Continue Next Batch (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
-        [InlineKeyboardButton("🛑 Stop Scraping", callback_data="stop_scrape")]
+        [InlineKeyboardButton(f"▶️ Next Batch (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
+        [InlineKeyboardButton("🛑 Stop", callback_data="stop_scrape")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
     context.user_data['last_url'] = target_url
     context.user_data['next_start'] = next_start
 
     await message_target.reply_document(
         document=txt_bytes, 
-        caption=f"📁 **Pages {start_page}-{end_page} TXT File** ({len(extracted_results)} Total Direct Links)"
-    )
-    await message_target.reply_document(
-        document=html_bytes, 
-        caption=f"🌐 **Pages {start_page}-{end_page} HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye button dabaein:",
-        reply_markup=reply_markup
+        caption=f"📁 **Pages {start_page}-{end_page} Completed!**\nFound `{len(extracted_results)}` direct stream links.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     await status_msg.delete()
 
 # ==========================================================
-# TELEGRAM BOT COMMAND & MESSAGE HANDLERS
+# COMMAND HANDLERS (/stop, /states, /start, etc.)
 # ==========================================================
-async def setup_bot_commands(application):
-    commands = [
-        BotCommand("start", "Start the bot and show help"),
-        BotCommand("stats", "Show bot & user statistics"),
-        BotCommand("stop", "Stop active task/scraping"),
-        BotCommand("userlist", "List allowed users (Admin only)"),
-        BotCommand("adduser", "Add allowed user ID (Admin only)"),
-        BotCommand("removeuser", "Remove user ID (Admin only)")
-    ]
-    await application.bot.set_my_commands(commands)
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("❌ Aap Authorized nahi hain.")
+        return
+    await update.message.reply_text("🤖 **Ultra-Fast Video Scraper Active!**\n\nLink bhejo, scraping start ho jaayegi.")
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stop Command implementation"""
     user_id = update.effective_user.id
-    if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ **Access Denied!**")
-        return
+    STOP_PROCESS[user_id] = True
+    await update.message.reply_text("🛑 **Scraping process stopping request sent!**")
 
-    await update.message.reply_text(
-        "⚡ **Universal Turbo Live Scraper Bot Active!**\n\n"
-        "• Direct URL bhejein parallel scraping run karne ke liye.\n"
-        "• Extracted TXT file upload karke automatic FFmpeg video downloads run karein."
-    )
-
-async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin command only.")
-        return
-    if context.args and context.args[0].isdigit():
-        uid = int(context.args[0])
-        add_user_db(uid)
-        await update.message.reply_text(f"✅ User `{uid}` database me add ho gaya.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("⚠️ **Usage:** `/adduser <user_id>`")
-
-async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin command only.")
-        return
-    if context.args and context.args[0].isdigit():
-        uid = int(context.args[0])
-        remove_user_db(uid)
-        await update.message.reply_text(f"🗑️ User `{uid}` database se remove ho gaya.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("⚠️ **Usage:** `/removeuser <user_id>`")
-
-async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def states_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/states & /stats Command implementation"""
     if not is_user_allowed(update.effective_user.id):
         return
     users = get_all_users()
-    msg = "👥 **Authorized Users:**\n\n"
-    for uid in users:
-        role = "👑 Admin" if uid == ADMIN_ID else "👤 User"
-        msg += f"• `{uid}` ({role})\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_user_allowed(update.effective_user.id):
-        return
-    users_count = len(get_all_users())
-    await update.message.reply_text(
-        f"📊 **Bot Statistics:**\n\n"
-        f"• **Authorized Users:** {users_count}\n"
-        f"• **Engine Speed:** 3.5s Hard Cutoff Turbo Engine ⚡"
+    stats_text = (
+        f"📊 **BOT SYSTEM STATUS & STATES**\n\n"
+        f"👑 **Admin ID:** `{ADMIN_ID}`\n"
+        f"👥 **Total Authorized Users:** `{len(users)}`\n"
+        f"⚡ **Parallel Workers Engine:** `{PARALLEL_WORKERS} Threads`\n"
+        f"🟢 **Status:** 24/7 Active & Running\n"
     )
+    await update.message.reply_text(stats_text, parse_mode="Markdown")
 
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STOP_PROCESS[update.effective_user.id] = True
-    await update.message.reply_text("🛑 **Process Stop Request Sent!**")
+async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    if context.args:
+        try:
+            uid = int(context.args[0])
+            add_user_db(uid)
+            await update.message.reply_text(f"✅ User `{uid}` added!")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid User ID.")
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_user_allowed(user_id):
-        return
-
-    doc = update.message.document
-    if not doc or not doc.file_name.endswith('.txt'):
-        await update.message.reply_text("❌ Kripya valid `.txt` file upload karein.")
-        return
-
-    STOP_PROCESS[user_id] = False
-    status_msg = await update.message.reply_text("📥 **TXT file read ho rahi hai...**")
-
-    try:
-        file = await context.bot.get_file(doc.file_id)
-        file_bytes = io.BytesIO()
-        await file.download_to_memory(file_bytes)
-        file_content = file_bytes.getvalue().decode('utf-8', errors='ignore')
-
-        raw_lines = file_content.splitlines()
-        urls = [m.group(1) for line in raw_lines if (m := re.search(r'(https?://[^\s]+)', line))]
-
-        if not urls:
-            await status_msg.edit_text("❌ TXT file me koi valid URL nahi mila.")
-            return
-
-        total = len(urls)
-        await status_msg.edit_text(f"🚀 Total **{total}** links processing me hain! Rokne ke liye `/stop` bhejein.")
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-            )
-
-            for idx, raw_url in enumerate(urls, 1):
-                if STOP_PROCESS.get(user_id, False):
-                    await update.message.reply_text("🛑 **Task Stopped By User!**")
-                    break
-
-                progress_msg = await update.message.reply_text(f"⏳ **[{idx}/{total}] Processing...**")
-                stream_url = raw_url
-                video_title = f"Video #{idx}"
-
-                if not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
-                    extracted = await scrape_single_url_fast(browser, raw_url)
-                    if extracted and extracted.get('download_link'):
-                        stream_url = extracted['download_link']
-                        video_title = extracted.get('title', video_title)
-
-                output_file = f"temp_video_{user_id}_{idx}.mp4"
-                if os.path.exists(output_file):
-                    try: os.remove(output_file)
-                    except Exception: pass
-
-                await progress_msg.edit_text(f"📥 **[{idx}/{total}] FFmpeg Downloading...**\n`{video_title[:30]}...`")
-                success = await download_video_ffmpeg(stream_url, output_file)
-
-                if success:
-                    await progress_msg.edit_text(f"📤 **[{idx}/{total}] Telegram Par Upload Ho Raha Hai...**")
-                    try:
-                        with open(output_file, 'rb') as vf:
-                            await update.message.reply_video(
-                                video=vf, 
-                                caption=f"🎥 **{video_title}**\n\n🔗 **Link {idx}/{total}**",
-                                supports_streaming=True
-                            )
-                        await progress_msg.delete()
-                    except Exception as upload_err:
-                        await progress_msg.edit_text(f"❌ Upload Error: {str(upload_err)}")
-                else:
-                    await progress_msg.edit_text(f"❌ **[{idx}/{total}] Download Failed!**")
-
-                if os.path.exists(output_file):
-                    try: os.remove(output_file)
-                    except Exception: pass
-
-            await browser.close()
-
-        await status_msg.edit_text("✅ **All videos processing completed!**")
-
-    except Exception as e:
-        logger.error(f"Error processing document: {e}")
-        await status_msg.edit_text(f"❌ File Process Error: {str(e)}")
+async def remove_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    if context.args:
+        try:
+            uid = int(context.args[0])
+            remove_user_db(uid)
+            await update.message.reply_text(f"🗑️ User `{uid}` removed!")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid User ID.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ **Access Denied!**")
-        return
-
+    if not is_user_allowed(update.effective_user.id): return
     text = update.message.text.strip()
     url_match = re.search(r'(https?://[^\s]+)', text)
-
-    if not url_match:
-        await update.message.reply_text("❌ Valid URL bhejein!")
-        return
-
-    target_url = url_match.group(1)
-    await run_scrape_chunk(update, context, target_url, start_page=1, end_page=10)
+    if url_match:
+        await run_scrape_chunk(update, context, url_match.group(1), start_page=1, end_page=10)
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    if not is_user_allowed(query.from_user.id):
-        return
-
-    if query.data == "stop_scrape":
-        await query.edit_message_caption(caption=query.message.caption + "\n\n🛑 **Scraping Stopped By User.**")
-        return
+    user_id = query.from_user.id
 
     if query.data == "continue_scrape":
         target_url = context.user_data.get('last_url')
         start_page = context.user_data.get('next_start', 11)
-        end_page = start_page + 9
+        await run_scrape_chunk(query, context, target_url, start_page=start_page, end_page=start_page+9)
+    elif query.data == "stop_scrape":
+        STOP_PROCESS[user_id] = True
+        await query.message.edit_text("🛑 **Scraping Process Stopped.**")
 
-        if not target_url:
-            await query.message.reply_text("❌ Target URL lost. Please re-send the URL.")
-            return
-
-        await run_scrape_chunk(query, context, target_url, start_page=start_page, end_page=end_page)
-
-# ==========================================================
-# MAIN EXECUTION ENTRYPOINT
-# ==========================================================
 def main():
     init_db()
     threading.Thread(target=run_dummy_server, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_bot_commands).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("adduser", adduser_command))
-    app.add_handler(CommandHandler("removeuser", removeuser_command))
-    app.add_handler(CommandHandler("userlist", userlist_command))
-
-    app.add_handler(CallbackQueryHandler(button_callback_handler))
-    app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
+    # Commands Registered
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("states", states_cmd))
+    app.add_handler(CommandHandler("stats", states_cmd))
+    app.add_handler(CommandHandler("adduser", add_user_cmd))
+    app.add_handler(CommandHandler("removeuser", remove_user_cmd))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback_handler))
 
-    print("🤖 Fully Final Turbo Live Scraper Bot Active!")
+    print("🤖 Ultra-Fast Scraper Ready with /stop and /states!")
     app.run_polling()
 
 if __name__ == "__main__":
