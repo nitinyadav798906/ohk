@@ -8,10 +8,9 @@ import subprocess
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional, List, Set, Dict
-from urllib.parse import unquote, urljoin, urlparse
+from typing import Optional, List, Dict
+from urllib.parse import urlparse
 
-import cloudscraper
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -22,6 +21,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
+from playwright.async_api import async_playwright
 
 # ==========================================================
 # LOGGING SETUP
@@ -33,21 +33,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================================
-# CONFIGURATION & GLOBAL VARIABLES
+# CONFIGURATION
 # ==========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7673015455:AAFW01HGes-gzQUg_1Fb6gKD2HlSTOZcG0Y")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1714266885"))
-DB_FILE = "bot_data.db"
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "1714266885"))
+except ValueError:
+    ADMIN_ID = 1234567890
 
+DB_FILE = "bot_data.db"
 STOP_PROCESS: Dict[int, bool] = {}
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
-scraper = cloudscraper.create_scraper(
-    browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
-)
-
 # ==========================================================
-# DATABASE HANDLER
+# DATABASE HANDLER (SQLite Access Control)
 # ==========================================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -58,25 +57,18 @@ def init_db():
         )
     """)
     cursor.execute("INSERT OR IGNORE INTO allowed_users (user_id) VALUES (?)", (ADMIN_ID,))
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS library (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            filename TEXT,
-            count INTEGER,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
     conn.commit()
     conn.close()
 
 def is_user_allowed(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
     conn.close()
-    return res is not None or user_id == ADMIN_ID
+    return res is not None
 
 def add_user_db(user_id: int):
     conn = sqlite3.connect(DB_FILE)
@@ -100,27 +92,6 @@ def get_all_users() -> List[int]:
     conn.close()
     return users
 
-def get_custom_headers(url: str) -> dict:
-    parsed = urlparse(url)
-    domain = parsed.netloc or "beeg.onl"
-    referer = f"https://{domain}/"
-    
-    return {
-        "User-Agent": DEFAULT_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": referer,
-        "Origin": referer.rstrip('/'),
-        "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1"
-    }
-
 # ==========================================================
 # DUMMY HTTP SERVER & KEEP ALIVE
 # ==========================================================
@@ -129,7 +100,7 @@ class DummyPortServer(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot Status: Active and Running 24/7!")
-        
+
     def log_message(self, format, *args):
         return
 
@@ -154,95 +125,60 @@ def self_ping_loop():
                 logger.error(f"Self-ping failed: {e}")
 
 # ==========================================================
-# EXTRACTION & SCRAPING ENGINE
+# PLAYWRIGHT SCRAPER & FFMEPG ENGINE
 # ==========================================================
-def process_tpl_link(hls_link: str) -> str:
-    try:
-        if "_TPL_" not in hls_link:
-            return hls_link
-        decoded_link = unquote(hls_link)
-        multi_match = re.search(r'multi=([^/]+)', decoded_link)
-        if multi_match:
-            res_labels = re.findall(r'(\d+p)', multi_match.group(1))
-            if res_labels:
-                best_res = sorted(set(res_labels), key=lambda x: int(x.replace('p', '')))[-1]
-                return hls_link.replace('_TPL_', best_res)
-        return hls_link.replace('_TPL_', '720p')
-    except Exception:
-        return hls_link
+async def scrape_page_with_playwright(url: str) -> dict:
+    video_links = set()
+    stream_link = None
+    title = "Video"
 
-def fetch_url_sync(url: str) -> Optional[str]:
-    try:
-        headers = get_custom_headers(url)
-        resp = scraper.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            return resp.text
-    except Exception as e:
-        logger.error(f"Scraper fetch error on {url}: {e}")
-    return None
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=DEFAULT_USER_AGENT)
+        page = await context.new_page()
 
-async def fetch_url_with_cloudscraper(url: str) -> Optional[str]:
-    return await asyncio.to_thread(fetch_url_sync, url)
+        def handle_response(response):
+            nonlocal stream_link
+            res_url = response.url
+            if ".m3u8" in res_url or ".mp4" in res_url:
+                if not stream_link and not any(x in res_url for x in [".jpg", ".png", ".gif", ".jpeg"]):
+                    stream_link = res_url
 
-async def extract_video_link(video_url: str) -> Optional[dict]:
-    try:
-        text = await fetch_url_with_cloudscraper(video_url)
-        if not text:
-            return None
+        page.on("response", handle_response)
 
-        title = "Video"
-        title_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE | re.DOTALL)
-        if not title_match:
-            title_match = re.search(r'<title>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
-            
-        if title_match:
-            title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-            title = re.sub(r'\s+', ' ', title)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight/2)")
+            await asyncio.sleep(2)
 
-        stream_link = None
-        file_type = None
+            title = await page.title()
+            hrefs = await page.eval_on_selector_all("a[href]", "elements => elements.map(e => e.href)")
+            for href in hrefs:
+                clean = href.split('?')[0].split('#')[0]
+                if any(k in clean for k in ["/video/", "/videos/", "/post/", ".html"]) and not any(x in clean for x in ["/page/", "/category/", "/tag/", "/index.html"]):
+                    video_links.add(href)
 
-        m_hls = re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
-        if m_hls:
-            stream_link = m_hls.group(1).replace('\\/', '/')
-            file_type = "M3U8"
-        else:
-            m_mp4 = re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
-            if m_mp4:
-                stream_link = m_mp4.group(1).replace('\\/', '/')
-                file_type = "MP4"
+        except Exception as e:
+            logger.error(f"Playwright Scraping Error on {url}: {e}")
+        finally:
+            await browser.close()
 
-        if not stream_link and "sxyprn" in video_url:
-            sxy_match = re.search(r'data-s=["\'](https?:[^\s"\']+?)["\']', text) or re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if sxy_match:
-                stream_link = sxy_match.group(1)
-                file_type = "MP4" if ".mp4" in stream_link else "M3U8"
+    file_type = "M3U8" if stream_link and ".m3u8" in stream_link else "MP4"
 
-        if not stream_link and "beeg" in video_url:
-            beeg_match = re.search(r'(https?:[^\s"\']*?\.(?:m3u8|mp4)[^\s"\']*)', text) or re.search(r'src=["\'](https?:[^\s"\']+?\.(?:m3u8|mp4)[^\s"\']*)["\']', text)
-            if beeg_match:
-                stream_link = beeg_match.group(1).replace('\\/', '/')
-                file_type = "MP4" if ".mp4" in stream_link else "M3U8"
-
-        if stream_link:
-            final_link = process_tpl_link(stream_link) if file_type == "M3U8" else stream_link
-            return {
-                "title": title,
-                "type": file_type,
-                "page_url": video_url,
-                "download_link": final_link
-            }
-    except Exception as e:
-        logger.error(f"Extraction Error for {video_url}: {e}")
-    return None
+    return {
+        "title": title,
+        "type": file_type,
+        "page_url": url,
+        "download_link": stream_link,
+        "video_links": list(video_links)
+    }
 
 async def download_video_ffmpeg(url: str, output_path: str) -> bool:
     try:
-        headers = get_custom_headers(url)
         cmd = [
             "ffmpeg",
             "-y",
-            "-headers", f"User-Agent: {headers['User-Agent']}\r\nReferer: {headers['Referer']}\r\n",
+            "-user_agent", DEFAULT_USER_AGENT,
             "-i", url,
             "-c", "copy",
             "-bsf:a", "aac_adtstoasc",
@@ -256,118 +192,109 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# FIXED MULTI-PAGE SCRAPING ENGINE (FOR BEEG.ONL & ALL)
+# MULTI-PAGE CHUNK SCRAPING LOGIC
 # ==========================================================
-async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
-    found_urls: Set[str] = set()
-    parsed = urlparse(url)
+async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
+    # Fixed Update / Callback Query message targeting
+    message_target = update_or_query.message if isinstance(update_or_query, Update) else update_or_query.message
+
+    status_msg = await message_target.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page} with Headless Browser Engine...**")
+
+    parsed = urlparse(target_url)
     domain_name = parsed.netloc or "beeg.onl"
     base_domain = f"https://{domain_name}"
-
-    is_single_video = (
-        url.endswith('.html') or 
-        re.search(r'/video/[^/]+', url) or
-        re.search(r'/post/\d+', url)
-    )
-    
-    if is_single_video and not any(url.endswith(x) for x in ['index.html', 'ilisting.html', '/']):
-        res = await extract_video_link(url)
-        return [res] if res else []
+    base_u = target_url.rstrip('/')
 
     page_urls = []
-    base_u = url.rstrip('/')
-
     for p in range(start_page, end_page + 1):
         if p == 1:
-            page_urls.append(url)
+            page_urls.append(target_url)
             page_urls.append(f"{base_domain}/")
-            continue
-        
-        if "beeg" in domain_name:
+        else:
             page_urls.append(f"{base_u}/page/{p}/")
             page_urls.append(f"{base_u}/page/{p}")
             page_urls.append(f"{base_domain}/page/{p}/")
             page_urls.append(f"{base_u}/?page={p}")
 
-        elif "sxyprn" in domain_name:
-            if "?" in url:
-                page_urls.append(f"{url}&page={p}")
-            else:
-                page_urls.append(f"{base_u}?page={p}")
-                page_urls.append(f"{base_u}/{p}")
+    all_video_pages = set()
 
-        elif "joysporn" in domain_name:
-            if base_u == base_domain:
-                page_urls.append(f"{base_domain}/apapu/{p}/")
-            elif base_u.endswith('.html'):
-                page_urls.append(url)
-            else:
-                page_urls.append(f"{base_u}/{p}/")
-                page_urls.append(f"{base_u}?page={p}")
+    for pu in set(page_urls):
+        res = await scrape_page_with_playwright(pu)
+        if res.get("video_links"):
+            all_video_pages.update(res["video_links"])
 
-        elif any(x in domain_name for x in ["xhamster", "xhaccess", "pornhub", "spankbang", "redtube", "youporn"]):
-            page_urls.append(f"{base_u}/{p}")
-            page_urls.append(f"{base_u}?page={p}")
-            if "?" in url:
-                page_urls.append(f"{url}&page={p}")
+    if not all_video_pages:
+        await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.")
+        return
 
-    page_urls = list(set(page_urls))
+    await status_msg.edit_text(f"✅ Total **{len(all_video_pages)}** Video Pages Found! Extracting Stream URLs...")
 
-    async def fetch_page_links(p_url):
-        try:
-            html_text = await fetch_url_with_cloudscraper(p_url)
-            if not html_text:
-                return
+    extracted_results = []
+    for v_url in list(all_video_pages)[:30]:
+        res = await scrape_page_with_playwright(v_url)
+        if res.get("download_link"):
+            extracted_results.append(res)
 
-            raw_links = re.findall(r'href=["\']([^"\']+)["\']', html_text)
+    if not extracted_results:
+        await status_msg.edit_text("❌ Pages mile par stream URLs extract nahi ho sake.")
+        return
 
-            for href in raw_links:
-                clean_href = href.split('?')[0].split('#')[0]
-                
-                if any(clean_href.endswith(ext) for ext in ['.css', '.js', '.jpg', '.png', '.gif', '.svg', '.jpeg', '.webp']):
-                    continue
+    # Generate TXT File
+    txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(extracted_results)} Items) ---\n\n"
+    for idx, item in enumerate(extracted_results, 1):
+        txt_content += f"{idx}. Title: {item['title']}\n"
+        txt_content += f"   Permanent Video Page: {item['page_url']}\n"
+        txt_content += f"   Direct Stream Link: {item['download_link']}\n\n"
 
-                full_u = href if href.startswith("http") else urljoin(base_domain, href)
-                
-                if "beeg" in domain_name:
-                    if "/video/" in clean_href or clean_href.endswith('.html') or re.search(r'/[^/]+-\d+/?$', clean_href):
-                        if not any(x in clean_href for x in ['/page/', '/category/', '/tag/', '/index.html']):
-                            found_urls.add(full_u)
+    txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
+    txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
 
-                elif "sxyprn" in domain_name:
-                    if re.search(r'/post/\w+', clean_href) or re.search(r'/video/\w+', clean_href) or clean_href.endswith('.html'):
-                        found_urls.add(full_u)
+    # Generate HTML File
+    html_content = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
+<style>
+body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
+.card {{ background: #1e1e1e; padding: 18px; margin-bottom: 15px; border-radius: 8px; border-left: 5px solid #0088cc; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}
+a {{ color: #4da6ff; word-break: break-all; text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+.tag {{ display: inline-block; background: #0088cc; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; margin-left: 8px; }}
+</style></head><body><h2>Scraped Videos Pages {start_page} to {end_page} ({len(extracted_results)} Items)</h2>"""
 
-                elif "joysporn" in domain_name:
-                    if clean_href.endswith('.html') or "/video/" in clean_href or "/videos/" in clean_href:
-                        if not any(clean_href.endswith(x) for x in ['index.html', 'main.html', 'ilisting.html']):
-                            found_urls.add(full_u)
+    for idx, item in enumerate(extracted_results, 1):
+        html_content += f"""<div class="card">
+<h3>{idx}. {item['title']} <span class="tag">{item['type']}</span></h3>
+<p><strong>🔗 Permanent Video Link:</strong> <a href="{item['page_url']}" target="_blank">{item['page_url']}</a></p>
+<p><strong>⚡ Direct Stream URL:</strong> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p>
+</div>"""
+    html_content += "</body></html>"
 
-                elif any(x in domain_name for x in ["xhamster", "xhaccess", "pornhub", "spankbang", "redtube", "youporn"]):
-                    if any(key in clean_href for key in ["/videos/", "/video/", "/view_video.php", "/watch/"]):
-                        if not re.search(r'/videos?/?$', clean_href):
-                            found_urls.add(full_u)
+    html_bytes = io.BytesIO(html_content.encode('utf-8'))
+    html_bytes.name = f"scraped_p{start_page}_to_p{end_page}.html"
 
-        except Exception as e:
-            logger.error(f"Error crawling page {p_url}: {e}")
+    next_start = end_page + 1
+    next_end = next_start + 9
+    keyboard = [
+        [InlineKeyboardButton(f"▶️ Continue (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
+        [InlineKeyboardButton("🛑 Stop Scraping", callback_data="stop_scrape")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await asyncio.gather(*[fetch_page_links(pu) for pu in page_urls])
+    context.user_data['last_url'] = target_url
+    context.user_data['next_start'] = next_start
 
-    if not found_urls:
-        return []
-
-    semaphore = asyncio.Semaphore(35)
-    async def sem_extract(v_url):
-        async with semaphore:
-            return await extract_video_link(v_url)
-
-    tasks = [sem_extract(v_url) for v_url in found_urls]
-    results = await asyncio.gather(*tasks)
-    
-    return [res for res in results if res is not None]
+    await message_target.reply_document(
+        document=txt_bytes, 
+        caption=f"📁 **Pages {start_page}-{end_page} TXT File** ({len(extracted_results)} Links)"
+    )
+    await message_target.reply_document(
+        document=html_bytes, 
+        caption=f"🌐 **Pages {start_page}-{end_page} HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye niche button par click karein:",
+        reply_markup=reply_markup
+    )
+    await status_msg.delete()
 
 # ==========================================================
-# TELEGRAM BOT HANDLERS & COMMAND REGISTER
+# TELEGRAM BOT HANDLERS
 # ==========================================================
 async def setup_bot_commands(application):
     commands = [
@@ -387,14 +314,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚡ **9-Site Bulk Scraper & Downloader Bot Active!**\n\n"
+        "⚡ **Advanced Playwright Bulk Scraper & Downloader Bot Active!**\n\n"
         "🌐 **Supported Sites (9 Total):**\n"
-        "• xHamster | Joysporn | Xhaccess | Sxyprn | Beeg.onl\n"
+        "• Beeg.onl | xHamster | Joysporn | Xhaccess | Sxyprn\n"
         "• Pornhub | Spankbang | Redtube | Youporn\n\n"
         "📌 **Features & Usage:**\n"
-        "1. **300+ Link Extraction:** Target URL bhejein, bot Pages 1-10 tak links extract karega.\n"
-        "2. **Clean TXT & HTML Output:** Video Links & Direct Stream URLs deliver karega.\n"
-        "3. **FFmpeg Downloader:** `.txt` file upload karke auto download karein.\n\n"
+        "1. **Headless Browser Crawling:** Modern Cloudflare & JS-rendered sites support.\n"
+        "2. **Dual Output:** Get TXT and Interactive Dark HTML File.\n"
+        "3. **FFmpeg Auto Downloader:** Upload `.txt` file to auto download and upload videos to Telegram.\n\n"
         "🛠️ **Commands:** `/start`, `/stats`, `/stop`, `/userlist`, `/adduser`, `/removeuser`"
     )
 
@@ -405,7 +332,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         add_user_db(uid)
-        await update.message.reply_text(f"✅ User `{uid}` database me add ho gaya.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ User `{uid}` database me add kar diya gaya.", parse_mode="Markdown")
     else:
         await update.message.reply_text("⚠️ **Usage:** `/adduser <user_id>`")
 
@@ -416,7 +343,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         remove_user_db(uid)
-        await update.message.reply_text(f"🗑️ User `{uid}` database se hata diya gaya.", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑️ User `{uid}` database se removal completed.", parse_mode="Markdown")
     else:
         await update.message.reply_text("⚠️ **Usage:** `/removeuser <user_id>`")
 
@@ -438,13 +365,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 **Bot Status:**\n\n"
         f"• **Authorized Users:** {users_count}\n"
         f"• **Supported Sites:** 9 Platforms\n"
-        f"• **Extract Capacity:** ~300+ Links / Batch\n"
-        f"• **Engine:** Cloudflare Bypass Active 🟢"
+        f"• **Engine:** Playwright Chromium Active 🟢"
     )
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STOP_PROCESS[update.effective_user.id] = True
-    await update.message.reply_text("🛑 **Process Stop Request Bhej Diya Gaya Hai!**")
+    await update.message.reply_text("🛑 **Process Stop Request Sent!**")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -485,7 +411,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             video_title = f"Video #{idx}"
 
             if not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
-                extracted = await extract_video_link(raw_url)
+                extracted = await scrape_page_with_playwright(raw_url)
                 if extracted and extracted.get('download_link'):
                     stream_url = extracted['download_link']
                     video_title = extracted.get('title', video_title)
@@ -523,76 +449,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error processing document: {e}")
         await status_msg.edit_text(f"❌ File Process Error: {str(e)}")
 
-async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
-    status_msg = await update_or_query.message.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page}...**")
-
-    try:
-        results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
-
-        if not results:
-            await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.")
-            return
-
-        await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! TXT aur HTML files tayar ho rahi hain...")
-
-        txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
-        for idx, item in enumerate(results, 1):
-            txt_content += f"{idx}. Title: {item['title']}\n"
-            txt_content += f"   Permanent Video Page: {item['page_url']}\n"
-            txt_content += f"   Direct Stream Link: {item['download_link']}\n\n"
-
-        txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
-        txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
-
-        html_content = f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
-<style>
-body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
-.card {{ background: #1e1e1e; padding: 18px; margin-bottom: 15px; border-radius: 8px; border-left: 5px solid #0088cc; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}
-a {{ color: #4da6ff; word-break: break-all; text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-.tag {{ display: inline-block; background: #0088cc; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; margin-left: 8px; }}
-</style></head><body><h2>Scraped Videos Pages {start_page} to {end_page} ({len(results)} Total Items)</h2>"""
-
-        for idx, item in enumerate(results, 1):
-            html_content += f"""<div class="card">
-<h3>{idx}. {item['title']} <span class="tag">{item['type']}</span></h3>
-<p><strong>🔗 Permanent Video Link:</strong> <a href="{item['page_url']}" target="_blank">{item['page_url']}</a></p>
-<p><strong>⚡ Direct Stream URL:</strong> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p>
-</div>"""
-        html_content += "</body></html>"
-
-        html_bytes = io.BytesIO(html_content.encode('utf-8'))
-        html_bytes.name = f"scraped_p{start_page}_to_p{end_page}.html"
-
-        context.user_data['last_url'] = target_url
-        context.user_data['next_start'] = end_page + 1
-
-        next_start = end_page + 1
-        next_end = next_start + 9
-
-        keyboard = [
-            [InlineKeyboardButton(f"▶️ Continue (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
-            [InlineKeyboardButton("🛑 Stop Scraping", callback_data="stop_scrape")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update_or_query.message.reply_document(
-            document=txt_bytes, 
-            caption=f"📁 **Pages {start_page}-{end_page} TXT File** ({len(results)} Links)"
-        )
-        
-        await update_or_query.message.reply_document(
-            document=html_bytes, 
-            caption=f"🌐 **Pages {start_page}-{end_page} HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye niche button par click karein:",
-            reply_markup=reply_markup
-        )
-        
-        await status_msg.delete()
-    except Exception as e:
-        logger.error(f"Error in run_scrape_chunk: {e}")
-        await status_msg.edit_text(f"❌ Scraping error: {str(e)}")
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_allowed(user_id):
@@ -607,15 +463,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target_url = url_match.group(1)
-    supported_domains = [
-        "joysporn", "xhaccess", "xhamster", "sxyprn", 
-        "pornhub", "spankbang", "redtube", "youporn", "beeg.onl", "beeg"
-    ]
-
-    if not any(domain in target_url.lower() for domain in supported_domains):
-        await update.message.reply_text("❌ Yeh domain supported nahi hai. Supported sites: xHamster, Joysporn, Sxyprn, Beeg.onl, Pornhub, Spankbang, Redtube, Youporn.")
-        return
-
     await run_scrape_chunk(update, context, target_url, start_page=1, end_page=10)
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -635,7 +482,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         end_page = start_page + 9
 
         if not target_url:
-            await query.message.reply_text("❌ Target URL lost. Kripya URL firse bhej kar start karein.")
+            await query.message.reply_text("❌ Target URL lost. Please re-send the URL.")
             return
 
         await run_scrape_chunk(query, context, target_url, start_page=start_page, end_page=end_page)
@@ -647,22 +494,21 @@ def main():
     init_db()
     threading.Thread(target=run_dummy_server, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
-    
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_bot_commands).build()
-    
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("stats", stats_command))
-    
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
     app.add_handler(CommandHandler("userlist", userlist_command))
-    
+
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("🤖 Advanced 9-Site 300+ Link Scraper Active!")
+
+    print("🤖 Playwright Headless Bot Active!")
     app.run_polling()
 
 if __name__ == "__main__":
