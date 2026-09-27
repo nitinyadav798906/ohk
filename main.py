@@ -43,10 +43,10 @@ except ValueError:
 
 DB_FILE = "bot_data.db"
 STOP_PROCESS: Dict[int, bool] = {}
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 # ==========================================================
-# DATABASE HANDLER (SQLite Access Control)
+# DATABASE HANDLER
 # ==========================================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -99,7 +99,7 @@ class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Status: Active and Running 24/7!")
+        self.wfile.write(b"Bot Status: Active, Running 24/7 Universal Ultra-Fast Engine!")
 
     def log_message(self, format, *args):
         return
@@ -125,43 +125,75 @@ def self_ping_loop():
                 logger.error(f"Self-ping failed: {e}")
 
 # ==========================================================
-# PLAYWRIGHT SCRAPER & FFMEPG ENGINE
+# UNIVERSAL ULTRA-FAST PLAYWRIGHT ENGINE
 # ==========================================================
-async def scrape_page_with_playwright(url: str) -> dict:
+async def scrape_single_url_fast(browser, url: str) -> dict:
     video_links = set()
     stream_link = None
     title = "Video"
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=DEFAULT_USER_AGENT)
-        page = await context.new_page()
+    context = await browser.new_context(
+        user_agent=DEFAULT_USER_AGENT,
+        viewport={'width': 800, 'height': 600},
+        java_script_enabled=True,
+        has_touch=False
+    )
+    
+    # Enable Route Abort for Max Speed
+    await context.route(
+        "**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2,ttf,otf,ico,mp3,wav,ogg,webp,avif,pdf}", 
+        lambda route: route.abort()
+    )
 
-        def handle_response(response):
-            nonlocal stream_link
-            res_url = response.url
-            if ".m3u8" in res_url or ".mp4" in res_url:
-                if not stream_link and not any(x in res_url for x in [".jpg", ".png", ".gif", ".jpeg"]):
-                    stream_link = res_url
+    page = await context.new_page()
 
-        page.on("response", handle_response)
+    # Low-level Chrome Protocol Blocking for trackers and ads
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        await cdp.send("Network.setBlockedURLs", {
+            "urls": [
+                "*.google-analytics.com", "*.doubleclick.net", "*.googlesyndication.com",
+                "*.facebook.com", "*.exoclick.com", "*.popads.net", "*.juicyads.com",
+                "*.trafficjunky.net", "*.adsterra.com", "*.mgid.com", "*.outbrain.com"
+            ]
+        })
+    except Exception:
+        pass
+
+    def handle_response(response):
+        nonlocal stream_link
+        res_url = response.url
+        if (".m3u8" in res_url or ".mp4" in res_url) and not stream_link:
+            if not any(x in res_url.lower() for x in [".jpg", ".png", ".gif", ".jpeg", ".ts"]):
+                stream_link = res_url
+
+    page.on("response", handle_response)
+
+    try:
+        # ULTRA OPTIMIZATION: Immediate Commit Load (5 Seconds max timeout)
+        await page.goto(url, wait_until="commit", timeout=5000)
+        await asyncio.sleep(0.4)
 
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.evaluate("window.scrollBy(0, document.body.scrollHeight/2)")
-            await asyncio.sleep(2)
-
             title = await page.title()
-            hrefs = await page.eval_on_selector_all("a[href]", "elements => elements.map(e => e.href)")
-            for href in hrefs:
-                clean = href.split('?')[0].split('#')[0]
-                if any(k in clean for k in ["/video/", "/videos/", "/post/", ".html"]) and not any(x in clean for x in ["/page/", "/category/", "/tag/", "/index.html"]):
-                    video_links.add(href)
+        except Exception:
+            title = "Extracted Media"
 
-        except Exception as e:
-            logger.error(f"Playwright Scraping Error on {url}: {e}")
-        finally:
-            await browser.close()
+        # Universal extraction for video page anchors
+        hrefs = await page.eval_on_selector_all("a[href]", "elements => elements.map(e => e.href)")
+        for href in hrefs:
+            clean = href.split('?')[0].split('#')[0]
+            if any(k in clean.lower() for k in [
+                "/video/", "/videos/", "/post/", "/watch/", "/v/", "/embed/", "/view/", "/play/", ".html"
+            ]) and not any(x in clean.lower() for x in [
+                "/page/", "/category/", "/tag/", "/index.html", "/search/", "/channels/", "/actors/", "/login"
+            ]):
+                video_links.add(href)
+
+    except Exception as e:
+        logger.debug(f"Fast Scrape Timeout on {url}: {e}")
+    finally:
+        await context.close()
 
     file_type = "M3U8" if stream_link and ".m3u8" in stream_link else "MP4"
 
@@ -178,7 +210,7 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         cmd = [
             "ffmpeg",
             "-y",
-            "-user_agent", DEFAULT_USER_AGENT,
+            "-headers", f"User-Agent: {DEFAULT_USER_AGENT}\r\n",
             "-i", url,
             "-c", "copy",
             "-bsf:a", "aac_adtstoasc",
@@ -192,58 +224,77 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# MULTI-PAGE CHUNK SCRAPING LOGIC
+# PARALLEL MULTI-PAGE CHUNK SCRAPING LOGIC
 # ==========================================================
 async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
-    # Fixed Update / Callback Query message targeting
     message_target = update_or_query.message if isinstance(update_or_query, Update) else update_or_query.message
-
-    status_msg = await message_target.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page} with Headless Browser Engine...**")
+    status_msg = await message_target.reply_text(f"🚀 **Universal Ultra-Fast Scraping (Pages {start_page} to {end_page})...**")
 
     parsed = urlparse(target_url)
-    domain_name = parsed.netloc or "beeg.onl"
-    base_domain = f"https://{domain_name}"
+    domain_name = parsed.netloc or "website"
     base_u = target_url.rstrip('/')
 
     page_urls = []
     for p in range(start_page, end_page + 1):
         if p == 1:
             page_urls.append(target_url)
-            page_urls.append(f"{base_domain}/")
         else:
             page_urls.append(f"{base_u}/page/{p}/")
             page_urls.append(f"{base_u}/page/{p}")
-            page_urls.append(f"{base_domain}/page/{p}/")
             page_urls.append(f"{base_u}/?page={p}")
+            page_urls.append(f"{base_u}/?p={p}")
 
-    all_video_pages = set()
+    page_urls = list(set(page_urls))
 
-    for pu in set(page_urls):
-        res = await scrape_page_with_playwright(pu)
-        if res.get("video_links"):
-            all_video_pages.update(res["video_links"])
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-accelerated-2d-canvas",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-zygote",
+                "--disable-extensions"
+            ]
+        )
 
-    if not all_video_pages:
-        await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.")
-        return
+        # STEP 1: Fast Concurrency Parallel Index Scanning
+        index_tasks = [scrape_single_url_fast(browser, pu) for pu in page_urls]
+        index_results = await asyncio.gather(*index_tasks)
 
-    await status_msg.edit_text(f"✅ Total **{len(all_video_pages)}** Video Pages Found! Extracting Stream URLs...")
+        all_video_pages = set()
+        for res in index_results:
+            if res.get("video_links"):
+                all_video_pages.update(res["video_links"])
 
-    extracted_results = []
-    for v_url in list(all_video_pages)[:30]:
-        res = await scrape_page_with_playwright(v_url)
-        if res.get("download_link"):
-            extracted_results.append(res)
+        if not all_video_pages:
+            await browser.close()
+            await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi valid video links nahi mile.")
+            return
+
+        await status_msg.edit_text(f"⚡ Found **{len(all_video_pages)}** Video Pages! Extracting Stream URLs Concurrently...")
+
+        # STEP 2: Multi-Threaded Parallel Extract (Up to 30 urls concurrently)
+        targets_to_scrape = list(all_video_pages)[:30]
+        video_tasks = [scrape_single_url_fast(browser, v_url) for v_url in targets_to_scrape]
+        video_results = await asyncio.gather(*video_tasks)
+
+        extracted_results = [res for res in video_results if res.get("download_link")]
+
+        await browser.close()
 
     if not extracted_results:
-        await status_msg.edit_text("❌ Pages mile par stream URLs extract nahi ho sake.")
+        await status_msg.edit_text("❌ Video pages mile par stream URLs extract nahi ho sake.")
         return
 
     # Generate TXT File
     txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(extracted_results)} Items) ---\n\n"
     for idx, item in enumerate(extracted_results, 1):
         txt_content += f"{idx}. Title: {item['title']}\n"
-        txt_content += f"   Permanent Video Page: {item['page_url']}\n"
+        txt_content += f"   Permanent Page: {item['page_url']}\n"
         txt_content += f"   Direct Stream Link: {item['download_link']}\n\n"
 
     txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
@@ -253,17 +304,16 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
     html_content = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
 <style>
-body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
-.card {{ background: #1e1e1e; padding: 18px; margin-bottom: 15px; border-radius: 8px; border-left: 5px solid #0088cc; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}
+body {{ font-family: sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
+.card {{ background: #1e1e1e; padding: 15px; margin-bottom: 12px; border-radius: 8px; border-left: 5px solid #0088cc; }}
 a {{ color: #4da6ff; word-break: break-all; text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-.tag {{ display: inline-block; background: #0088cc; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; margin-left: 8px; }}
+.tag {{ background: #0088cc; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 11px; margin-left: 8px; }}
 </style></head><body><h2>Scraped Videos Pages {start_page} to {end_page} ({len(extracted_results)} Items)</h2>"""
 
     for idx, item in enumerate(extracted_results, 1):
         html_content += f"""<div class="card">
 <h3>{idx}. {item['title']} <span class="tag">{item['type']}</span></h3>
-<p><strong>🔗 Permanent Video Link:</strong> <a href="{item['page_url']}" target="_blank">{item['page_url']}</a></p>
+<p><strong>🔗 Page URL:</strong> <a href="{item['page_url']}" target="_blank">{item['page_url']}</a></p>
 <p><strong>⚡ Direct Stream URL:</strong> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p>
 </div>"""
     html_content += "</body></html>"
@@ -274,7 +324,7 @@ a:hover {{ text-decoration: underline; }}
     next_start = end_page + 1
     next_end = next_start + 9
     keyboard = [
-        [InlineKeyboardButton(f"▶️ Continue (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
+        [InlineKeyboardButton(f"▶️ Continue Next Batch (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
         [InlineKeyboardButton("🛑 Stop Scraping", callback_data="stop_scrape")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -284,11 +334,11 @@ a:hover {{ text-decoration: underline; }}
 
     await message_target.reply_document(
         document=txt_bytes, 
-        caption=f"📁 **Pages {start_page}-{end_page} TXT File** ({len(extracted_results)} Links)"
+        caption=f"📁 **Pages {start_page}-{end_page} TXT Output** ({len(extracted_results)} Items)"
     )
     await message_target.reply_document(
         document=html_bytes, 
-        caption=f"🌐 **Pages {start_page}-{end_page} HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye niche button par click karein:",
+        caption=f"🌐 **Pages {start_page}-{end_page} HTML Output**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye button dabaen:",
         reply_markup=reply_markup
     )
     await status_msg.delete()
@@ -314,15 +364,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚡ **Advanced Playwright Bulk Scraper & Downloader Bot Active!**\n\n"
-        "🌐 **Supported Sites (9 Total):**\n"
-        "• Beeg.onl | xHamster | Joysporn | Xhaccess | Sxyprn\n"
-        "• Pornhub | Spankbang | Redtube | Youporn\n\n"
-        "📌 **Features & Usage:**\n"
-        "1. **Headless Browser Crawling:** Modern Cloudflare & JS-rendered sites support.\n"
-        "2. **Dual Output:** Get TXT and Interactive Dark HTML File.\n"
-        "3. **FFmpeg Auto Downloader:** Upload `.txt` file to auto download and upload videos to Telegram.\n\n"
-        "🛠️ **Commands:** `/start`, `/stats`, `/stop`, `/userlist`, `/adduser`, `/removeuser`"
+        "⚡ **Universal Ultra-Fast Scraper Engine Active!**\n\n"
+        "🌐 Any Video / Media site is supported in Ultra Speed Mode.\n\n"
+        "📌 Link send karein fast parallel scraping start karne ke liye!"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -332,7 +376,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         add_user_db(uid)
-        await update.message.reply_text(f"✅ User `{uid}` database me add kar diya gaya.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ User `{uid}` database me add ho gaya.", parse_mode="Markdown")
     else:
         await update.message.reply_text("⚠️ **Usage:** `/adduser <user_id>`")
 
@@ -343,7 +387,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         remove_user_db(uid)
-        await update.message.reply_text(f"🗑️ User `{uid}` database se removal completed.", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑️ User `{uid}` database se remove ho gaya.", parse_mode="Markdown")
     else:
         await update.message.reply_text("⚠️ **Usage:** `/removeuser <user_id>`")
 
@@ -364,8 +408,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 **Bot Status:**\n\n"
         f"• **Authorized Users:** {users_count}\n"
-        f"• **Supported Sites:** 9 Platforms\n"
-        f"• **Engine:** Playwright Chromium Active 🟢"
+        f"• **Engine:** Universal CDP Resource-Blocked Parallel Playwright ⚡"
     )
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -401,47 +444,55 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = len(urls)
         await status_msg.edit_text(f"🚀 Total **{total}** links processing me hain! Rokne ke liye `/stop` bhejein.")
 
-        for idx, raw_url in enumerate(urls, 1):
-            if STOP_PROCESS.get(user_id, False):
-                await update.message.reply_text("🛑 **Task Stopped By User!**")
-                break
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
 
-            progress_msg = await update.message.reply_text(f"⏳ **[{idx}/{total}] Processing...**")
-            stream_url = raw_url
-            video_title = f"Video #{idx}"
+            for idx, raw_url in enumerate(urls, 1):
+                if STOP_PROCESS.get(user_id, False):
+                    await update.message.reply_text("🛑 **Task Stopped By User!**")
+                    break
 
-            if not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
-                extracted = await scrape_page_with_playwright(raw_url)
-                if extracted and extracted.get('download_link'):
-                    stream_url = extracted['download_link']
-                    video_title = extracted.get('title', video_title)
+                progress_msg = await update.message.reply_text(f"⏳ **[{idx}/{total}] Processing...**")
+                stream_url = raw_url
+                video_title = f"Video #{idx}"
 
-            output_file = f"temp_video_{user_id}_{idx}.mp4"
-            if os.path.exists(output_file):
-                try: os.remove(output_file)
-                except Exception: pass
+                if not (raw_url.endswith('.m3u8') or raw_url.endswith('.mp4')):
+                    extracted = await scrape_single_url_fast(browser, raw_url)
+                    if extracted and extracted.get('download_link'):
+                        stream_url = extracted['download_link']
+                        video_title = extracted.get('title', video_title)
 
-            await progress_msg.edit_text(f"📥 **[{idx}/{total}] FFmpeg Downloading...**\n`{video_title[:30]}...`")
-            success = await download_video_ffmpeg(stream_url, output_file)
+                output_file = f"temp_video_{user_id}_{idx}.mp4"
+                if os.path.exists(output_file):
+                    try: os.remove(output_file)
+                    except Exception: pass
 
-            if success:
-                await progress_msg.edit_text(f"📤 **[{idx}/{total}] Telegram Par Upload Ho Raha Hai...**")
-                try:
-                    with open(output_file, 'rb') as vf:
-                        await update.message.reply_video(
-                            video=vf, 
-                            caption=f"🎥 **{video_title}**\n\n🔗 **Link {idx}/{total}**",
-                            supports_streaming=True
-                        )
-                    await progress_msg.delete()
-                except Exception as upload_err:
-                    await progress_msg.edit_text(f"❌ Upload Error: {str(upload_err)}")
-            else:
-                await progress_msg.edit_text(f"❌ **[{idx}/{total}] Download Failed!**")
+                await progress_msg.edit_text(f"📥 **[{idx}/{total}] FFmpeg Downloading...**\n`{video_title[:30]}...`")
+                success = await download_video_ffmpeg(stream_url, output_file)
 
-            if os.path.exists(output_file):
-                try: os.remove(output_file)
-                except Exception: pass
+                if success:
+                    await progress_msg.edit_text(f"📤 **[{idx}/{total}] Telegram Par Upload Ho Raha Hai...**")
+                    try:
+                        with open(output_file, 'rb') as vf:
+                            await update.message.reply_video(
+                                video=vf, 
+                                caption=f"🎥 **{video_title}**\n\n🔗 **Link {idx}/{total}**",
+                                supports_streaming=True
+                            )
+                        await progress_msg.delete()
+                    except Exception as upload_err:
+                        await progress_msg.edit_text(f"❌ Upload Error: {str(upload_err)}")
+                else:
+                    await progress_msg.edit_text(f"❌ **[{idx}/{total}] Download Failed!**")
+
+                if os.path.exists(output_file):
+                    try: os.remove(output_file)
+                    except Exception: pass
+
+            await browser.close()
 
         await status_msg.edit_text("✅ **All videos processing completed!**")
 
@@ -508,7 +559,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 Playwright Headless Bot Active!")
+    print("🤖 Universal Ultra-Fast Playwright Bot Active!")
     app.run_polling()
 
 if __name__ == "__main__":
