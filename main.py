@@ -42,13 +42,12 @@ DB_FILE = "bot_data.db"
 STOP_PROCESS: Dict[int, bool] = {}
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
-# Cloudscraper Instance
 scraper = cloudscraper.create_scraper(
     browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
 )
 
 # ==========================================================
-# DATABASE HANDLER (Persistent Storage)
+# DATABASE HANDLER
 # ==========================================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -103,7 +102,7 @@ def get_all_users() -> List[int]:
 
 def get_custom_headers(url: str) -> dict:
     parsed = urlparse(url)
-    domain = parsed.netloc or "xhamster.com"
+    domain = parsed.netloc or "beeg.onl"
     referer = f"https://{domain}/"
     
     return {
@@ -123,7 +122,7 @@ def get_custom_headers(url: str) -> dict:
     }
 
 # ==========================================================
-# DUMMY HTTP SERVER & AUTO-PING KEEP ALIVE (24/7)
+# DUMMY HTTP SERVER & KEEP ALIVE
 # ==========================================================
 class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -146,7 +145,7 @@ def run_dummy_server():
 def self_ping_loop():
     render_app_url = os.getenv("RENDER_EXTERNAL_URL")
     while True:
-        time.sleep(600)  # Ping every 10 minutes
+        time.sleep(600)
         if render_app_url:
             try:
                 requests.get(render_app_url, timeout=10)
@@ -155,7 +154,7 @@ def self_ping_loop():
                 logger.error(f"Self-ping failed: {e}")
 
 # ==========================================================
-# EXTRACTION & SCRAPING CORE ENGINE
+# EXTRACTION & SCRAPING ENGINE
 # ==========================================================
 def process_tpl_link(hls_link: str) -> str:
     try:
@@ -219,8 +218,8 @@ async def extract_video_link(video_url: str) -> Optional[dict]:
                 stream_link = sxy_match.group(1)
                 file_type = "MP4" if ".mp4" in stream_link else "M3U8"
 
-        if not stream_link and "beeg.onl" in video_url:
-            beeg_match = re.search(r'(https?:[^\s"\']*?\.(?:m3u8|mp4)[^\s"\']*)', text)
+        if not stream_link and "beeg" in video_url:
+            beeg_match = re.search(r'(https?:[^\s"\']*?\.(?:m3u8|mp4)[^\s"\']*)', text) or re.search(r'src=["\'](https?:[^\s"\']+?\.(?:m3u8|mp4)[^\s"\']*)["\']', text)
             if beeg_match:
                 stream_link = beeg_match.group(1).replace('\\/', '/')
                 file_type = "MP4" if ".mp4" in stream_link else "M3U8"
@@ -257,18 +256,17 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# MULTI-SITE 300+ SCRAPING ENGINE (PAGES 1 TO 10 FIXED)
+# FIXED MULTI-PAGE SCRAPING ENGINE (FOR BEEG.ONL & ALL)
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
     found_urls: Set[str] = set()
     parsed = urlparse(url)
-    domain_name = parsed.netloc or "xhamster.com"
+    domain_name = parsed.netloc or "beeg.onl"
     base_domain = f"https://{domain_name}"
 
     is_single_video = (
         url.endswith('.html') or 
-        re.search(r'/videos?/[^/]+-\d+', url) or 
-        re.search(r'/video/\d+', url) or
+        re.search(r'/video/[^/]+', url) or
         re.search(r'/post/\d+', url)
     )
     
@@ -282,21 +280,21 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     for p in range(start_page, end_page + 1):
         if p == 1:
             page_urls.append(url)
+            page_urls.append(f"{base_domain}/")
             continue
         
-        # Site Specific Pagination Generators
-        if "sxyprn" in domain_name:
+        if "beeg" in domain_name:
+            page_urls.append(f"{base_u}/page/{p}/")
+            page_urls.append(f"{base_u}/page/{p}")
+            page_urls.append(f"{base_domain}/page/{p}/")
+            page_urls.append(f"{base_u}/?page={p}")
+
+        elif "sxyprn" in domain_name:
             if "?" in url:
                 page_urls.append(f"{url}&page={p}")
             else:
                 page_urls.append(f"{base_u}?page={p}")
                 page_urls.append(f"{base_u}/{p}")
-
-        elif "beeg.onl" in domain_name:
-            page_urls.append(f"{base_u}/page/{p}/")
-            page_urls.append(f"{base_u}/page/{p}")
-            page_urls.append(f"{base_u}/?page={p}")
-            page_urls.append(f"{base_u}/{p}/")
 
         elif "joysporn" in domain_name:
             if base_u == base_domain:
@@ -312,6 +310,8 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             page_urls.append(f"{base_u}?page={p}")
             if "?" in url:
                 page_urls.append(f"{url}&page={p}")
+
+    page_urls = list(set(page_urls))
 
     async def fetch_page_links(p_url):
         try:
@@ -329,14 +329,14 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 
                 full_u = href if href.startswith("http") else urljoin(base_domain, href)
                 
-                if "sxyprn" in domain_name:
+                if "beeg" in domain_name:
+                    if "/video/" in clean_href or clean_href.endswith('.html') or re.search(r'/[^/]+-\d+/?$', clean_href):
+                        if not any(x in clean_href for x in ['/page/', '/category/', '/tag/', '/index.html']):
+                            found_urls.add(full_u)
+
+                elif "sxyprn" in domain_name:
                     if re.search(r'/post/\w+', clean_href) or re.search(r'/video/\w+', clean_href) or clean_href.endswith('.html'):
                         found_urls.add(full_u)
-
-                elif "beeg.onl" in domain_name:
-                    if clean_href.endswith('.html') or "/video/" in clean_href or re.search(r'/\d+', clean_href):
-                        if not any(clean_href.endswith(x) for x in ['index.html', 'ilisting.html', '/']) and not "/page/" in clean_href:
-                            found_urls.add(full_u)
 
                 elif "joysporn" in domain_name:
                     if clean_href.endswith('.html') or "/video/" in clean_href or "/videos/" in clean_href:
@@ -370,7 +370,6 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 # TELEGRAM BOT HANDLERS & COMMAND REGISTER
 # ==========================================================
 async def setup_bot_commands(application):
-    """Registers auto-suggestion commands menu in Telegram Chat Box"""
     commands = [
         BotCommand("start", "Start the bot and show help"),
         BotCommand("stats", "Show bot & user statistics"),
@@ -393,16 +392,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• xHamster | Joysporn | Xhaccess | Sxyprn | Beeg.onl\n"
         "• Pornhub | Spankbang | Redtube | Youporn\n\n"
         "📌 **Features & Usage:**\n"
-        "1. **300+ Link Extraction:** Target URL bhejein, bot Pages 1-10 tak ~300+ links extract karega.\n"
-        "2. **Clean TXT & HTML Output:** Result me Video Link aur Direct Stream URL clean layout me milega.\n"
-        "3. **FFmpeg Downloader:** `.txt` file upload karne par automatic video download karke upload kar dega.\n\n"
-        "🛠️ **Available Commands:**\n"
-        "• `/start` - Main Help Menu\n"
-        "• `/stats` - Bot Status & User Count\n"
-        "• `/stop` - Cancel Active Task\n"
-        "• `/adduser <id>` - Allow New User (Admin)\n"
-        "• `/removeuser <id>` - Remove User (Admin)\n"
-        "• `/userlist` - View All Allowed Users"
+        "1. **300+ Link Extraction:** Target URL bhejein, bot Pages 1-10 tak links extract karega.\n"
+        "2. **Clean TXT & HTML Output:** Video Links & Direct Stream URLs deliver karega.\n"
+        "3. **FFmpeg Downloader:** `.txt` file upload karke auto download karein.\n\n"
+        "🛠️ **Commands:** `/start`, `/stats`, `/stop`, `/userlist`, `/adduser`, `/removeuser`"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,7 +405,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         add_user_db(uid)
-        await update.message.reply_text(f"✅ User `{uid}` database me add kar diya gaya hai.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ User `{uid}` database me add ho gaya.", parse_mode="Markdown")
     else:
         await update.message.reply_text("⚠️ **Usage:** `/adduser <user_id>`")
 
@@ -423,7 +416,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         remove_user_db(uid)
-        await update.message.reply_text(f"🗑️ User `{uid}` database se hata diya gaya hai.", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑️ User `{uid}` database se hata diya gaya.", parse_mode="Markdown")
     else:
         await update.message.reply_text("⚠️ **Usage:** `/removeuser <user_id>`")
 
@@ -531,7 +524,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ File Process Error: {str(e)}")
 
 async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
-    status_msg = await update_or_query.message.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page} (~300 links target)...**")
+    status_msg = await update_or_query.message.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page}...**")
 
     try:
         results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
@@ -542,7 +535,6 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
 
         await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! TXT aur HTML files tayar ho rahi hain...")
 
-        # 1. CLEAN TXT FORMAT
         txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
         for idx, item in enumerate(results, 1):
             txt_content += f"{idx}. Title: {item['title']}\n"
@@ -552,7 +544,6 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
         txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
         txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
 
-        # 2. CLEAN HTML FORMAT
         html_content = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
 <style>
@@ -586,7 +577,6 @@ a:hover {{ text-decoration: underline; }}
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # 3. SEND BOTH FILES TO TELEGRAM USER
         await update_or_query.message.reply_document(
             document=txt_bytes, 
             caption=f"📁 **Pages {start_page}-{end_page} TXT File** ({len(results)} Links)"
