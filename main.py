@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # ==========================================================
 # CONFIGURATION & GLOBAL VARIABLES
 # ==========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7673015455:AAFrMbFSEpPXV33WMUud-bRFPUxvzN7znBk")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7673015455:AAFW01HGes-gzQUg_1Fb6gKD2HlSTOZcG0Y")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1714266885"))
 DB_FILE = "bot_data.db"
 
