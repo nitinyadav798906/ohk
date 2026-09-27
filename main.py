@@ -1,6 +1,5 @@
 import asyncio
 import io
-import json
 import logging
 import os
 import re
@@ -14,7 +13,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import cloudscraper
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -186,7 +185,7 @@ def fetch_url_sync(url: str) -> Optional[str]:
 async def fetch_url_with_cloudscraper(url: str) -> Optional[str]:
     return await asyncio.to_thread(fetch_url_sync, url)
 
-async def extract_video_link(video_url: str, source_page: str = "") -> Optional[dict]:
+async def extract_video_link(video_url: str) -> Optional[dict]:
     try:
         text = await fetch_url_with_cloudscraper(video_url)
         if not text:
@@ -232,7 +231,6 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                 "title": title,
                 "type": file_type,
                 "page_url": video_url,
-                "source_page": source_page or video_url,
                 "download_link": final_link
             }
     except Exception as e:
@@ -259,10 +257,10 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# MULTI-SITE 300+ SCRAPING ENGINE (PAGES 1 TO 10)
+# MULTI-SITE 300+ SCRAPING ENGINE (PAGES 1 TO 10 FIXED)
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
-    url_to_source = {}
+    found_urls: Set[str] = set()
     parsed = urlparse(url)
     domain_name = parsed.netloc or "xhamster.com"
     base_domain = f"https://{domain_name}"
@@ -275,7 +273,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     )
     
     if is_single_video and not any(url.endswith(x) for x in ['index.html', 'ilisting.html', '/']):
-        res = await extract_video_link(url, source_page=url)
+        res = await extract_video_link(url)
         return [res] if res else []
 
     page_urls = []
@@ -286,7 +284,21 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             page_urls.append(url)
             continue
         
-        if "joysporn" in domain_name or "beeg.onl" in domain_name:
+        # Site Specific Pagination Generators
+        if "sxyprn" in domain_name:
+            if "?" in url:
+                page_urls.append(f"{url}&page={p}")
+            else:
+                page_urls.append(f"{base_u}?page={p}")
+                page_urls.append(f"{base_u}/{p}")
+
+        elif "beeg.onl" in domain_name:
+            page_urls.append(f"{base_u}/page/{p}/")
+            page_urls.append(f"{base_u}/page/{p}")
+            page_urls.append(f"{base_u}/?page={p}")
+            page_urls.append(f"{base_u}/{p}/")
+
+        elif "joysporn" in domain_name:
             if base_u == base_domain:
                 page_urls.append(f"{base_domain}/apapu/{p}/")
             elif base_u.endswith('.html'):
@@ -294,12 +306,6 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             else:
                 page_urls.append(f"{base_u}/{p}/")
                 page_urls.append(f"{base_u}?page={p}")
-
-        elif "sxyprn" in domain_name:
-            page_urls.append(f"{base_u}?page={p}")
-            page_urls.append(f"{base_u}/{p}")
-            if "?" in url:
-                page_urls.append(f"{url}&page={p}")
 
         elif any(x in domain_name for x in ["xhamster", "xhaccess", "pornhub", "spankbang", "redtube", "youporn"]):
             page_urls.append(f"{base_u}/{p}")
@@ -323,51 +329,62 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 
                 full_u = href if href.startswith("http") else urljoin(base_domain, href)
                 
-                # Match supported site patterns
-                if "joysporn" in domain_name:
-                    if clean_href.endswith('.html') or "/video/" in clean_href or "/videos/" in clean_href:
-                        if not any(clean_href.endswith(x) for x in ['index.html', 'main.html', 'ilisting.html']):
-                            url_to_source[full_u] = p_url
+                if "sxyprn" in domain_name:
+                    if re.search(r'/post/\w+', clean_href) or re.search(r'/video/\w+', clean_href) or clean_href.endswith('.html'):
+                        found_urls.add(full_u)
 
                 elif "beeg.onl" in domain_name:
                     if clean_href.endswith('.html') or "/video/" in clean_href or re.search(r'/\d+', clean_href):
-                        if not any(clean_href.endswith(x) for x in ['index.html', 'ilisting.html', '/']):
-                            url_to_source[full_u] = p_url
+                        if not any(clean_href.endswith(x) for x in ['index.html', 'ilisting.html', '/']) and not "/page/" in clean_href:
+                            found_urls.add(full_u)
 
-                elif "sxyprn" in domain_name:
-                    if re.search(r'/post/\w+', clean_href) or re.search(r'/video/\w+', clean_href) or clean_href.endswith('.html'):
-                        url_to_source[full_u] = p_url
+                elif "joysporn" in domain_name:
+                    if clean_href.endswith('.html') or "/video/" in clean_href or "/videos/" in clean_href:
+                        if not any(clean_href.endswith(x) for x in ['index.html', 'main.html', 'ilisting.html']):
+                            found_urls.add(full_u)
 
                 elif any(x in domain_name for x in ["xhamster", "xhaccess", "pornhub", "spankbang", "redtube", "youporn"]):
                     if any(key in clean_href for key in ["/videos/", "/video/", "/view_video.php", "/watch/"]):
                         if not re.search(r'/videos?/?$', clean_href):
-                            url_to_source[full_u] = p_url
+                            found_urls.add(full_u)
 
         except Exception as e:
             logger.error(f"Error crawling page {p_url}: {e}")
 
     await asyncio.gather(*[fetch_page_links(pu) for pu in page_urls])
 
-    if not url_to_source:
+    if not found_urls:
         return []
 
     semaphore = asyncio.Semaphore(35)
-    async def sem_extract(v_url, src_p):
+    async def sem_extract(v_url):
         async with semaphore:
-            return await extract_video_link(v_url, source_page=src_p)
+            return await extract_video_link(v_url)
 
-    tasks = [sem_extract(v_url, src_p) for v_url, src_p in url_to_source.items()]
+    tasks = [sem_extract(v_url) for v_url in found_urls]
     results = await asyncio.gather(*tasks)
     
     return [res for res in results if res is not None]
 
 # ==========================================================
-# TELEGRAM BOT HANDLERS
+# TELEGRAM BOT HANDLERS & COMMAND REGISTER
 # ==========================================================
+async def setup_bot_commands(application):
+    """Registers auto-suggestion commands menu in Telegram Chat Box"""
+    commands = [
+        BotCommand("start", "Start the bot and show help"),
+        BotCommand("stats", "Show bot & user statistics"),
+        BotCommand("stop", "Stop active task/scraping"),
+        BotCommand("userlist", "List allowed users (Admin only)"),
+        BotCommand("adduser", "Add allowed user ID (Admin only)"),
+        BotCommand("removeuser", "Remove user ID (Admin only)")
+    ]
+    await application.bot.set_my_commands(commands)
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ **Access Denied! Aap is bot ko use nahi kar sakte.**")
+        await update.message.reply_text("⛔ **Access Denied!**")
         return
 
     await update.message.reply_text(
@@ -376,28 +393,39 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• xHamster | Joysporn | Xhaccess | Sxyprn | Beeg.onl\n"
         "• Pornhub | Spankbang | Redtube | Youporn\n\n"
         "📌 **Features & Usage:**\n"
-        "1. **300+ Link Extraction:** Target URL bhejein, bot Pages 1-10 tak 300+ links extract karega.\n"
-        "2. **TXT & HTML Files:** Scrape hone ke baad `.txt` aur `.html` dono files saath me milengi.\n"
-        "3. **HTML Source Info:** High quality HTML file me Direct Stream URL aur Source Page URL milega.\n"
-        "4. **FFmpeg Downloader:** `.txt` file upload karne par automatic video download karke Telegram par upload kar dega.\n\n"
-        "🛠️ **Commands:** `/stop`, `/userlist`, `/stats`"
+        "1. **300+ Link Extraction:** Target URL bhejein, bot Pages 1-10 tak ~300+ links extract karega.\n"
+        "2. **Clean TXT & HTML Output:** Result me Video Link aur Direct Stream URL clean layout me milega.\n"
+        "3. **FFmpeg Downloader:** `.txt` file upload karne par automatic video download karke upload kar dega.\n\n"
+        "🛠️ **Available Commands:**\n"
+        "• `/start` - Main Help Menu\n"
+        "• `/stats` - Bot Status & User Count\n"
+        "• `/stop` - Cancel Active Task\n"
+        "• `/adduser <id>` - Allow New User (Admin)\n"
+        "• `/removeuser <id>` - Remove User (Admin)\n"
+        "• `/userlist` - View All Allowed Users"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin command only.")
         return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         add_user_db(uid)
         await update.message.reply_text(f"✅ User `{uid}` database me add kar diya gaya hai.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("⚠️ **Usage:** `/adduser <user_id>`")
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin command only.")
         return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         remove_user_db(uid)
         await update.message.reply_text(f"🗑️ User `{uid}` database se hata diya gaya hai.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("⚠️ **Usage:** `/removeuser <user_id>`")
 
 async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
@@ -514,18 +542,17 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
 
         await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! TXT aur HTML files tayar ho rahi hain...")
 
-        # 1. GENERATE TXT CONTENT
+        # 1. CLEAN TXT FORMAT
         txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
         for idx, item in enumerate(results, 1):
             txt_content += f"{idx}. Title: {item['title']}\n"
-            txt_content += f"   Source Listing Page: {item['source_page']}\n"
             txt_content += f"   Permanent Video Page: {item['page_url']}\n"
             txt_content += f"   Direct Stream Link: {item['download_link']}\n\n"
 
         txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
         txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
 
-        # 2. GENERATE HTML CONTENT
+        # 2. CLEAN HTML FORMAT
         html_content = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
 <style>
@@ -539,7 +566,6 @@ a:hover {{ text-decoration: underline; }}
         for idx, item in enumerate(results, 1):
             html_content += f"""<div class="card">
 <h3>{idx}. {item['title']} <span class="tag">{item['type']}</span></h3>
-<p><strong>🌐 Source Listing Page:</strong> <a href="{item['source_page']}" target="_blank">{item['source_page']}</a></p>
 <p><strong>🔗 Permanent Video Link:</strong> <a href="{item['page_url']}" target="_blank">{item['page_url']}</a></p>
 <p><strong>⚡ Direct Stream URL:</strong> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p>
 </div>"""
@@ -593,11 +619,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_url = url_match.group(1)
     supported_domains = [
         "joysporn", "xhaccess", "xhamster", "sxyprn", 
-        "pornhub", "spankbang", "redtube", "youporn", "beeg.onl"
+        "pornhub", "spankbang", "redtube", "youporn", "beeg.onl", "beeg"
     ]
 
-    if not any(domain in target_url for domain in supported_domains):
-        await update.message.reply_text("❌ Yeh domain supported nahi hai. Support sites: xHamster, Joysporn, Sxyprn, Beeg.onl, Pornhub, Spankbang, Redtube, Youporn.")
+    if not any(domain in target_url.lower() for domain in supported_domains):
+        await update.message.reply_text("❌ Yeh domain supported nahi hai. Supported sites: xHamster, Joysporn, Sxyprn, Beeg.onl, Pornhub, Spankbang, Redtube, Youporn.")
         return
 
     await run_scrape_chunk(update, context, target_url, start_page=1, end_page=10)
@@ -632,7 +658,7 @@ def main():
     threading.Thread(target=run_dummy_server, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
     
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_bot_commands).build()
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stop", stop_command))
