@@ -253,7 +253,7 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# MULTI-SITE 300+ SCRAPING ENGINE (PAGES 1 TO 10)
+# MULTI-SITE SCRAPING ENGINE
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
     url_to_source = {}
@@ -265,7 +265,9 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
         url.endswith('.html') or 
         re.search(r'/videos?/[^/]+-\d+', url) or 
         re.search(r'/video/\d+', url) or
-        re.search(r'/post/\d+', url)
+        re.search(r'/post/\d+', url) or
+        re.search(r'/videos/\d+', url) or
+        re.search(r'/watch/', url)
     )
     
     if is_single_video and not any(url.endswith(x) for x in ['index.html', 'ilisting.html', '/']):
@@ -295,7 +297,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             if "?" in url:
                 page_urls.append(f"{url}&page={p}")
 
-        elif any(x in domain_name for x in ["xhamster", "xhaccess", "pornhub", "spankbang", "redtube", "youporn"]):
+        else:
             page_urls.append(f"{base_u}/{p}")
             page_urls.append(f"{base_u}?page={p}")
             if "?" in url:
@@ -317,18 +319,18 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 
                 full_u = href if href.startswith("http") else urljoin(base_domain, href)
                 
-                # Match supported site patterns
+                # Dynamic Link Matching based on Domain Structures
                 if "joysporn" in domain_name:
                     if clean_href.endswith('.html') or "/video/" in clean_href or "/videos/" in clean_href:
                         if not any(clean_href.endswith(x) for x in ['index.html', 'main.html', 'ilisting.html']):
                             url_to_source[full_u] = p_url
 
                 elif "sxyprn" in domain_name:
-                    if re.search(r'/post/\w+', clean_href) or re.search(r'/video/\w+', clean_href) or clean_href.endswith('.html'):
+                    if re.search(r'/(post|video)/\w+', clean_href) or clean_href.endswith('.html'):
                         url_to_source[full_u] = p_url
 
-                elif any(x in domain_name for x in ["xhamster", "xhaccess", "pornhub", "spankbang", "redtube", "youporn"]):
-                    if any(key in clean_href for key in ["/videos/", "/video/", "/view_video.php", "/watch/"]):
+                else:
+                    if any(key in clean_href for key in ["/videos/", "/video/", "/view_video.php", "/watch/", "/post/"]):
                         if not re.search(r'/videos?/?$', clean_href):
                             url_to_source[full_u] = p_url
 
@@ -340,7 +342,8 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     if not url_to_source:
         return []
 
-    semaphore = asyncio.Semaphore(35)
+    # Optimized Semaphore for Rate Limit Avoidance
+    semaphore = asyncio.Semaphore(10)
     async def sem_extract(v_url, src_p):
         async with semaphore:
             return await extract_video_link(v_url, source_page=src_p)
@@ -360,10 +363,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚡ **8-Site Bulk Scraper & Downloader Bot Active!**\n\n"
-        "🌐 **Supported Sites (8 Total):**\n"
+        "⚡ **13-Site Bulk Scraper & Downloader Bot Active!**\n\n"
+        "🌐 **Supported Sites (13 Total):**\n"
         "• xHamster | Joysporn | Xhaccess | Sxyprn\n"
-        "• Pornhub | Spankbang | Redtube | Youporn\n\n"
+        "• Pornhub | Spankbang | Redtube | Youporn\n"
+        "• 4tube | IPornTV | HQPorn | JustPorn | SexVid\n\n"
         "📌 **Features & Usage:**\n"
         "1. **300+ Link Extraction:** Target URL bhejein, bot Pages 1-10 tak 300+ links extract karega.\n"
         "2. **HTML & Source Info:** High quality HTML file me Direct Stream URL aur Source Page URL milega.\n"
@@ -404,7 +408,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 **Bot Status:**\n\n"
         f"• **Authorized Users:** {users_count}\n"
-        f"• **Supported Sites:** 8 Platforms\n"
+        f"• **Supported Sites:** 13 Platforms\n"
         f"• **Extract Capacity:** ~300+ Links / Batch\n"
         f"• **Engine:** Cloudflare Bypass Active 🟢"
     )
@@ -491,7 +495,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ File Process Error: {str(e)}")
 
 async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
-    status_msg = await update_or_query.message.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page} (~300 links target)...**")
+    status_msg = await update_or_query.message.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page}...**")
 
     try:
         results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
@@ -512,7 +516,6 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
         txt_bytes = io.BytesIO(txt_content.encode('utf-8'))
         txt_bytes.name = f"scraped_p{start_page}_to_p{end_page}.txt"
 
-        # Modern HTML Template with Source Page URL Included
         html_content = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Scraped Links ({start_page}-{end_page})</title>
 <style>
@@ -572,10 +575,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target_url = url_match.group(1)
-    supported_domains = ["joysporn", "xhaccess", "xhamster", "sxyprn", "pornhub", "spankbang", "redtube", "youporn"]
+    supported_domains = [
+        "joysporn", "xhaccess", "xhamster", "sxyprn", "pornhub", 
+        "spankbang", "redtube", "youporn", "4tube", "iporntv", 
+        "hqporn", "justporn", "sexvid"
+    ]
 
     if not any(domain in target_url for domain in supported_domains):
-        await update.message.reply_text("❌ Yeh domain supported nahi hai. Support sites: xHamster, Joysporn, Sxyprn, Pornhub, Spankbang, Redtube, Youporn.")
+        await update.message.reply_text("❌ Yeh domain supported nahi hai. Supported sites list ke liye `/start` dabayein.")
         return
 
     await run_scrape_chunk(update, context, target_url, start_page=1, end_page=10)
@@ -624,7 +631,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🤖 Advanced 8-Site 300+ Link Scraper Active!")
+    print("🤖 Advanced 13-Site Link Scraper Active!")
     app.run_polling()
 
 if __name__ == "__main__":
