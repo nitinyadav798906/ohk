@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional, List, Set, Dict
+from typing import Optional, List, Dict
 from urllib.parse import unquote, urljoin, urlparse
 
 import cloudscraper
@@ -192,6 +192,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         if not text:
             return None
 
+        # Title Extraction
         title = "Video"
         title_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE | re.DOTALL)
         if not title_match:
@@ -204,16 +205,38 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         stream_link = None
         file_type = None
 
-        m_hls = re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
-        if m_hls:
-            stream_link = m_hls.group(1).replace('\\/', '/')
-            file_type = "M3U8"
-        else:
-            m_mp4 = re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
-            if m_mp4:
-                stream_link = m_mp4.group(1).replace('\\/', '/')
-                file_type = "MP4"
+        # 1. Look for M3U8 Stream Links
+        m_hls = re.findall(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
+        for hls_candidate in m_hls:
+            clean_hls = hls_candidate.replace('\\/', '/')
+            if not any(clean_hls.lower().endswith(ext) for ext in ['.jpg', '.png', '.jpeg', '.webp']):
+                stream_link = clean_hls
+                file_type = "M3U8"
+                break
 
+        # 2. Look for Direct MP4 Video Links (Exclude preview images)
+        if not stream_link:
+            m_mp4 = re.findall(r'(https?:[^\s"\']*?\.mp4(?:\?[^\s"\']*)?)', text)
+            for mp4_candidate in m_mp4:
+                clean_mp4 = mp4_candidate.replace('\\/', '/')
+                # Reject thumbnail formats like preview_preview.mp4.jpg
+                if re.search(r'\.mp4(?:\.(jpg|jpeg|png|webp)|\?[^\s"\']*?\.(jpg|jpeg|png|webp))?$', clean_mp4, re.IGNORECASE):
+                    if any(clean_mp4.lower().endswith(ext) for ext in ['.jpg', '.png', '.jpeg', '.webp']):
+                        continue
+                stream_link = clean_mp4
+                file_type = "MP4"
+                break
+
+        # 3. Handle Player JS Configs / JSON Objects (Justporn, IPornTV, 4tube, etc.)
+        if not stream_link:
+            js_match = re.search(r'["\']?(?:video_url|file|media_url|src|video_file)["\']?\s*:\s*["\'](https?:[^\s"\']+?)["\']', text, re.IGNORECASE)
+            if js_match:
+                candidate = js_match.group(1).replace('\\/', '/')
+                if not any(candidate.lower().endswith(ext) for ext in ['.jpg', '.png', '.jpeg', '.webp']):
+                    stream_link = candidate
+                    file_type = "MP4" if ".mp4" in candidate.lower() else "M3U8"
+
+        # 4. Domain Specific Extractions
         if not stream_link and "sxyprn" in video_url:
             sxy_match = re.search(r'data-s=["\'](https?:[^\s"\']+?)["\']', text) or re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
             if sxy_match:
@@ -253,7 +276,7 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# MULTI-SITE SCRAPING ENGINE
+# MULTI-SITE SCRAPING ENGINE (13 SITES)
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
     url_to_source = {}
@@ -267,7 +290,8 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
         re.search(r'/video/\d+', url) or
         re.search(r'/post/\d+', url) or
         re.search(r'/videos/\d+', url) or
-        re.search(r'/watch/', url)
+        re.search(r'/watch/', url) or
+        re.search(r'/contents/videos_screenshots/', url)
     )
     
     if is_single_video and not any(url.endswith(x) for x in ['index.html', 'ilisting.html', '/']):
@@ -319,20 +343,10 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 
                 full_u = href if href.startswith("http") else urljoin(base_domain, href)
                 
-                # Dynamic Link Matching based on Domain Structures
-                if "joysporn" in domain_name:
-                    if clean_href.endswith('.html') or "/video/" in clean_href or "/videos/" in clean_href:
-                        if not any(clean_href.endswith(x) for x in ['index.html', 'main.html', 'ilisting.html']):
-                            url_to_source[full_u] = p_url
-
-                elif "sxyprn" in domain_name:
-                    if re.search(r'/(post|video)/\w+', clean_href) or clean_href.endswith('.html'):
+                # Broad Matching Rule set for 13 Sites
+                if any(key in clean_href.lower() for key in ["/videos/", "/video/", "/view_video.php", "/watch/", "/post/", "/contents/"]):
+                    if not re.search(r'/videos?/?$', clean_href):
                         url_to_source[full_u] = p_url
-
-                else:
-                    if any(key in clean_href for key in ["/videos/", "/video/", "/view_video.php", "/watch/", "/post/"]):
-                        if not re.search(r'/videos?/?$', clean_href):
-                            url_to_source[full_u] = p_url
 
         except Exception as e:
             logger.error(f"Error crawling page {p_url}: {e}")
@@ -342,7 +356,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     if not url_to_source:
         return []
 
-    # Optimized Semaphore for Rate Limit Avoidance
+    # Optimized Concurrency Control
     semaphore = asyncio.Semaphore(10)
     async def sem_extract(v_url, src_p):
         async with semaphore:
@@ -363,16 +377,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚡ **13-Site Bulk Scraper & Downloader Bot Active!**\n\n"
-        "🌐 **Supported Sites (13 Total):**\n"
+        "⚡ **13-Site Bulk Link Scraper Bot Active!**\n\n"
+        "🌐 **Supported Platforms:**\n"
         "• xHamster | Joysporn | Xhaccess | Sxyprn\n"
         "• Pornhub | Spankbang | Redtube | Youporn\n"
         "• 4tube | IPornTV | HQPorn | JustPorn | SexVid\n\n"
-        "📌 **Features & Usage:**\n"
-        "1. **300+ Link Extraction:** Target URL bhejein, bot Pages 1-10 tak 300+ links extract karega.\n"
-        "2. **HTML & Source Info:** High quality HTML file me Direct Stream URL aur Source Page URL milega.\n"
-        "3. **FFmpeg Downloader:** `.txt` file upload karne par automatic video download karke Telegram par upload kar dega.\n\n"
-        "🛠️ **Commands:** `/stop`, `/mylibrary`, `/stats`"
+        "📌 **Features:**\n"
+        "1. **Bulk Extraction:** Multi-page search (Pages 1-10) with exact stream links.\n"
+        "2. **Export Formats:** Direct TXT aur Interactive HTML Files.\n"
+        "3. **FFmpeg Downloader:** TXT file upload karke automatic Telegram upload.\n\n"
+        "🛠️ **Commands:** `/stop`, `/stats`, `/userlist`"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -381,7 +395,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         add_user_db(uid)
-        await update.message.reply_text(f"✅ User `{uid}` database me add kar diya gaya hai.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ User `{uid}` database me add ho gaya.", parse_mode="Markdown")
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -389,7 +403,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         remove_user_db(uid)
-        await update.message.reply_text(f"🗑️ User `{uid}` database se hata diya gaya hai.", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑️ User `{uid}` remove ho gaya.", parse_mode="Markdown")
 
 async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
@@ -409,8 +423,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 **Bot Status:**\n\n"
         f"• **Authorized Users:** {users_count}\n"
         f"• **Supported Sites:** 13 Platforms\n"
-        f"• **Extract Capacity:** ~300+ Links / Batch\n"
-        f"• **Engine:** Cloudflare Bypass Active 🟢"
+        f"• **Engine:** Multi-Threaded Extractor 🟢"
     )
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -424,11 +437,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     doc = update.message.document
     if not doc or not doc.file_name.endswith('.txt'):
-        await update.message.reply_text("❌ Kripya valid `.txt` file upload karein.")
+        await update.message.reply_text("❌ Valid `.txt` file upload karein.")
         return
 
     STOP_PROCESS[user_id] = False
-    status_msg = await update.message.reply_text("📥 **TXT file read ho rahi hai...**")
+    status_msg = await update.message.reply_text("📥 **TXT file reading started...**")
 
     try:
         file = await context.bot.get_file(doc.file_id)
@@ -444,7 +457,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         total = len(urls)
-        await status_msg.edit_text(f"🚀 Total **{total}** links processing me hain! Rokne ke liye `/stop` bhejein.")
+        await status_msg.edit_text(f"🚀 Total **{total}** links queued! Process stop karne ke liye `/stop` bhejein.")
 
         for idx, raw_url in enumerate(urls, 1):
             if STOP_PROCESS.get(user_id, False):
@@ -466,16 +479,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try: os.remove(output_file)
                 except Exception: pass
 
-            await progress_msg.edit_text(f"📥 **[{idx}/{total}] FFmpeg Downloading...**\n`{video_title[:30]}...`")
+            await progress_msg.edit_text(f"📥 **[{idx}/{total}] Downloading Video...**")
             success = await download_video_ffmpeg(stream_url, output_file)
 
             if success:
-                await progress_msg.edit_text(f"📤 **[{idx}/{total}] Telegram Par Upload Ho Raha Hai...**")
+                await progress_msg.edit_text(f"📤 **[{idx}/{total}] Telegram Uploading...**")
                 try:
                     with open(output_file, 'rb') as vf:
                         await update.message.reply_video(
                             video=vf, 
-                            caption=f"🎥 **{video_title}**\n\n🔗 **Link {idx}/{total}**",
+                            caption=f"🎥 **{video_title}**\n\n🔗 **Item {idx}/{total}**",
                             supports_streaming=True
                         )
                     await progress_msg.delete()
@@ -488,7 +501,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try: os.remove(output_file)
                 except Exception: pass
 
-        await status_msg.edit_text("✅ **All videos processing completed!**")
+        await status_msg.edit_text("✅ **Processing completed!**")
 
     except Exception as e:
         logger.error(f"Error processing document: {e}")
@@ -504,7 +517,7 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
             await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.")
             return
 
-        await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! Files tayar ho rahi hain...")
+        await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! Files ready ho rahi hain...")
 
         txt_content = f"--- Scraped Video Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
         for idx, item in enumerate(results, 1):
@@ -553,7 +566,7 @@ a:hover {{ text-decoration: underline; }}
         await update_or_query.message.reply_document(document=txt_bytes, caption=f"📁 **Pages {start_page}-{end_page} TXT File** ({len(results)} Links)")
         await update_or_query.message.reply_document(
             document=html_bytes, 
-            caption=f"🌐 **Pages {start_page}-{end_page} HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye niche button par click karein:",
+            caption=f"🌐 **Pages {start_page}-{end_page} HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye button click karein:",
             reply_markup=reply_markup
         )
         await status_msg.delete()
@@ -582,7 +595,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     if not any(domain in target_url for domain in supported_domains):
-        await update.message.reply_text("❌ Yeh domain supported nahi hai. Supported sites list ke liye `/start` dabayein.")
+        await update.message.reply_text("❌ Domain supported nahi hai. Supported list ke liye `/start` dabayein.")
         return
 
     await run_scrape_chunk(update, context, target_url, start_page=1, end_page=10)
@@ -604,13 +617,13 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         end_page = start_page + 9
 
         if not target_url:
-            await query.message.reply_text("❌ Target URL lost. Kripya URL firse bhej kar start karein.")
+            await query.message.reply_text("❌ Target URL lost. Target URL dobara bhejein.")
             return
 
         await run_scrape_chunk(query, context, target_url, start_page=start_page, end_page=end_page)
 
 # ==========================================================
-# MAIN EXECUTION ENTRYPOINT
+# MAIN ENTRYPOINT
 # ==========================================================
 def main():
     init_db()
@@ -631,7 +644,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🤖 Advanced 13-Site Link Scraper Active!")
+    print("🤖 All-in-One 13-Site Link Extractor & Downloader Bot Running!")
     app.run_polling()
 
 if __name__ == "__main__":
