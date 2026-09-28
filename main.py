@@ -104,7 +104,7 @@ def get_all_users() -> List[int]:
 
 def get_custom_headers(url: str) -> dict:
     parsed = urlparse(url)
-    domain = parsed.netloc or "xvideos.com"
+    domain = parsed.netloc or "xvideos2.com"
     referer = f"https://{domain}/"
     
     return {
@@ -210,8 +210,8 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         # SITE DEDICATED EXTRACTION LOGIC (16 SITES)
         # ----------------------------------------------------
         
-        # 1. XVideos Engine
-        if "xvideos" in domain:
+        # 1. XVideos & XVideos2 Engine (Fully Handles xvideos2.com)
+        if "xvideos" in domain or "xvideos2" in domain:
             xv_high = re.search(r'html5player\.setVideoUrlHigh\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
             xv_low = re.search(r'html5player\.setVideoUrlLow\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
             xv_hls = re.search(r'html5player\.setVideoHLS\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
@@ -361,19 +361,20 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# MULTI-PAGE SCRAPING ENGINE (16 SITES INTEGRATED)
+# MULTI-PAGE SCRAPING ENGINE (XVideos2 & ALL 16 SITES)
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
     url_to_source = {}
     parsed = urlparse(url)
-    domain_name = parsed.netloc or "xvideos.com"
+    domain_name = parsed.netloc or "xvideos2.com"
     base_domain = f"https://{domain_name}"
 
-    # Check if single video link
+    # Check if single video link (Added XVideos / XVideos2 video patterns)
     is_single_video = (
         url.endswith('.html') or 
-        re.search(r'/videos?/[^/]+-\d+', url) or 
+        re.search(r'/video\.', url) or
         re.search(r'/video\d+', url) or
+        re.search(r'/videos?/[^/]+-\d+', url) or
         re.search(r'/post/\d+', url) or
         re.search(r'/watch/', url) or
         re.search(r'/v/', url) or
@@ -393,7 +394,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             page_urls.append(url)
             continue
         
-        if "xvideos" in domain_name:
+        if "xvideos" in domain_name or "xvideos2" in domain_name:
             if "?" in url:
                 page_urls.append(f"{url}&p={p-1}")
             else:
@@ -446,11 +447,11 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 
                 full_u = href if href.startswith("http") else urljoin(base_domain, href)
                 
-                # Site Specific Video Patterns (Expanded for 16 Sites)
+                # Site Specific Video Patterns (XVideos2 /video. included)
                 video_patterns = [
-                    r'/videos?/', r'/video\d+', r'/view_video', r'/watch/', r'/post/', 
-                    r'/contents/', r'/v/', r'/film/', r'/play/', r'/item/', 
-                    r'/e/', r'\.html$'
+                    r'/video\.', r'/video\d+', r'/videos?/', r'/view_video', 
+                    r'/watch/', r'/post/', r'/contents/', r'/v/', r'/film/', 
+                    r'/play/', r'/item/', r'/e/', r'\.html$'
                 ]
 
                 if any(re.search(pat, clean_href.lower()) for pat in video_patterns):
@@ -488,11 +489,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ **16-Site Dedicated Bulk Link Scraper Bot Active!**\n\n"
         "🌐 **Supported Platforms (16 Sites):**\n"
-        "1. XVideos      2. ViralXXXPorn  3. XHNews\n"
-        "4. xHamster     5. Joysporn      6. Xhaccess\n"
-        "7. Sxyprn       8. Pornhub       9. Spankbang\n"
-        "10. Redtube     11. Youporn      12. 4tube\n"
-        "13. IPornTV     14. HQPorn       15. JustPorn   16. SexVid\n\n"
+        "1. XVideos/XVideos2  2. ViralXXXPorn  3. XHNews\n"
+        "4. xHamster           5. Joysporn      6. Xhaccess\n"
+        "7. Sxyprn             8. Pornhub       9. Spankbang\n"
+        "10. Redtube           11. Youporn      12. 4tube\n"
+        "13. IPornTV           14. HQPorn       15. JustPorn   16. SexVid\n\n"
         "📌 **Features:**\n"
         "1. **Domain Extraction Engine:** Dedicated extractors for all 16 sites.\n"
         "2. **Export Files:** TXT & Interactive HTML Files.\n"
@@ -533,7 +534,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 **Bot Status:**\n\n"
         f"• **Authorized Users:** {users_count}\n"
-        f"• **Dedicated Site Extractors:** 16 Sites\n"
+        f"• **Dedicated Site Extractors:** 16 Sites (Including XVideos2)\n"
         f"• **Engine Status:** 24/7 Active 🟢"
     )
 
@@ -700,7 +701,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_url = url_match.group(1)
     supported_domains = [
-        "xvideos", "viralxxxporn", "xhnews", "joysporn", "xhaccess", 
+        "xvideos", "xvideos2", "viralxxxporn", "xhnews", "joysporn", "xhaccess", 
         "xhamster", "sxyprn", "pornhub", "spankbang", "redtube", 
         "youporn", "4tube", "iporntv", "hqporn", "justporn", "sexvid"
     ]
