@@ -104,7 +104,7 @@ def get_all_users() -> List[int]:
 
 def get_custom_headers(url: str) -> dict:
     parsed = urlparse(url)
-    domain = parsed.netloc or "xhamster.com"
+    domain = parsed.netloc or "xvideos.com"
     referer = f"https://{domain}/"
     
     return {
@@ -156,7 +156,7 @@ def self_ping_loop():
                 logger.error(f"Self-ping failed: {e}")
 
 # ==========================================================
-# 13 DEDICATED DOMAIN EXTRACTION ENGINES
+# 16 DEDICATED DOMAIN EXTRACTION ENGINES
 # ==========================================================
 def process_tpl_link(hls_link: str) -> str:
     try:
@@ -207,9 +207,45 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         domain = urlparse(video_url).netloc.lower()
 
         # ----------------------------------------------------
-        # 1. SITE DEDICATED EXTRACTION LOGIC
+        # SITE DEDICATED EXTRACTION LOGIC (16 SITES)
         # ----------------------------------------------------
-        if "pornhub" in domain:
+        
+        # 1. XVideos Engine
+        if "xvideos" in domain:
+            xv_high = re.search(r'html5player\.setVideoUrlHigh\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
+            xv_low = re.search(r'html5player\.setVideoUrlLow\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
+            xv_hls = re.search(r'html5player\.setVideoHLS\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
+            
+            if xv_high:
+                stream_link = xv_high.group(1)
+                file_type = "MP4"
+            elif xv_hls:
+                stream_link = xv_hls.group(1)
+                file_type = "M3U8"
+            elif xv_low:
+                stream_link = xv_low.group(1)
+                file_type = "MP4"
+
+        # 2. ViralXXXPorn Engine
+        elif "viralxxxporn" in domain:
+            vxp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'iframe\s+src=["\'](https?:[^\s"\']+?)["\']', text)
+            if vxp_match:
+                stream_link = vxp_match.group(1)
+                file_type = "MP4" if ".mp4" in stream_link else "M3U8"
+
+        # 3. XHNews Engine
+        elif "xhnews" in domain:
+            xhn_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
+            if xhn_match:
+                stream_link = xhn_match.group(1)
+                file_type = "M3U8" if ".m3u8" in stream_link else "MP4"
+
+        # 4. Pornhub Engine
+        elif "pornhub" in domain:
             match = re.search(r'var\s+flashvars_\d+\s*=\s*(\{.*?\});', text)
             if match:
                 try:
@@ -222,6 +258,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                 except Exception:
                     pass
 
+        # 5. Spankbang Engine
         elif "spankbang" in domain:
             sb_match = re.search(r'var\040stream_url\040=\040["\'](https?:[^\s"\']+?)["\']', text) or \
                        re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text)
@@ -229,6 +266,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                 stream_link = sb_match.group(1)
                 file_type = "MP4" if ".mp4" in stream_link else "M3U8"
 
+        # 6 & 7. Redtube & Youporn Engine
         elif "redtube" in domain or "youporn" in domain:
             yt_match = re.search(r'page_params\.mediaDefinitions\s*=\s*(\[.*?\]);', text) or \
                        re.search(r'definition\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
@@ -236,6 +274,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                 stream_link = yt_match.group(1) if yt_match.group(1).startswith("http") else None
                 file_type = "MP4"
 
+        # 8. Sxyprn Engine
         elif "sxyprn" in domain:
             sxy_match = re.search(r'data-s=["\'](https?:[^\s"\']+?)["\']', text) or \
                         re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
@@ -243,6 +282,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                 stream_link = sxy_match.group(1)
                 file_type = "MP4" if ".mp4" in stream_link else "M3U8"
 
+        # 9 & 10. Joysporn & Xhaccess Engine
         elif "joysporn" in domain or "xhaccess" in domain:
             joy_match = re.search(r'source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
                         re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
@@ -250,6 +290,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                 stream_link = joy_match.group(1)
                 file_type = "MP4" if ".mp4" in stream_link else "M3U8"
 
+        # 11 & 12. 4tube & IPornTV Engine
         elif "4tube" in domain or "iporntv" in domain:
             ft_match = re.search(r'"src"\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
                        re.search(r'https?:[^\s"\']+\.m3u8[^\s"\']*', text)
@@ -257,6 +298,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                 stream_link = ft_match.group(0) if isinstance(ft_match.group(0), str) else ft_match.group(1)
                 file_type = "M3U8"
 
+        # 13, 14 & 15. HQPorn, JustPorn & SexVid Engine
         elif "hqporn" in domain or "justporn" in domain or "sexvid" in domain:
             hq_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
                        re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
@@ -265,7 +307,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                 file_type = "MP4" if ".mp4" in stream_link else "M3U8"
 
         # ----------------------------------------------------
-        # 2. FALLBACK GENERIC EXTRACTOR (HLS -> MP4 -> JS)
+        # FALLBACK GENERIC EXTRACTOR
         # ----------------------------------------------------
         if not stream_link:
             m_hls = re.findall(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
@@ -319,19 +361,19 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# MULTI-PAGE SCRAPING ENGINE (13 SITES INTEGRATED)
+# MULTI-PAGE SCRAPING ENGINE (16 SITES INTEGRATED)
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
     url_to_source = {}
     parsed = urlparse(url)
-    domain_name = parsed.netloc or "xhamster.com"
+    domain_name = parsed.netloc or "xvideos.com"
     base_domain = f"https://{domain_name}"
 
     # Check if single video link
     is_single_video = (
         url.endswith('.html') or 
         re.search(r'/videos?/[^/]+-\d+', url) or 
-        re.search(r'/video/\d+', url) or
+        re.search(r'/video\d+', url) or
         re.search(r'/post/\d+', url) or
         re.search(r'/watch/', url) or
         re.search(r'/v/', url) or
@@ -351,7 +393,17 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             page_urls.append(url)
             continue
         
-        if "joysporn" in domain_name or "xhaccess" in domain_name:
+        if "xvideos" in domain_name:
+            if "?" in url:
+                page_urls.append(f"{url}&p={p-1}")
+            else:
+                page_urls.append(f"{base_u}/{p-1}")
+
+        elif "viralxxxporn" in domain_name or "xhnews" in domain_name:
+            page_urls.append(f"{base_u}/page/{p}/")
+            page_urls.append(f"{base_u}?page={p}")
+
+        elif "joysporn" in domain_name or "xhaccess" in domain_name:
             if base_u == base_domain:
                 page_urls.append(f"{base_domain}/apapu/{p}/")
             else:
@@ -394,9 +446,9 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 
                 full_u = href if href.startswith("http") else urljoin(base_domain, href)
                 
-                # Site Specific Video Patterns
+                # Site Specific Video Patterns (Expanded for 16 Sites)
                 video_patterns = [
-                    r'/videos?/', r'/view_video', r'/watch/', r'/post/', 
+                    r'/videos?/', r'/video\d+', r'/view_video', r'/watch/', r'/post/', 
                     r'/contents/', r'/v/', r'/film/', r'/play/', r'/item/', 
                     r'/e/', r'\.html$'
                 ]
@@ -434,13 +486,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚡ **13-Site Dedicated Bulk Link Scraper Bot Active!**\n\n"
-        "🌐 **Supported Platforms:**\n"
-        "1. xHamster  2. Joysporn  3. Xhaccess  4. Sxyprn\n"
-        "5. Pornhub   6. Spankbang 7. Redtube   8. Youporn\n"
-        "9. 4tube     10. IPornTV 11. HQPorn   12. JustPorn  13. SexVid\n\n"
+        "⚡ **16-Site Dedicated Bulk Link Scraper Bot Active!**\n\n"
+        "🌐 **Supported Platforms (16 Sites):**\n"
+        "1. XVideos      2. ViralXXXPorn  3. XHNews\n"
+        "4. xHamster     5. Joysporn      6. Xhaccess\n"
+        "7. Sxyprn       8. Pornhub       9. Spankbang\n"
+        "10. Redtube     11. Youporn      12. 4tube\n"
+        "13. IPornTV     14. HQPorn       15. JustPorn   16. SexVid\n\n"
         "📌 **Features:**\n"
-        "1. **Domain Extraction Engine:** Native extractors for all 13 sites.\n"
+        "1. **Domain Extraction Engine:** Dedicated extractors for all 16 sites.\n"
         "2. **Export Files:** TXT & Interactive HTML Files.\n"
         "3. **FFmpeg Downloader:** Upload `.txt` file to auto-download & send video.\n\n"
         "🛠️ **Commands:** `/stop`, `/stats`, `/userlist`"
@@ -479,7 +533,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 **Bot Status:**\n\n"
         f"• **Authorized Users:** {users_count}\n"
-        f"• **Dedicated Site Extractors:** 13\n"
+        f"• **Dedicated Site Extractors:** 16 Sites\n"
         f"• **Engine Status:** 24/7 Active 🟢"
     )
 
@@ -646,9 +700,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_url = url_match.group(1)
     supported_domains = [
-        "joysporn", "xhaccess", "xhamster", "sxyprn", "pornhub", 
-        "spankbang", "redtube", "youporn", "4tube", "iporntv", 
-        "hqporn", "justporn", "sexvid"
+        "xvideos", "viralxxxporn", "xhnews", "joysporn", "xhaccess", 
+        "xhamster", "sxyprn", "pornhub", "spankbang", "redtube", 
+        "youporn", "4tube", "iporntv", "hqporn", "justporn", "sexvid"
     ]
 
     if not any(domain in target_url for domain in supported_domains):
@@ -701,7 +755,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🤖 All-in-One 13-Site Dedicated Extractor & Downloader Bot Running!")
+    print("🤖 All-in-One 16-Site Dedicated Extractor & Downloader Bot Running!")
     app.run_polling()
 
 if __name__ == "__main__":
