@@ -159,7 +159,7 @@ def self_ping_loop():
                 logger.error(f"Self-ping failed: {e}")
 
 # ==========================================================
-# DEDICATED DOMAIN EXTRACTION ENGINES
+# DEDICATED DOMAIN EXTRACTION ENGINES (23 SITES)
 # ==========================================================
 def process_tpl_link(hls_link: str) -> str:
     try:
@@ -208,30 +208,129 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         file_type = "VIDEO"
         domain = urlparse(video_url).netloc.lower()
 
-        # Site Specific Extractors
+        # --------------------------------------------------
+        # Site Specific Extractors (23 Dedicated Sites)
+        # --------------------------------------------------
         if "xvideos" in domain or "xvideos2" in domain:
             xv_high = re.search(r'html5player\.setVideoUrlHigh\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
             xv_low = re.search(r'html5player\.setVideoUrlLow\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
             xv_hls = re.search(r'html5player\.setVideoHLS\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
-            
-            if xv_high:
-                stream_link = xv_high.group(1)
-            elif xv_hls:
-                stream_link = xv_hls.group(1)
-            elif xv_low:
-                stream_link = xv_low.group(1)
+            if xv_high: stream_link = xv_high.group(1)
+            elif xv_hls: stream_link = xv_hls.group(1)
+            elif xv_low: stream_link = xv_low.group(1)
 
         elif "viralxxxporn" in domain:
             vxp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
                         re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if vxp_match:
-                stream_link = vxp_match.group(1)
+            if vxp_match: stream_link = vxp_match.group(1)
 
         elif "xhnews" in domain:
             xhn_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
                         re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
-            if xhn_match:
-                stream_link = xhn_match.group(1)
+            if xhn_match: stream_link = xhn_match.group(1)
+
+        elif "xhamster" in domain:
+            xh_match = re.search(r'"m3u8":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'"mp4":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text)
+            if xh_match: stream_link = xh_match.group(1).replace('\\/', '/')
+
+        elif "joysporn" in domain:
+            jp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if jp_match: stream_link = jp_match.group(1)
+
+        elif "xhaccess" in domain:
+            xha_match = re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text)
+            if xha_match: stream_link = xha_match.group(1)
+
+        elif "sxyprn" in domain:
+            sxy_match = re.search(r'data-src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
+            if sxy_match: stream_link = sxy_match.group(1)
+
+        elif "pornhub" in domain:
+            ph_match = re.search(r'"mediaDefinitions":\s*(\[.*?\])', text)
+            if ph_match:
+                try:
+                    media_json = json.loads(ph_match.group(1))
+                    for item in media_json:
+                        if item.get("videoUrl"):
+                            stream_link = item["videoUrl"]
+                            break
+                except Exception: pass
+            if not stream_link:
+                ph_m = re.search(r'quality_\d+p\s*=\s*["\'](https?:[^\s"\']+?)["\']', text)
+                if ph_m: stream_link = ph_m.group(1)
+
+        elif "spankbang" in domain:
+            sb_match = re.search(r'stream_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
+            if sb_match: stream_link = sb_match.group(1)
+
+        elif "redtube" in domain or "youporn" in domain:
+            rt_match = re.search(r'mediaDefinitions\s*:\s*(\[.*?\])', text)
+            if rt_match:
+                try:
+                    media_json = json.loads(rt_match.group(1))
+                    for item in media_json:
+                        if item.get("videoUrl"):
+                            stream_link = item["videoUrl"]
+                            break
+                except Exception: pass
+
+        elif "4tube" in domain or "fapdu" in domain:
+            ft_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'"file":\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if ft_match: stream_link = ft_match.group(1)
+
+        elif "i-porntv" in domain or "iporntv" in domain:
+            ip_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if ip_match: stream_link = ip_match.group(1)
+
+        elif "hqporn" in domain or "justporn" in domain or "sexvid" in domain:
+            hq_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if hq_match: stream_link = hq_match.group(1)
+
+        # --- Newly Added 7 Sites ---
+        elif "eporner" in domain:
+            ep_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
+            if ep_match: stream_link = ep_match.group(1)
+
+        elif "pornorus" in domain or "russkoe-porno" in domain:
+            pr_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
+            if pr_match: stream_link = pr_match.group(1)
+
+        elif "gotporn" in domain:
+            gp_match = re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text)
+            if gp_match: stream_link = gp_match.group(1)
+
+        elif "fak.xxx" in domain:
+            fk_match = re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text)
+            if fk_match: stream_link = fk_match.group(1)
+
+        elif "anysex" in domain:
+            as_match = re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
+            if as_match: stream_link = as_match.group(1)
+
+        elif "superporn" in domain:
+            sp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if sp_match: stream_link = sp_match.group(1)
 
         # Fallback Extractor
         if not stream_link:
@@ -254,12 +353,9 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         if stream_link:
             final_link = process_tpl_link(stream_link) if ".m3u8" in stream_link else stream_link
             
-            if ".pdf" in final_link.lower():
-                file_type = "PDF"
-            elif any(ext in final_link.lower() for ext in ['.mp3', '.wav', '.m4a', '.aac']):
-                file_type = "AUDIO"
-            elif any(ext in final_link.lower() for ext in ['.jpg', '.png', '.jpeg', '.webp']):
-                file_type = "IMAGE"
+            if ".pdf" in final_link.lower(): file_type = "PDF"
+            elif any(ext in final_link.lower() for ext in ['.mp3', '.wav', '.m4a', '.aac']): file_type = "AUDIO"
+            elif any(ext in final_link.lower() for ext in ['.jpg', '.png', '.jpeg', '.webp']): file_type = "IMAGE"
 
             return {
                 "title": title,
@@ -324,10 +420,9 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             continue
         
         if "xvideos" in domain_name or "xvideos2" in domain_name:
-            if "?" in url:
-                page_urls.append(f"{url}&p={p-1}")
-            else:
-                page_urls.append(f"{base_u}/{p-1}")
+            page_urls.append(f"{url}&p={p-1}" if "?" in url else f"{base_u}/{p-1}")
+        elif "xhamster" in domain_name or "pornhub" in domain_name or "spankbang" in domain_name or "eporner" in domain_name:
+            page_urls.append(f"{url}&page={p}" if "?" in url else f"{base_u}/{p}")
         else:
             page_urls.append(f"{base_u}/{p}")
             page_urls.append(f"{base_u}?page={p}")
@@ -350,7 +445,10 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
                     continue
 
                 full_u = href if href.startswith("http") else urljoin(base_domain, href)
-                video_patterns = [r'/video\.', r'/video\d+', r'/videos?/', r'/view_video', r'/watch/', r'/post/', r'/film/', r'\.html$']
+                video_patterns = [
+                    r'/video\.', r'/video\d+', r'/videos?/', r'/view_video', r'/watch/', r'/post/', 
+                    r'/film/', r'\.html$', r'/v/', r'/play/', r'/categories/', r'/cat/'
+                ]
 
                 if any(re.search(pat, clean_href.lower()) for pat in video_patterns):
                     if not re.search(r'/videos?/?$', clean_href) and not re.search(r'/category/?$', clean_href):
@@ -398,7 +496,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
         icon = "🎬"
         if item['type'] == 'PDF': icon = "📄"
         elif item['type'] == 'AUDIO': icon = "🎵"
-        elif item['type'] == 'IMAGE': icon = "🖼️"
+        elif item['type'] == 'IMAGE': icon = "🖼"
 
         items_html += f"""
         <div class="list-item" id="item-{idx}" data-type="{item['type']}" onclick="openCinema({idx})">
@@ -427,7 +525,6 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
     else:
         security_script = "document.getElementById('app-wrapper').style.display = 'block';"
 
-    # Combined Web App Template
     html_template = f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark" data-color="blue">
 <head>
@@ -847,13 +944,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚡ **16-Site Dedicated Bulk Link Scraper Bot Active!**\n\n"
-        "🌐 **Supported Platforms (16 Sites):**\n"
+        "⚡ **23-Site Dedicated Bulk Link Scraper Bot Active!**\n\n"
+        "🌐 **Supported Platforms (23 Sites):**\n"
         "1. XVideos/XVideos2  2. ViralXXXPorn  3. XHNews\n"
         "4. xHamster           5. Joysporn      6. Xhaccess\n"
         "7. Sxyprn              8. Pornhub       9. Spankbang\n"
         "10. Redtube            11. Youporn      12. 4tube\n"
-        "13. IPornTV            14. HQPorn       15. JustPorn   16. SexVid\n\n"
+        "13. IPornTV            14. HQPorn       15. JustPorn\n"
+        "16. SexVid             17. Eporner      18. Pornorus\n"
+        "19. Russkoe-Porno      20. GotPorn      21. Fak.xxx\n"
+        "22. AnySex             23. SuperPorn\n\n"
         "📌 **Features:**\n"
         "1. **Full Web Player UI:** Custom Video & Media Player interface in HTML.\n"
         "2. **4 Files Export:** 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
@@ -862,24 +962,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         add_user_db(uid)
         await update.message.reply_text(f"✅ User `{uid}` added.", parse_mode="Markdown")
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         remove_user_db(uid)
-        await update.message.reply_text(f"🗑️ User `{uid}` removed.", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑 User `{uid}` removed.", parse_mode="Markdown")
 
 async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_user_allowed(update.effective_user.id):
-        return
+    if not is_user_allowed(update.effective_user.id): return
     users = get_all_users()
     msg = "👥 **Authorized Users:**\n\n"
     for uid in users:
@@ -888,13 +985,12 @@ async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_user_allowed(update.effective_user.id):
-        return
+    if not is_user_allowed(update.effective_user.id): return
     users_count = len(get_all_users())
     await update.message.reply_text(
         f"📊 **Bot Status:**\n\n"
         f"• **Authorized Users:** {users_count}\n"
-        f"• **Dedicated Site Extractors:** 16 Sites\n"
+        f"• **Dedicated Site Extractors:** 23 Sites Active\n"
         f"• **Engine Status:** 24/7 Active 🟢"
     )
 
@@ -904,8 +1000,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_user_allowed(user_id):
-        return
+    if not is_user_allowed(user_id): return
 
     doc = update.message.document
     if not doc or not doc.file_name.endswith('.txt'):
@@ -1002,7 +1097,7 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
         txt_full_bytes = io.BytesIO(txt_full_content.encode('utf-8'))
         txt_full_bytes.name = f"scraped_p{start_page}_to_p{end_page}_full.txt"
 
-        # FILE 2: SIMPLE TXT (Title: URL)
+        # FILE 2: SIMPLE TXT
         txt_simple_content = f"--- Simple Video Stream Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
         for idx, item in enumerate(results, 1):
             txt_simple_content += f"{item['title']}: {item['download_link']}\n"
@@ -1010,7 +1105,7 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
         txt_simple_bytes = io.BytesIO(txt_simple_content.encode('utf-8'))
         txt_simple_bytes.name = f"scraped_p{start_page}_to_p{end_page}_simple.txt"
 
-        # FILE 3: FULL WEB APP HTML (Custom Player Template)
+        # FILE 3: FULL WEB APP HTML
         html_web_app = generate_web_app_html(results, title=f"Media Player ({start_page}-{end_page})")
         html_full_bytes = io.BytesIO(html_web_app.encode('utf-8'))
         html_full_bytes.name = f"scraped_p{start_page}_to_p{end_page}_full.html"
@@ -1036,7 +1131,6 @@ a:hover {{ text-decoration: underline; }}
         html_simple_bytes = io.BytesIO(html_simple_content.encode('utf-8'))
         html_simple_bytes.name = f"scraped_p{start_page}_to_p{end_page}_simple.html"
 
-        # SEND ALL FILES
         context.user_data['last_url'] = target_url
         context.user_data['next_start'] = end_page + 1
 
@@ -1082,8 +1176,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
 
-    if not is_user_allowed(query.from_user.id):
-        return
+    if not is_user_allowed(query.from_user.id): return
 
     if query.data == "stop_scrape":
         await query.edit_message_caption(caption=query.message.caption + "\n\n🛑 **Scraping Stopped By User.**")
@@ -1122,7 +1215,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🤖 All-in-One 16-Site Dedicated Extractor & Web App Bot Running!")
+    print("🤖 23-Site Dedicated Extractor & Web App Bot Running!")
     app.run_polling()
 
 if __name__ == "__main__":
