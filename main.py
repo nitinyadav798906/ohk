@@ -49,6 +49,7 @@ BOT_OWNER_NAME = os.getenv("BOT_OWNER_NAME", "@Mascotchlowa")
 TELEGRAM_LINK = os.getenv("TELEGRAM_LINK", "https://t.me/Mascotchlowa")
 SKY_PASSWORD = os.getenv("SKY_PASSWORD", "7989")
 DB_FILE = "bot_data.db"
+PROXY_URL = os.getenv("PROXY_URL", "").strip()  # e.g. http://user:pass@host:port (optional)
 
 STOP_PROCESS: Dict[int, bool] = {}
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -77,6 +78,20 @@ def init_db():
             filename TEXT,
             count INTEGER,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS custom_sites (
+            domain TEXT PRIMARY KEY,
+            added_by INTEGER,
+            added DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS site_cookies (
+            domain TEXT PRIMARY KEY,
+            cookie TEXT,
+            updated DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -111,6 +126,127 @@ def get_all_users() -> List[int]:
     users = [row[0] for row in cursor.fetchall()]
     conn.close()
     return users
+
+# ==========================================================
+# SITE LIST + PER-SITE LOGIN COOKIES (optional for every site)
+# ==========================================================
+# Full domains (exact domains used in the dedicated extractors)
+SITES_FULL = [
+    "xhamster46.desi",      # login / logout supported (cookie)
+    "rusvideos.net", "pornhd8k.me", "evooli.com", "porn4days.pw", "porneec.com",
+    "redheadpornx.com", "vxxx.com", "hdporn92.com", "inxxx.com", "pornk.top",
+    "24videos.space", "sex-studentki.guru", "seksvideo.tv", "russkoeporno.mobi",
+    "megatube.xxx", "freshporno.org", "darknessporn.com", "bdsmx.tube",
+    "85po.com", "vtrahe.to", "fak.xxx",
+]
+# Matched by name, so every mirror / TLD of these works (e.g. xhamster46.desi)
+SITES_KEYWORD = [
+    "xvideos / xvideos2", "xhamster", "xhnews", "xhaccess", "viralxxxporn", "joysporn",
+    "sxyprn", "pornhub", "spankbang", "redtube", "youporn", "4tube", "fapdu",
+    "i-porntv / iporntv", "hqporn", "justporn", "sexvid", "eporner", "pornorus",
+    "russkoe-porno", "gotporn", "anysex", "superporn",
+]
+
+def normalize_domain(value: str) -> str:
+    v = (value or "").strip().lower()
+    v = re.sub(r'^https?://', '', v)
+    v = v.split('/')[0].split('?')[0].split('#')[0].split(':')[0]
+    if v.startswith('www.'):
+        v = v[4:]
+    return v
+
+def clean_cookie(raw: str) -> str:
+    c = re.sub(r'[\r\n]+', ' ', raw or '').strip()
+    c = re.sub(r'^cookie:\s*', '', c, flags=re.I)
+    return c.encode('ascii', errors='ignore').decode('ascii').strip()
+
+def set_cookie_db(domain: str, cookie: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO site_cookies (domain, cookie) VALUES (?, ?) "
+        "ON CONFLICT(domain) DO UPDATE SET cookie=excluded.cookie, updated=CURRENT_TIMESTAMP",
+        (domain, cookie))
+    conn.commit()
+    conn.close()
+
+def delete_cookie_db(domain: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM site_cookies WHERE domain = ?", (domain,))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+def list_cookie_domains() -> List[str]:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT domain FROM site_cookies ORDER BY domain")
+    rows = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_cookie_for_url(url: str) -> Optional[str]:
+    host = normalize_domain(url)
+    if not host:
+        return None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT domain, cookie FROM site_cookies")
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception:
+        return None
+    for d, c in rows:
+        if host == d or host.endswith('.' + d):
+            return c
+    return None
+
+# ---- custom sites added from the bot (/addsite) ----
+DOMAIN_RE = re.compile(r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,}|xn--[a-z0-9-]+)$')
+
+def env_extra_sites() -> List[str]:
+    """Optional permanent sites via env var EXTRA_SITES=domain1.com,domain2.net"""
+    out = []
+    for x in os.getenv("EXTRA_SITES", "").split(","):
+        d = normalize_domain(x)
+        if d and DOMAIN_RE.match(d) and d not in out:
+            out.append(d)
+    return out
+
+def add_custom_site_db(domain: str, user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO custom_sites (domain, added_by) VALUES (?, ?)", (domain, user_id))
+    conn.commit()
+    conn.close()
+
+def remove_custom_site_db(domain: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM custom_sites WHERE domain = ?", (domain,))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+def list_custom_sites_db() -> List[str]:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT domain FROM custom_sites ORDER BY added")
+    rows = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_all_sites() -> List[str]:
+    """Built-in full domains + EXTRA_SITES env + sites added with /addsite (no duplicates)."""
+    out = list(SITES_FULL)
+    for d in env_extra_sites() + list_custom_sites_db():
+        if d not in out:
+            out.append(d)
+    return out
 
 def get_custom_headers(url: str) -> dict:
     parsed = urlparse(url)
@@ -221,32 +357,53 @@ LAST_REPORT: dict = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0
 
 def make_headers(url: str, referer: Optional[str] = None) -> dict:
     p = urlparse(url)
-    return {
+    headers = {
         "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": referer or f"{p.scheme or 'https'}://{p.netloc}/",
     }
+    cookie = get_cookie_for_url(url)   # signed-in session for this site (if any)
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+LAST_DETAIL: Dict[str, str] = {}
 
 
 def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
     headers = make_headers(url, referer)
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
     attempts = []
     if cffi_requests:  # best against Cloudflare (real Chrome TLS fingerprint)
-        attempts.append(lambda: cffi_requests.get(
-            url, headers=headers, impersonate="chrome124", timeout=25))
-    attempts.append(lambda: scraper.get(url, headers=headers, timeout=25))
-    attempts.append(lambda: requests.get(url, headers=headers, timeout=25))
+        attempts.append(("curl_cffi", lambda: cffi_requests.get(
+            url, headers=headers, impersonate="chrome124", timeout=25, proxies=proxies)))
+    attempts.append(("cloudscraper", lambda: scraper.get(
+        url, headers=headers, timeout=25, proxies=proxies)))
+    attempts.append(("requests", lambda: requests.get(
+        url, headers=headers, timeout=25, proxies=proxies)))
 
-    for fn in attempts:
+    detail = []
+    for name, fn in attempts:
         try:
             r = fn()
             LAST_STATUS[url] = r.status_code
             if r.status_code == 200 and len(r.text) > 500:
+                if re.search(r'<title>\s*(Just a moment|Attention Required|Access denied|'
+                             r'Verifying|Are you a robot|DDoS)', r.text, re.I):
+                    LAST_STATUS[url] = "200 (bot-challenge page)"
+                    detail.append(f"{name}:challenge")
+                    logger.warning(f"fetch {url} -> bot challenge page ({name})")
+                    continue
+                LAST_DETAIL[url] = ""
                 return r.text
-            logger.warning(f"fetch {url} -> HTTP {r.status_code}")
+            detail.append(f"{name}:{r.status_code}")
+            logger.warning(f"fetch {url} -> HTTP {r.status_code} ({name})")
         except Exception as e:
-            logger.warning(f"fetch {url} error: {e}")
+            detail.append(f"{name}:error")
+            logger.warning(f"fetch {url} error ({name}): {e}")
+    LAST_DETAIL[url] = ", ".join(detail)
     return None
 
 
@@ -270,35 +427,45 @@ def _shape(pu) -> str:
     return '/'.join(segs) + (('?' + q) if q else '')
 
 
+def _root_host(h: str) -> str:
+    h = h.lower().split(':')[0]
+    parts = h.split('.')
+    return '.'.join(parts[-2:]) if len(parts) >= 2 else h
+
+
 def find_video_links(html: str, page_url: str) -> List[str]:
-    host = urlparse(page_url).netloc.lower()
-    if host.startswith('www.'):
-        host = host[4:]
+    root = _root_host(urlparse(page_url).netloc)
     items: Dict[str, tuple] = {}
 
-    for m in re.finditer(r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-                         html, re.I | re.S):
-        href = m.group(1).strip().replace('&amp;', '&')
-        inner = m.group(2)
-        if href.startswith(('javascript:', '#', 'mailto:', 'tel:')):
-            continue
+    def add(href: str, thumb: bool):
+        href = href.strip().replace('&amp;', '&').replace('\\/', '/')
+        if not href or href.startswith(('javascript:', '#', 'mailto:', 'tel:', 'data:')):
+            return
         full = urljoin(page_url, href).split('#')[0]
         pu = urlparse(full)
         if pu.scheme not in ('http', 'https'):
-            continue
-        link_host = pu.netloc.lower()
-        if link_host.startswith('www.'):
-            link_host = link_host[4:]
-        if link_host != host:
-            continue
+            return
+        if _root_host(pu.netloc) != root:
+            return
         if pu.path in ('', '/') or full.rstrip('/') == page_url.rstrip('/'):
-            continue
+            return
         if pu.path.lower().endswith(SKIP_EXT) or BAD_PATH.search(pu.path):
-            continue
-        thumb = bool(re.search(r'<img\b|data-src|data-original|poster|background-image',
-                               inner, re.I))
+            return
         old = items.get(full)
         items[full] = (_shape(pu), thumb or (old[1] if old else False))
+
+    for m in re.finditer(r'<a\b[^>]*?href=(?:["\']([^"\']+)["\']|([^\s>]+))[^>]*>(.*?)</a>',
+                         html, re.I | re.S):
+        inner = m.group(3)
+        thumb = bool(re.search(r'<img\b|data-src|data-original|poster|background-image',
+                               inner, re.I))
+        add(m.group(1) or m.group(2), thumb)
+
+    if len(items) < 3:  # links hidden inside JSON / script blocks
+        for m in re.finditer(r'["\'](https?:\\?/\\?/[^"\'\s<>]+)["\']', html):
+            add(m.group(1), False)
+        for m in re.finditer(r'["\'](\\?/[^"\'\s<>]*[-_0-9][^"\'\s<>]*)["\']', html):
+            add(m.group(1), False)
 
     if not items:
         return []
@@ -309,14 +476,33 @@ def find_video_links(html: str, page_url: str) -> List[str]:
         thumbs[sh] += int(th)
     top = max(score.values())
 
-    good = {sh for sh, c in score.items()
-            if c >= 3 and c >= 0.3 * top and thumbs[sh] >= 0.5 * c}
-    if not good:
-        good = {sh for sh, c in score.items() if c >= 3 and c >= 0.3 * top}
-    if not good:  # tiny page: just use anything with a thumbnail
-        return [u for u, (_, th) in items.items() if th]
+    def pick(min_count: int, need_thumb: bool):
+        return {sh for sh, c in score.items()
+                if c >= min_count and c >= 0.3 * top
+                and (not need_thumb or thumbs[sh] >= 0.5 * c)}
 
-    return [u for u, (sh, _) in items.items() if sh in good]
+    good = pick(3, True) or pick(3, False) or pick(2, False)
+    if good:
+        return [u for u, (sh, _) in items.items() if sh in good]
+
+    th_links = [u for u, (_, t) in items.items() if t]
+    return (th_links or list(items))[:60]
+
+
+def link_stats(html: str, page_url: str) -> str:
+    root = _root_host(urlparse(page_url).netloc)
+    hrefs = re.findall(r'<a\b[^>]*?href=["\']([^"\']+)["\']', html, re.I)
+    same = [h for h in hrefs
+            if _root_host(urlparse(urljoin(page_url, h)).netloc) == root]
+    shapes = Counter(_shape(urlparse(urljoin(page_url, h))) for h in same)
+    title = re.search(r'<title>(.*?)</title>', html, re.I | re.S)
+    return (
+        f"📄 Title: {(title.group(1).strip()[:80] if title else 'none')}\n"
+        f"🔢 <a> tags: {len(hrefs)} | same-site: {len(same)} | <img>: {len(re.findall(r'<img\b', html, re.I))}\n"
+        f"🧩 Top URL shapes: {shapes.most_common(4)}\n"
+        f"⚙️ <script> blocks: {len(re.findall(r'<script', html, re.I))} "
+        f"(zyada script + kam <a> = JS-rendered listing)"
+    )
 
 
 def _looks_like_single_video(url: str) -> bool:
@@ -1160,7 +1346,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. **Full Web Player UI:** Custom Video & Media Player interface in HTML.\n"
         "2. **4 Files Export:** 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
         "3. **FFmpeg Downloader:** Upload `.txt` file to auto-download & send video.\n\n"
-        "🛠️ **Commands:** `/stop`, `/stats`, `/userlist`"
+        "🛠️ **Commands:** `/site`, `/addsite`, `/removesite`, `/login`, `/logout`, `/stop`, `/stats`, `/userlist`"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1212,10 +1398,13 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not html:
         await update.message.reply_text(
             f"❌ Fetch failed. HTTP: {LAST_STATUS.get(url, '?')}\n"
+            f"🔧 Engines: {LAST_DETAIL.get(url, '?')}\n"
+            f"curl_cffi installed: {'YES' if cffi_requests else 'NO'} | "
+            f"Proxy set: {'YES' if PROXY_URL else 'NO'}\n\n"
             "403/503 = Cloudflare/IP block | 404 = wrong URL | ? = timeout/DNS")
         return
 
-    lines = [f"✅ Fetched {len(html)} bytes"]
+    lines = [f"✅ Fetched {len(html)} bytes", link_stats(html, url)]
     links = find_video_links(html, url)
     lines.append(f"🔗 Video-like links on page: {len(links)}")
     lines += links[:3]
@@ -1227,6 +1416,210 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = await generic_extract(html, url)
         lines.append(f"▶ Treated as single video page: {s or 'no stream found'}")
     await update.message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+async def dump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/dump <url> -> sends the raw HTML the bot receives, so it can be inspected."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /dump <url>")
+        return
+    url = context.args[0]
+    html = await fetch(url)
+    if not html:
+        await update.message.reply_text(f"❌ Fetch failed. HTTP: {LAST_STATUS.get(url, '?')}")
+        return
+    buf = io.BytesIO(html.encode('utf-8', errors='ignore'))
+    buf.name = "page_dump.html"
+    await update.message.reply_document(document=buf, caption=f"Raw HTML ({len(html)} bytes) of {url}")
+
+async def save_cookie_flow(update: Update, domain: str, raw_cookie: str):
+    """Saves cookie for a domain, deletes the user's message (it contains secrets) and tests the site."""
+    cookie = clean_cookie(raw_cookie)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    if not domain or '=' not in cookie:
+        await update.effective_chat.send_message("❌ Invalid cookie. Format: name=value; name2=value2; ...")
+        return
+    set_cookie_db(domain, cookie)
+    n = len([c for c in cookie.split(';') if '=' in c])
+    test_url = f"https://{domain}/"
+    html = await fetch(test_url)
+    if html:
+        test = "✅ Site reachable (HTTP 200)"
+    else:
+        test = (f"⚠️ Site fetch failed: HTTP {LAST_STATUS.get(test_url, '?')} "
+                f"({LAST_DETAIL.get(test_url, '')})\n"
+                "Cookie save ho gayi, par block/IP ki problem alag hai. /debug se check karo.")
+    await update.effective_chat.send_message(
+        f"🔑 Signed in: {domain}\n🍪 Cookies saved: {n}\n{test}\n"
+        f"🧹 Cookie wala message delete kar diya gaya.")
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/login <domain> <cookie string>"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    parts = (update.message.text or "").split(None, 2)
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "Usage:\n/login <domain> <cookie string>\n\n"
+            "Example:\n/login xhamster46.desi cookie_accept_v2=...; UID=...; ...\n\n"
+            "Ya /site -> Sign In button dabao.")
+        return
+    await save_cookie_flow(update, normalize_domain(parts[1]), parts[2])
+
+async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/logout <domain>  or  /logout all"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        saved = list_cookie_domains()
+        await update.message.reply_text(
+            "Usage: /logout <domain>  |  /logout all\n"
+            f"Signed-in sites: {', '.join(saved) if saved else 'none'}")
+        return
+    if context.args[0].lower() == "all":
+        for d in list_cookie_domains():
+            delete_cookie_db(d)
+        await update.message.reply_text("🚪 Sab sites se sign out ho gaya.")
+        return
+    dom = normalize_domain(context.args[0])
+    ok = delete_cookie_db(dom)
+    await update.message.reply_text(f"🚪 Signed out: {dom}" if ok else f"ℹ️ {dom} par koi saved login nahi tha.")
+
+async def site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/site -> all supported sites + login status.  /site <domain> -> status + live test."""
+    if not is_user_allowed(update.effective_user.id):
+        return
+
+    if context.args:
+        dom = normalize_domain(context.args[0])
+        has = get_cookie_for_url(f"https://{dom}/") is not None
+        test_url = f"https://{dom}/"
+        html = await fetch(test_url)
+        status = "✅ reachable (HTTP 200)" if html else (
+            f"❌ HTTP {LAST_STATUS.get(test_url, '?')} ({LAST_DETAIL.get(test_url, '')})")
+        await update.message.reply_text(
+            f"🌐 {dom}\n🔑 Login: {'SIGNED IN 🟢' if has else 'not signed in ⚪'}\n📡 Test: {status}")
+        return
+
+    saved = set(list_cookie_domains())
+    lines = ["🌐 Supported Sites (full domains)", "🟢 = signed in | ⚪ = no login", ""]
+    for d in SITES_FULL:
+        lines.append(f"{'🟢' if d in saved else '⚪'} {d}")
+    custom_sites = [d for d in get_all_sites() if d not in SITES_FULL]
+    if custom_sites:
+        lines += ["", "➕ Added by you (/addsite):"]
+        for d in custom_sites:
+            lines.append(f"{'🟢' if d in saved else '⚪'} {d}")
+    lines += [
+        "",
+        "🔎 Name-match (kisi bhi mirror/TLD par chalega):",
+        ", ".join(SITES_KEYWORD),
+        "",
+        "ℹ️ Inke alawa koi bhi doosri site bhi try hoti hai (generic extractor).",
+        "",
+        "🔑 Login optional hai, har site ke liye:",
+        "/login <domain> <cookie>   |   /logout <domain>",
+        "/site <domain> -> status + live test",
+        "",
+        "➕ Nayi site jodne ke liye: /addsite <full domain>",
+        "➖ Hatane ke liye: /removesite <domain>",
+    ]
+    keyboard = []
+    if update.effective_user.id == ADMIN_ID:
+        keyboard.append([InlineKeyboardButton("🔑 Sign In xhamster46.desi", callback_data="signin:xhamster46.desi")])
+        for d in custom_sites:
+            if d != "xhamster46.desi":
+                keyboard.append([InlineKeyboardButton(f"🔑 Sign In {d}", callback_data=f"signin:{d}"[:64])])
+        for d in sorted(saved):
+            keyboard.append([InlineKeyboardButton(f"🚪 Sign Out {d}", callback_data=f"signout:{d}"[:64])])
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+        disable_web_page_preview=True)
+
+async def addsite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addsite <full domain or URL> [optional cookie]  -> adds a site to the bot's list and tests it."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    chat = update.effective_chat
+    parts = (update.message.text or "").split(None, 2)
+
+    if len(parts) < 2:
+        custom = [d for d in get_all_sites() if d not in SITES_FULL]
+        await chat.send_message(
+            "Usage:\n"
+            "/addsite <full domain>\n"
+            "/addsite <full domain> <cookie>   (cookie optional)\n\n"
+            "Examples:\n/addsite xhamster46.desi\n/addsite https://example.com/videos\n\n"
+            f"➕ Abhi tak jodi gayi sites: {', '.join(custom) if custom else 'none'}")
+        return
+
+    domain = normalize_domain(parts[1])
+    cookie = clean_cookie(parts[2]) if len(parts) > 2 else ""
+    if cookie:  # message contains secrets -> remove it
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    if not DOMAIN_RE.match(domain):
+        await chat.send_message(f"❌ Invalid domain: {domain or '(empty)'}\nFull domain do, jaise: example.com")
+        return
+
+    already = domain in get_all_sites()
+    if not already:
+        add_custom_site_db(domain, update.effective_user.id)
+    cookie_note = ""
+    if cookie and '=' in cookie:
+        set_cookie_db(domain, cookie)
+        cookie_note = "\n🔑 Cookie saved (signed in)"
+
+    status = await chat.send_message(f"⏳ {domain} test ho raha hai...")
+    home = f"https://{domain}/"
+    html = await fetch(home)
+    if not html:
+        report = (f"📡 Fetch: ❌ HTTP {LAST_STATUS.get(home, '?')} ({LAST_DETAIL.get(home, '')})\n"
+                  "⚠️ Site list me add ho gayi, par abhi bot ise khol nahi pa raha "
+                  "(Cloudflare/IP block ho sakta hai). /debug se check karo.")
+    else:
+        links = find_video_links(html, home)
+        report = f"📡 Fetch: ✅ HTTP 200\n🔗 Video-like links (homepage): {len(links)}"
+        if links:
+            h = await fetch(links[0], referer=home)
+            stream = await generic_extract(h, links[0]) if h else None
+            report += f"\n▶ Extract test: {'✅ stream mila' if stream else '⚠️ FAILED (is site ka sample bhejo)'}"
+        else:
+            report += "\nℹ️ Homepage par links nahi mile; kisi listing/video URL se try karo."
+
+    head = "ℹ️ Pehle se list me thi" if already else "✅ Site added"
+    await status.edit_text(
+        f"{head}: {domain}{cookie_note}\n{report}\n\n"
+        "Ab is site ka listing ya video URL bot ko bhejo. /site se list dekho.")
+
+async def removesite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/removesite <domain> -> removes a site added with /addsite."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        custom = list_custom_sites_db()
+        await update.message.reply_text(
+            "Usage: /removesite <domain>\n"
+            f"Removable sites: {', '.join(custom) if custom else 'none'}")
+        return
+    domain = normalize_domain(context.args[0])
+    if domain in SITES_FULL:
+        await update.message.reply_text("⛔ Ye built-in site hai, hata nahi sakte.")
+    elif domain in env_extra_sites() and domain not in list_custom_sites_db():
+        await update.message.reply_text("ℹ️ Ye EXTRA_SITES env variable se aayi hai; wahan se hatao.")
+    elif remove_custom_site_db(domain):
+        await update.message.reply_text(
+            f"➖ Removed: {domain}\n(Login cookie bhi hatani ho to: /logout {domain})")
+    else:
+        await update.message.reply_text(f"ℹ️ {domain} list me nahi mili.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1318,7 +1711,7 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
                 f"🚫 Failed: {r['pages_fail'][:3]}\n"
                 f"🔗 Links found: {r['links']}\n"
                 f"✅ Extracted: {r['extracted']}\n\n"
-                f"Detail ke liye: /debug {target_url}"
+                f"Detail ke liye: /debug {target_url}\nRaw HTML ke liye: /dump {target_url}"
             )
             return
 
@@ -1401,6 +1794,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    pending_domain = context.user_data.get('await_cookie')
+    if pending_domain and user_id == ADMIN_ID:
+        context.user_data.pop('await_cookie', None)
+        if text.lower() == "cancel":
+            await update.message.reply_text("❎ Sign in cancel ho gaya.")
+            return
+        await save_cookie_flow(update, pending_domain, text)
+        return
+
     url_match = re.search(r'(https?://[^\s]+)', text)
 
     if not url_match:
@@ -1415,6 +1818,21 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     if not is_user_allowed(query.from_user.id): return
+
+    if query.data.startswith("signin:") or query.data.startswith("signout:"):
+        if query.from_user.id != ADMIN_ID:
+            return
+        action, dom = query.data.split(":", 1)
+        if action == "signin":
+            context.user_data['await_cookie'] = dom
+            await query.message.reply_text(
+                f"🔑 {dom} ke liye cookie string ab bhejo (name=value; name2=value2; ...).\n"
+                "Cancel karne ke liye: cancel\n"
+                "Cookie wala message save hote hi auto-delete ho jayega.")
+        else:
+            ok = delete_cookie_db(dom)
+            await query.message.reply_text(f"🚪 Signed out: {dom}" if ok else f"ℹ️ {dom} par login nahi tha.")
+        return
 
     if query.data == "stop_scrape":
         await query.edit_message_caption(caption=query.message.caption + "\n\n🛑 **Scraping Stopped By User.**")
@@ -1445,6 +1863,12 @@ def main():
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("debug", debug_command))
+    app.add_handler(CommandHandler("dump", dump_command))
+    app.add_handler(CommandHandler("site", site_command))
+    app.add_handler(CommandHandler("addsite", addsite_command))
+    app.add_handler(CommandHandler("removesite", removesite_command))
+    app.add_handler(CommandHandler("login", login_command))
+    app.add_handler(CommandHandler("logout", logout_command))
     
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
@@ -1454,6 +1878,8 @@ def main():
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
+    logger.info(f"curl_cffi: {'ON' if cffi_requests else 'OFF (pip install curl_cffi)'} | "
+                f"Proxy: {'ON' if PROXY_URL else 'OFF'}")
     print("🤖 43-Site Dedicated Extractor & Web App Bot Running!")
     app.run_polling()
 
