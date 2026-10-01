@@ -2437,6 +2437,16 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
 
     ordered = [results[v] for v in url_to_source if v in results]
 
+    # ---- JS-rendered (SPA) site: embedded JSON / hidden API / sitemap / optional browser ----
+    if not ordered and first_html.get("h") and not STOP_PROCESS.get(user_id):
+        try:
+            ordered, spa_diag = await scr_spa_fallback(url, first_html["h"], page_urls[0], start, end, user_id)
+        except Exception as e:
+            logger.error(f"spa fallback error {domain}: {e}")
+            ordered, spa_diag = [], f"SPA error: {e}"
+        rep["diag"] = (rep["diag"] + "\n" + spa_diag).strip()
+        rep["links"] = max(rep["links"], len(ordered))
+
     # ---- FALLBACK: the page itself holds a player (no listing) ----
     if not ordered and first_html.get("h") and not STOP_PROCESS.get(user_id):
         single = await _scr_single_fallback(first_html["h"], page_urls[0])
@@ -2508,7 +2518,7 @@ async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
 
     # ---- 1) NEW SITE? -> add to /site list + auto-build domain-specific extractor ----
     learn = gate_note
-    if not get_site_rule(domain) and not _is_builtin_domain(domain):
+    if not get_site_rule(domain) and not _is_builtin_domain(domain) and domain not in _RULE_FAILED:
         if domain not in get_all_sites():
             add_custom_site_db(domain, user_id)          # now visible in /site
         await status.edit_text(f"{gate_note}🧩 Nayi site: {domain}\nAuto extractor ban raha hai (2-3 pages analyze)...")
@@ -2520,6 +2530,7 @@ async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
             save_site_rule(domain, res["regex"], res["shapes"], res.get("strict", True), res.get("note", ""))
             learn += f"🧩 Extractor saved ({res.get('note') or 'auto'}) | /site me add ho gayi\n"
         else:
+            _RULE_FAILED.add(domain)
             why = (res.get("report") or "").splitlines()
             learn += ("⚠️ Auto extractor nahi bana, generic extractor use ho raha hai "
                       "(site /site me add hai)\n" + (f"ℹ️ {why[0][:150]}\n" if why else ""))
@@ -2541,7 +2552,8 @@ async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
                f"🔗 Links: {rep['links']} | ✅ Extracted: {rep['extracted']}\n")
         if rep.get("diag"):
             msg += f"\n🔍 Diagnosis:\n{rep['diag']}\n"
-        msg += (f"\nAgla step: /dump {url} -> HTML file bhejo (JS-rendered / Cloudflare / login ho to wahi dikhega)")
+        msg += ("\n💡 Ye site JS se load hoti lagti hai. Browser DevTools -> Network -> XHR/Fetch me jo "
+                "videos-list API URL dikhe wo bhejo, ya /dump " + url + " ki HTML file bhejo.")
         await status.edit_text(msg[:4000], disable_web_page_preview=True)
         return
 
@@ -2619,6 +2631,428 @@ async def scr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("❌ URL lost. /scr <url> dobara bhejo.")
             return
         await scr_run(q.message.chat, context, q.from_user.id, url, nxt, nxt + 9)
+
+
+# ==========================================================
+# JS-RENDERED (SPA) SITES: embedded JSON / hidden API / sitemap / optional browser
+# ==========================================================
+try:   # optional: real headless browser (pip install playwright && playwright install chromium)
+    from playwright.async_api import async_playwright
+except Exception:
+    async_playwright = None
+
+_RULE_FAILED: set = set()           # domains where auto-rule already failed (don't retry on every /scr)
+_JSON_CACHE: Dict[str, object] = {}
+_PW = {"pw": None, "browser": None}
+_PW_SEM = None
+
+_SKIP_SCRIPT = re.compile(
+    r'(google|gtag|analytics|facebook|jquery|plyr|hls\.|swiper|cloudflare|recaptcha|adsbygoogle|'
+    r'doubleclick|yandex|metrika|histats|unpkg|polyfill|bootstrap|fontawesome|sentry|hotjar|'
+    r'exoclick|juicyads|trafficjunky|popads|propeller)', re.I)
+_API_SKIP = re.compile(
+    r'(\.(?:js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|map|html?)(?:\?|$)|analytics|tracking|metrics|'
+    r'(?:^|[/_.-])logs?(?:[/_.?-]|$)|locale|i18n|translation|(?:^|[/_.-])ads?/|adserver|'
+    r'auth|login|logout|register|token|csrf|captcha|consent|cookie|manifest|package\.json|browserconfig|'
+    r'service-worker|favicon)', re.I)
+_API_WORDS = re.compile(
+    r'(video|clip|movie|film|list|feed|latest|newest|new|popular|trending|home|index|content|post|'
+    r'search|browse|catalog|recommend|top|best|hot|all)', re.I)
+_API_RX = [
+    r'["\'`]((?:https?:)?//[^"\'`\s]+?/(?:api|ajax|rest|v\d)/[^"\'`\s]*)["\'`]',
+    r'["\'`](/(?:api|ajax|rest|graphql|_next/data|v\d)/[^"\'`\s]*)["\'`]',
+    r'["\'`]([^"\'`\s]+\.json(?:\?[^"\'`\s]*)?)["\'`]',
+]
+_PAGE_KEYS = ('url', 'link', 'permalink', 'href', 'page_url', 'pageUrl', 'path', 'uri',
+              'canonical', 'watch_url', 'video_url_page')
+_TITLE_KEYS = ('title', 'name', 'headline', 'caption')
+
+
+def _raw_fetch_sync(url: str, referer: Optional[str] = None, accept: str = "application/json, text/plain, */*") -> Optional[str]:
+    """Like fetch_sync but accepts short bodies (JSON / robots / sitemap)."""
+    headers = make_headers(url, referer)
+    headers["Accept"] = accept
+    headers["X-Requested-With"] = "XMLHttpRequest"
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    attempts = []
+    if cffi_requests:
+        attempts.append(lambda: cffi_requests.get(url, headers=headers, impersonate="chrome124",
+                                                   timeout=25, proxies=proxies))
+    attempts.append(lambda: scraper.get(url, headers=headers, timeout=25, proxies=proxies))
+    attempts.append(lambda: requests.get(url, headers=headers, timeout=25, proxies=proxies))
+    for fn in attempts:
+        try:
+            r = fn()
+            if r.status_code == 200 and r.text and len(r.text.strip()) > 2:
+                return r.text
+        except Exception:
+            continue
+    return None
+
+
+async def scr_get_json(url: str, referer: Optional[str] = None):
+    if url in _JSON_CACHE:
+        return _JSON_CACHE[url]
+    txt = await asyncio.to_thread(_raw_fetch_sync, url, referer)
+    data = None
+    if txt:
+        try:
+            data = json.loads(txt.strip().lstrip('\ufeff'))
+        except Exception:
+            data = None
+    if len(_JSON_CACHE) > 300:
+        _JSON_CACHE.clear()
+    _JSON_CACHE[url] = data
+    return data
+
+
+def _balanced(text: str, i: int) -> Optional[str]:
+    """text[i] is '{' or '[' -> returns the balanced JSON-ish substring (string-aware)."""
+    open_c = text[i]
+    close_c = '}' if open_c == '{' else ']'
+    depth, in_s, esc = 0, None, False
+    for j in range(i, min(len(text), i + 1_500_000)):
+        c = text[j]
+        if in_s:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == in_s:
+                in_s = None
+        elif c in '"\'':
+            in_s = c
+        elif c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return None
+
+
+def embedded_json_blobs(html: str) -> list:
+    """JSON stored inside the page: <script type=application/json>, __NEXT_DATA__, window.__STATE__ = {...}"""
+    blobs = []
+    for m in re.finditer(r'<script\b[^>]*\btype=["\']application/(?:ld\+)?json["\'][^>]*>(.*?)</script>',
+                         html, re.I | re.S):
+        try:
+            blobs.append(json.loads(m.group(1)))
+        except Exception:
+            pass
+    for m in re.finditer(r'(?:window\.)?(?:__[A-Za-z_]+__|initialState|INITIAL_STATE|pageData|videoData)'
+                         r'\s*=\s*([{\[])', html):
+        s = _balanced(html, m.start(1))
+        if s:
+            try:
+                blobs.append(json.loads(s))
+            except Exception:
+                pass
+    return blobs[:12]
+
+
+def _walk_json(obj, depth: int = 0):
+    if depth > 12:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                yield from _walk_json(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj[:500]:
+            if isinstance(v, (dict, list)):
+                yield from _walk_json(v, depth + 1)
+
+
+def _strings(obj, depth: int = 0):
+    if depth > 3:
+        return
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _strings(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj[:50]:
+            yield from _strings(v, depth + 1)
+
+
+def scr_json_harvest(blobs: list, page_url: str):
+    """-> (stream_items, page_url_strings) found inside JSON objects."""
+    streams, pages, seen = [], [], set()
+    for blob in blobs:
+        for d in _walk_json(blob):
+            title = next((str(d[k]) for k in _TITLE_KEYS
+                          if isinstance(d.get(k), str) and d[k].strip()), None)
+            best = None
+            for s in _strings(d):
+                low = s.lower()
+                if len(s) > 2000 or not ('.mp4' in low or '.m3u8' in low or 'get_file' in low):
+                    continue
+                u = _clean(s, page_url)
+                if _valid_stream_url(u) and (best is None or _rank(u) < _rank(best)):
+                    best = u
+            if best and best not in seen:
+                seen.add(best)
+                streams.append({
+                    "title": re.sub(r'\s+', ' ', title or "Video")[:150], "type": "VIDEO",
+                    "page_url": page_url, "source_page": page_url,
+                    "download_link": process_tpl_link(best) if ".m3u8" in best else best})
+                continue
+            for k in _PAGE_KEYS:
+                v = d.get(k)
+                if isinstance(v, str) and 1 < len(v) < 300 and not v.startswith(('javascript:', '#', 'data:')):
+                    pages.append(v)
+                    break
+    return streams, pages
+
+
+def _links_from_raw(raw: List[str], page_url: str) -> List[str]:
+    """Raw url strings -> filtered video-page links (same shape-majority logic as normal pages)."""
+    if not raw:
+        return []
+    synth = "".join(f'<a href="{_html.escape(u)}"><img src="x"></a>' for u in dict.fromkeys(raw))
+    return find_video_links(synth, page_url, use_rule=False)
+
+
+def _script_srcs(html: str, page_url: str) -> List[str]:
+    out = []
+    for m in re.finditer(r'<script\b[^>]*?\bsrc=["\']([^"\']+)["\']', html, re.I):
+        u = urljoin(page_url, m.group(1).replace('&amp;', '&'))
+        if u.startswith(('http://', 'https://')) and not _SKIP_SCRIPT.search(u) and u not in out:
+            out.append(u)
+    return out
+
+
+def _api_candidates(texts: List[str], page_url: str) -> List[str]:
+    found: Dict[str, int] = {}
+    for t in texts:
+        for rx in _API_RX:
+            for m in re.finditer(rx, t):
+                raw = m.group(1).replace('\\/', '/')
+                if '${' in raw or '{' in raw or '}' in raw or len(raw) > 300:
+                    continue
+                u = urljoin(page_url, ('https:' + raw) if raw.startswith('//') else raw)
+                if not u.startswith(('http://', 'https://')) or _API_SKIP.search(u) or _SKIP_SCRIPT.search(u):
+                    continue
+                if u.endswith('='):
+                    u += '1'
+                score = len(_API_WORDS.findall(u)) + (2 if '/api/' in u else 0) + (1 if '.json' in u else 0)
+                if score and u not in found:
+                    found[u] = score
+    return sorted(found, key=lambda x: -found[x])[:12]
+
+
+async def scr_spa_discover(page_url: str, html: str, start: int = 1, end: int = 1, light: bool = False) -> dict:
+    """Finds data of a JS-rendered page: embedded JSON state + API endpoints read from its JS bundles."""
+    info: List[str] = []
+    blobs = embedded_json_blobs(html)
+    streams, raw_pages = scr_json_harvest(blobs, page_url)
+    info.append(f"🧬 Embedded JSON blobs: {len(blobs)} (streams {len(streams)}, links {len(raw_pages)})")
+
+    texts = re.findall(r'<script\b(?![^>]*\bsrc=)[^>]*>(.*?)</script>', html, re.I | re.S)
+    srcs = _script_srcs(html, page_url)[:8]
+    bundles = await asyncio.gather(*[fast_fetch(s, referer=page_url) for s in srcs]) if srcs else []
+    texts += [b for b in bundles if b]
+    info.append(f"📦 JS bundles read: {sum(1 for b in bundles if b)}/{len(srcs)}")
+
+    eps = _api_candidates(texts, page_url)
+    info.append(f"🔌 API candidates: {len(eps)}")
+    probes = await asyncio.gather(*[scr_get_json(e, page_url) for e in eps]) if eps else []
+
+    best_ep, best_n = None, 0
+    for ep, data in zip(eps, probes):
+        if data is None:
+            info.append(f"   ✗ {ep[:90]}")
+            continue
+        s, p = scr_json_harvest([data], page_url)
+        n = len(s) + len(p)
+        info.append(f"   ✓ {ep[:90]} ({len(s)} streams, {len(p)} links)")
+        streams += s
+        raw_pages += p
+        if n > best_n:
+            best_ep, best_n = ep, n
+
+    # ---- pagination of the best API endpoint (?page=N) ----
+    if not light and best_ep and end > start:
+        pm = re.search(r'([?&](?:page|p|pg|pageNumber|page_number)=)(\d+)', best_ep)
+        if pm:
+            todo = [re.sub(r'([?&](?:page|p|pg|pageNumber|page_number)=)\d+',
+                           lambda m_: m_.group(1) + str(n), best_ep)
+                    for n in range(start, min(end, start + 29) + 1) if str(n) != pm.group(2)]
+            for data in await asyncio.gather(*[scr_get_json(u, page_url) for u in todo]):
+                if data is not None:
+                    s, p = scr_json_harvest([data], page_url)
+                    streams += s
+                    raw_pages += p
+
+    uniq = {}
+    for s in streams:
+        uniq.setdefault(s["download_link"], s)
+    return {"streams": list(uniq.values()), "links": _links_from_raw(raw_pages, page_url), "info": info}
+
+
+async def scr_sitemap(page_url: str) -> dict:
+    """sitemap.xml fallback (SPAs usually still publish one, sometimes with <video:content_loc> streams)."""
+    pu = urlparse(page_url)
+    base = f"{pu.scheme}://{pu.netloc}"
+    maps: List[str] = []
+    robots = await asyncio.to_thread(_raw_fetch_sync, base + "/robots.txt", None, "text/plain,*/*")
+    if robots:
+        maps += re.findall(r'(?im)^\s*sitemap:\s*(\S+)', robots)
+    for p in ("/sitemap.xml", "/sitemap_index.xml", "/video-sitemap.xml", "/sitemap-videos.xml"):
+        if base + p not in maps:
+            maps.append(base + p)
+
+    streams, links, seen_maps, queue = [], [], set(), maps[:6]
+    while queue and len(seen_maps) < 6 and len(links) < 600:
+        m = queue.pop(0)
+        if m in seen_maps:
+            continue
+        seen_maps.add(m)
+        xml = await asyncio.to_thread(_raw_fetch_sync, m, None, "application/xml,text/xml,*/*")
+        if not xml:
+            continue
+        blocks = re.findall(r'<url>(.*?)</url>', xml, re.I | re.S)
+        if not blocks:                                   # sitemap index -> child sitemaps
+            kids = re.findall(r'<loc>\s*(?:<!\[CDATA\[)?\s*([^<\s\]]+)', xml, re.I)
+            kids.sort(key=lambda k: 0 if 'video' in k.lower() else 1)
+            queue += [k for k in kids if k not in seen_maps][:3]
+            continue
+        for b in blocks:
+            loc = re.search(r'<loc>\s*(?:<!\[CDATA\[)?\s*([^<\s\]]+)', b, re.I)
+            cl = re.search(r'<video:content_loc>\s*(?:<!\[CDATA\[)?\s*([^<\s\]]+)', b, re.I)
+            tt = re.search(r'<video:title>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</video:title>', b, re.I | re.S)
+            if cl and _valid_stream_url(_clean(cl.group(1), page_url)):
+                u = _clean(cl.group(1), page_url)
+                streams.append({"title": (tt.group(1).strip() if tt else "Video")[:150], "type": "VIDEO",
+                                "page_url": loc.group(1) if loc else page_url, "source_page": m,
+                                "download_link": process_tpl_link(u) if ".m3u8" in u else u})
+            elif loc:
+                links.append(loc.group(1).replace('&amp;', '&'))
+    root = _root_host(pu.netloc)
+    links = [l for l in dict.fromkeys(links) if _root_host(urlparse(l).netloc) == root
+             and not BAD_PATH.search(urlparse(l).path) and not urlparse(l).path.lower().endswith(SKIP_EXT)
+             and urlparse(l).path not in ('', '/')]
+    return {"streams": streams, "links": links}
+
+
+# ---------------- optional real browser (Playwright) ----------------
+async def pw_render(url: str, wait: float = 4.0, scroll: bool = False):
+    """-> (rendered_html, [stream urls seen in network traffic]). Needs: pip install playwright && playwright install chromium"""
+    global _PW_SEM
+    if not async_playwright:
+        return None, []
+    if _PW_SEM is None:
+        _PW_SEM = asyncio.Semaphore(2)
+    streams: List[str] = []
+    async with _PW_SEM:
+        ctx = None
+        try:
+            if _PW["browser"] is None:
+                _PW["pw"] = await async_playwright().start()
+                _PW["browser"] = await _PW["pw"].chromium.launch(headless=True, args=["--no-sandbox"])
+            ctx = await _PW["browser"].new_context(user_agent=UA, viewport={"width": 1280, "height": 800})
+            page = await ctx.new_page()
+            page.on("request", lambda r: streams.append(r.url) if _valid_stream_url(r.url) else None)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(int(wait * 1000))
+            if scroll:
+                for _ in range(3):
+                    await page.mouse.wheel(0, 4000)
+                    await page.wait_for_timeout(700)
+            for sel in ("video", ".play", "[class*=play]", "button"):     # nudge lazy players
+                if streams:
+                    break
+                try:
+                    await page.click(sel, timeout=1200)
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+            html = await page.content()
+            return html, streams
+        except Exception as e:
+            logger.error(f"pw_render error {url}: {e}")
+            return None, streams
+        finally:
+            if ctx:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+
+
+async def scr_deep_extract(v: str, s: str) -> Optional[dict]:
+    """Video page is a JS shell: try embedded JSON / API streams, then the real browser."""
+    page = await fast_fetch(v, referer=s)
+    if page:
+        d = await scr_spa_discover(v, page, light=True)
+        if d["streams"]:
+            it = dict(sorted(d["streams"], key=lambda x: _rank(x["download_link"]))[0])
+            it.update(page_url=v, source_page=s)
+            if it["title"] == "Video":
+                it["title"] = _scr_title(page)
+            return it
+    if async_playwright:
+        html, streams = await pw_render(v, wait=4)
+        if streams:
+            best = sorted(streams, key=_rank)[0]
+            return {"title": _scr_title(html or ""), "type": "VIDEO", "page_url": v, "source_page": s,
+                    "download_link": process_tpl_link(best) if ".m3u8" in best else best}
+    return None
+
+
+async def scr_extract_many(items: Dict[str, str], user_id: int) -> List[dict]:
+    sem = asyncio.Semaphore(SCR_CONCURRENCY)
+    out: Dict[str, dict] = {}
+
+    async def one(v: str, s: str):
+        if STOP_PROCESS.get(user_id):
+            return
+        async with sem:
+            r = await extract_video_link(v, source_page=s)
+            if not r:
+                r = await scr_deep_extract(v, s)
+        if r:
+            out[v] = r
+
+    await asyncio.gather(*[one(v, s) for v, s in items.items()])
+    return [out[v] for v in items if v in out]
+
+
+async def scr_spa_fallback(url: str, html: str, page_url: str, start: int, end: int, user_id: int):
+    """Everything we try when a listing page is an empty JS shell. -> (items, diag_text)"""
+    d = await scr_spa_discover(page_url, html, start, end)
+    info = list(d["info"])
+    direct, links, sliced = list(d["streams"]), list(d["links"]), False
+
+    if not direct and not links and async_playwright:
+        rendered, _ = await pw_render(page_url, wait=5, scroll=True)
+        if rendered:
+            links = scr_find_links(rendered, page_url)
+        info.append(f"🌐 Browser render: {len(links)} links")
+    elif not async_playwright:
+        info.append("🌐 Browser mode: OFF (optional: pip install playwright && playwright install chromium)")
+
+    if not direct and not links:
+        sm = await scr_sitemap(page_url)
+        direct, links, sliced = sm["streams"], sm["links"], True
+        info.append(f"🗺 Sitemap: {len(sm['streams'])} streams / {len(sm['links'])} links")
+
+    if sliced:                                           # sitemap is one long list -> emulate pages (24 per page)
+        per = 24
+        direct = direct[(start - 1) * per: end * per]
+        links = links[(start - 1) * per: end * per]
+
+    got = await scr_extract_many({l: page_url for l in links[:300]}, user_id) if links else []
+    merged, seen = [], set()
+    for it in direct[:300] + got:
+        if it["download_link"] not in seen:
+            seen.add(it["download_link"])
+            merged.append(it)
+    info.append(f"✅ SPA mode result: {len(merged)} items")
+    return merged, "\n".join(info)
 
 
 # ==========================================================
