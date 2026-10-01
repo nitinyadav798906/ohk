@@ -2210,6 +2210,27 @@ _FETCH_CACHE: Dict[str, tuple] = {}
 _STREAM_CACHE: Dict[str, dict] = {}   # video page url -> extracted result (instant re-runs)
 _EXECUTOR_READY = False
 
+# ---- age-gate / consent-page bypass (many sites show "I am 18+" first) ----
+_SCR_EXTRA_COOKIES: Dict[str, str] = {}   # root host -> extra cookie string
+_AGE_COOKIES = ("age_verified=1; ageverified=1; age_gate=1; age_confirmed=1; over18=1; is_adult=1; "
+                "adult=1; agree=1; agreed=1; kt_agecheck=1; disclaimer=1; accepted=1; "
+                "age_check=1; av=1; verified=1")
+_GATE_RX = re.compile(
+    r'(18\s*\+|over\s*18|18\s*years|age\s*(?:verif|check|confirm|gate)|adults?\s*only|'
+    r'are\s+you\s+(?:over\s+)?18|i\s*am\s*(?:over\s*)?18|i\s*agree|enter\s*site|disclaimer)', re.I)
+_ENTER_RX = re.compile(
+    r'(?:\b(?:enter|agree|accept|continue|yes|confirm|proceed)\b|i\s*am|over\s*18|18\s*\+)', re.I)
+
+_orig_make_headers = make_headers      # original is kept; this wraps it (adds age cookies if needed)
+
+
+def make_headers(url: str, referer: Optional[str] = None) -> dict:
+    h = _orig_make_headers(url, referer)
+    extra = _SCR_EXTRA_COOKIES.get(_root_host(urlparse(url).netloc))
+    if extra:
+        h["Cookie"] = (h["Cookie"] + "; " + extra) if h.get("Cookie") else extra
+    return h
+
 
 def _ensure_fast_executor():
     """Bigger thread pool so asyncio.to_thread(fetch_sync) really runs in parallel."""
@@ -2243,12 +2264,98 @@ def _is_builtin_domain(domain: str) -> bool:
     return False
 
 
+def scr_find_links(html: str, page_url: str) -> List[str]:
+    """find_video_links() + extra discovery (data-href, onclick, JSON urls) when the page has few <a> links."""
+    links = find_video_links(html, page_url)
+    if len(links) >= 4:
+        return links
+    extra = re.findall(r'data-(?:href|url|link|video-url|video-link|permalink)\s*=\s*["\']([^"\']+)["\']', html, re.I)
+    extra += re.findall(r'(?:location(?:\.href)?\s*=|window\.open\()\s*["\']([^"\']+)["\']', html, re.I)
+    extra += re.findall(r'"(?:url|link|permalink|video_url|href)"\s*:\s*"([^"]+)"', html, re.I)
+    if not extra:
+        return links
+    synth = "".join(f'<a href="{u}"><img src="x"></a>' for u in dict.fromkeys(extra))
+    more = find_video_links(html + synth, page_url)
+    return more if len(more) > len(links) else links
+
+
+async def scr_unlock_gate(url: str, html: str):
+    """Tries to pass an age-gate / consent page. Returns (html, base_url) of the real listing or None."""
+    root = _root_host(urlparse(url).netloc)
+    if len(html) > 30000 and not _GATE_RX.search(html):
+        return None                                   # big normal page, not a gate
+    _SCR_EXTRA_COOKIES[root] = _AGE_COOKIES
+    _FETCH_CACHE.pop(url, None)
+    h = await fetch(url)                              # same URL again, now with age cookies
+    if h and len(scr_find_links(h, url)) >= 4:
+        return h, url
+
+    cands: List[str] = []
+    for m in re.finditer(r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, re.I | re.S):
+        href, inner = m.group(1), re.sub(r'<[^>]+>', ' ', m.group(2))
+        if not (_ENTER_RX.search(inner) or _ENTER_RX.search(href)):
+            continue
+        full = urljoin(url, href.replace('&amp;', '&')).split('#')[0]
+        if (full.startswith(('http://', 'https://'))
+                and _root_host(urlparse(full).netloc) == root
+                and full.rstrip('/') != url.rstrip('/') and full not in cands):
+            cands.append(full)
+    for c in cands[:3]:                               # follow "Enter / I am 18+" links
+        h2 = await fetch(c, referer=url)
+        if h2 and len(scr_find_links(h2, c)) >= 4:
+            return h2, c
+    _SCR_EXTRA_COOKIES.pop(root, None)
+    return None
+
+
+async def scr_preflight(url: str) -> str:
+    """Checks the listing page once; if it looks like a gate, unlocks it and returns the real URL."""
+    if _looks_like_single_video(url):
+        return url
+    first = await fast_fetch(url)
+    if not first or len(scr_find_links(first, url)) >= 4:
+        return url
+    got = await scr_unlock_gate(url, first)
+    if got:
+        html2, base = got
+        _FETCH_CACHE[base] = (time.time(), html2)
+        return base
+    return url
+
+
+def _scr_title(html: str) -> str:
+    m = (re.search(r'<h1[^>]*>(.*?)</h1>', html, re.I | re.S)
+         or re.search(r'<title>(.*?)</title>', html, re.I | re.S))
+    return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', m.group(1))).strip() if m else "Video"
+
+
+async def _scr_single_fallback(html: Optional[str], page_url: str) -> Optional[dict]:
+    """The given URL may itself be a page with a player (no listing)."""
+    if not html:
+        return None
+    s = await generic_extract(html, page_url)
+    if not s:
+        return None
+    final = process_tpl_link(s) if ".m3u8" in s else s
+    return {"title": _scr_title(html), "type": "VIDEO", "page_url": page_url,
+            "source_page": page_url, "download_link": final}
+
+
+def _scr_diag(html: str, page_url: str, links: List[str]) -> str:
+    gate = "HAAN" if _GATE_RX.search(html) else "nahi"
+    out = [link_stats(html, page_url), f"🚧 Age-gate/consent shak: {gate}",
+           f"🔗 Is page par mile links ({len(links)}):"]
+    out += [l[:100] for l in links[:3]]
+    return "\n".join(out)
+
+
 async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None):
     """Fast scraper: parallel pages + parallel extraction + cache + retry + self-heal."""
     _ensure_fast_executor()
     domain = normalize_domain(url)
     rep = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0,
-           "cached": 0, "healed": False}
+           "cached": 0, "healed": False, "diag": ""}
+    first_html: Dict[str, str] = {}
 
     if _looks_like_single_video(url):
         r = await extract_video_link(url, source_page=url)
@@ -2269,62 +2376,74 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
             rep["pages_fail"].append(f"{pu} (HTTP {LAST_STATUS.get(pu, '?')})")
             return
         rep["pages_ok"] += 1
-        for l in find_video_links(page, pu):
+        links = scr_find_links(page, pu)
+        if pu == page_urls[0]:
+            first_html["h"] = page
+            if len(links) < 4:
+                rep["diag"] = _scr_diag(page, pu, links)
+        for l in links:
             url_to_source.setdefault(l, pu)
 
     await asyncio.gather(*[crawl(p) for p in page_urls])
     rep["links"] = len(url_to_source)
-    if not url_to_source:
-        return [], rep
 
     results: Dict[str, dict] = {}
-    esem = asyncio.Semaphore(SCR_CONCURRENCY)
-    total = len(url_to_source)
-    state = {"done": 0, "last": 0.0}
+    if url_to_source:
+        esem = asyncio.Semaphore(SCR_CONCURRENCY)
+        total = len(url_to_source)
+        state = {"done": 0, "last": 0.0}
 
-    async def work(v: str, s: str):
-        if STOP_PROCESS.get(user_id):
-            return
-        hit = _STREAM_CACHE.get(v)
-        if hit:
-            results[v] = hit
-            rep["cached"] += 1
-        else:
-            async with esem:
-                r = await extract_video_link(v, source_page=s)
-                if not r and not STOP_PROCESS.get(user_id):
-                    await asyncio.sleep(1)               # one quick retry
+        async def work(v: str, s: str):
+            if STOP_PROCESS.get(user_id):
+                return
+            hit = _STREAM_CACHE.get(v)
+            if hit:
+                results[v] = hit
+                rep["cached"] += 1
+            else:
+                async with esem:
                     r = await extract_video_link(v, source_page=s)
-            if r:
-                if len(_STREAM_CACHE) > 5000:
-                    _STREAM_CACHE.clear()
-                results[v] = r
-                _STREAM_CACHE[v] = r
-        state["done"] += 1
-        if progress and time.time() - state["last"] > 2.5:
-            state["last"] = time.time()
+                    if not r and not STOP_PROCESS.get(user_id):
+                        await asyncio.sleep(1)               # one quick retry
+                        r = await extract_video_link(v, source_page=s)
+                if r:
+                    if len(_STREAM_CACHE) > 5000:
+                        _STREAM_CACHE.clear()
+                    results[v] = r
+                    _STREAM_CACHE[v] = r
+            state["done"] += 1
+            if progress and time.time() - state["last"] > 2.5:
+                state["last"] = time.time()
+                try:
+                    await progress(state["done"], total)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[work(v, s) for v, s in url_to_source.items()])
+
+        # ---- SELF-HEAL: saved rule stopped working (site changed) -> relearn once ----
+        failed = [v for v in url_to_source if v not in results]
+        if (get_site_rule(domain) and total >= 6 and len(results) < 0.3 * total
+                and not STOP_PROCESS.get(user_id)):
             try:
-                await progress(state["done"], total)
-            except Exception:
-                pass
-
-    await asyncio.gather(*[work(v, s) for v, s in url_to_source.items()])
-
-    # ---- SELF-HEAL: saved rule stopped working (site changed) -> relearn once ----
-    failed = [v for v in url_to_source if v not in results]
-    if (get_site_rule(domain) and total >= 6 and len(results) < 0.3 * total
-            and not STOP_PROCESS.get(user_id)):
-        try:
-            res = await build_auto_rule(url, domain)
-            if res.get("ok"):
-                save_site_rule(domain, res["regex"], res["shapes"],
-                               res.get("strict", True), (res.get("note") or "") + " [auto-healed]")
-                rep["healed"] = True
-                await asyncio.gather(*[work(v, url_to_source[v]) for v in failed])
-        except Exception as e:
-            logger.error(f"self-heal error {domain}: {e}")
+                res = await build_auto_rule(url, domain)
+                if res.get("ok"):
+                    save_site_rule(domain, res["regex"], res["shapes"],
+                                   res.get("strict", True), (res.get("note") or "") + " [auto-healed]")
+                    rep["healed"] = True
+                    await asyncio.gather(*[work(v, url_to_source[v]) for v in failed])
+            except Exception as e:
+                logger.error(f"self-heal error {domain}: {e}")
 
     ordered = [results[v] for v in url_to_source if v in results]
+
+    # ---- FALLBACK: the page itself holds a player (no listing) ----
+    if not ordered and first_html.get("h") and not STOP_PROCESS.get(user_id):
+        single = await _scr_single_fallback(first_html["h"], page_urls[0])
+        if single:
+            ordered = [single]
+            rep["links"] = max(rep["links"], 1)
+
     rep["extracted"] = len(ordered)
     return ordered, rep
 
@@ -2377,22 +2496,33 @@ async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
     STOP_PROCESS[user_id] = False
     status = await chat.send_message(f"⚡ {domain} | Pages {start}-{end} ...")
 
+    # ---- 0) age-gate / consent page? unlock it first (so rule-learning sees the real listing) ----
+    gate_note = ""
+    try:
+        new_url = await scr_preflight(url)
+        if new_url != url or _root_host(urlparse(url).netloc) in _SCR_EXTRA_COOKIES:
+            gate_note = "🔓 Age-gate/consent page bypass hua\n"
+        url = new_url
+    except Exception as e:
+        logger.error(f"/scr preflight error {domain}: {e}")
+
     # ---- 1) NEW SITE? -> add to /site list + auto-build domain-specific extractor ----
-    learn = ""
+    learn = gate_note
     if not get_site_rule(domain) and not _is_builtin_domain(domain):
         if domain not in get_all_sites():
             add_custom_site_db(domain, user_id)          # now visible in /site
-        await status.edit_text(f"🧩 Nayi site: {domain}\nAuto extractor ban raha hai (2-3 pages analyze)...")
+        await status.edit_text(f"{gate_note}🧩 Nayi site: {domain}\nAuto extractor ban raha hai (2-3 pages analyze)...")
         try:
             res = await build_auto_rule(url, domain)
         except Exception as e:
             res = {"ok": False, "report": str(e)}
         if res.get("ok"):
             save_site_rule(domain, res["regex"], res["shapes"], res.get("strict", True), res.get("note", ""))
-            learn = f"🧩 Extractor saved ({res.get('note') or 'auto'}) | /site me add ho gayi\n"
+            learn += f"🧩 Extractor saved ({res.get('note') or 'auto'}) | /site me add ho gayi\n"
         else:
-            learn = ("⚠️ Auto extractor nahi bana, generic extractor use ho raha hai "
-                     "(site /site me add hai)\n")
+            why = (res.get("report") or "").splitlines()
+            learn += ("⚠️ Auto extractor nahi bana, generic extractor use ho raha hai "
+                      "(site /site me add hai)\n" + (f"ℹ️ {why[0][:150]}\n" if why else ""))
         await status.edit_text(f"{learn}⚡ Scraping Pages {start}-{end} ...")
 
     async def progress(done, total):
@@ -2406,11 +2536,13 @@ async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
         return
 
     if not results:
-        await status.edit_text(
-            f"{learn}❌ Koi video link nahi mila.\n"
-            f"📄 Pages OK: {rep['pages_ok']} | 🚫 Failed: {rep['pages_fail'][:3]}\n"
-            f"🔗 Links: {rep['links']} | ✅ Extracted: {rep['extracted']}\n\n"
-            f"Check: /debug {url}   |   Raw HTML: /dump {url}")
+        msg = (f"{learn}❌ Koi video link nahi mila.\n"
+               f"📄 Pages OK: {rep['pages_ok']} | 🚫 Failed: {rep['pages_fail'][:3]}\n"
+               f"🔗 Links: {rep['links']} | ✅ Extracted: {rep['extracted']}\n")
+        if rep.get("diag"):
+            msg += f"\n🔍 Diagnosis:\n{rep['diag']}\n"
+        msg += (f"\nAgla step: /dump {url} -> HTML file bhejo (JS-rendered / Cloudflare / login ho to wahi dikhega)")
+        await status.edit_text(msg[:4000], disable_web_page_preview=True)
         return
 
     heal = " | 🩹 extractor auto-healed" if rep["healed"] else ""
@@ -2440,7 +2572,7 @@ async def scr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/scr <url> 3-8      -> pages 3-8\n\n"
             "• Site main.py me nahi hai to auto domain-specific extractor banta hai\n"
             "• Site apne aap /site list me add ho jaati hai\n"
-            "• Parallel fast scraping, cache, auto-retry, auto-heal\n"
+            "• Age-gate (18+) page auto bypass, parallel fast scraping, cache, auto-retry, auto-heal\n"
             f"• Max {SCR_MAX_PAGES} pages ek baar me\n\n"
             f"🧩 Saved extractors: {', '.join(list_rule_domains()) or 'none'}")
         return
