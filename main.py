@@ -88,6 +88,16 @@ def init_db():
         )
     """)
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS site_rules (
+            domain TEXT PRIMARY KEY,
+            regex TEXT,
+            shapes TEXT,
+            strict INTEGER DEFAULT 1,
+            note TEXT,
+            updated DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS site_cookies (
             domain TEXT PRIMARY KEY,
             cookie TEXT,
@@ -247,6 +257,66 @@ def get_all_sites() -> List[str]:
         if d not in out:
             out.append(d)
     return out
+
+# ---- site-specific extractor rules (/addscr) ----
+_RULES_CACHE: Optional[Dict[str, dict]] = None
+
+def _load_rules() -> Dict[str, dict]:
+    global _RULES_CACHE
+    if _RULES_CACHE is None:
+        rules: Dict[str, dict] = {}
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("SELECT domain, regex, shapes, strict, note FROM site_rules")
+            for d, rx, sh, st, note in cursor.fetchall():
+                rules[d] = {
+                    "regex": json.loads(rx or "[]"),
+                    "shapes": json.loads(sh or "[]"),
+                    "strict": bool(st),
+                    "note": note or "",
+                }
+            conn.close()
+        except Exception as e:
+            logger.error(f"load rules error: {e}")
+        _RULES_CACHE = rules
+    return _RULES_CACHE
+
+def save_site_rule(domain: str, regexes: List[str], shapes: List[str], strict: bool, note: str):
+    global _RULES_CACHE
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO site_rules (domain, regex, shapes, strict, note) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(domain) DO UPDATE SET regex=excluded.regex, shapes=excluded.shapes, "
+        "strict=excluded.strict, note=excluded.note, updated=CURRENT_TIMESTAMP",
+        (domain, json.dumps(regexes), json.dumps(shapes), int(strict), note))
+    conn.commit()
+    conn.close()
+    _RULES_CACHE = None
+
+def delete_site_rule(domain: str) -> bool:
+    global _RULES_CACHE
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM site_rules WHERE domain = ?", (domain,))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    _RULES_CACHE = None
+    return changed
+
+def list_rule_domains() -> List[str]:
+    return sorted(_load_rules().keys())
+
+def get_site_rule(url_or_domain: str) -> Optional[dict]:
+    host = normalize_domain(url_or_domain)
+    if not host:
+        return None
+    for d, r in _load_rules().items():
+        if host == d or host.endswith('.' + d):
+            return r
+    return None
 
 def get_custom_headers(url: str) -> dict:
     parsed = urlparse(url)
@@ -433,7 +503,7 @@ def _root_host(h: str) -> str:
     return '.'.join(parts[-2:]) if len(parts) >= 2 else h
 
 
-def find_video_links(html: str, page_url: str) -> List[str]:
+def find_video_links(html: str, page_url: str, use_rule: bool = True) -> List[str]:
     root = _root_host(urlparse(page_url).netloc)
     items: Dict[str, tuple] = {}
 
@@ -469,6 +539,14 @@ def find_video_links(html: str, page_url: str) -> List[str]:
 
     if not items:
         return []
+
+    if use_rule:  # site-specific link shapes saved by /addscr
+        rule = get_site_rule(page_url)
+        if rule and rule.get("shapes"):
+            wanted = set(rule["shapes"])
+            ruled = [u for u, (sh, _) in items.items() if sh in wanted]
+            if ruled:
+                return ruled
 
     score, thumbs = Counter(), Counter()
     for sh, th in items.values():
@@ -639,6 +717,185 @@ async def generic_extract(html: str, page_url: str, depth: int = 0) -> Optional[
                     return r
     return None
 
+# ==========================================================
+# /addscr  -> AUTO-BUILD A DOMAIN-SPECIFIC EXTRACTOR
+# ==========================================================
+IMG_EXT = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.vtt', '.js', '.css')
+
+def _valid_stream_url(u: str) -> bool:
+    pu = urlparse(u)
+    low = u.lower()
+    if pu.scheme not in ('http', 'https'):
+        return False
+    if low.split('?')[0].endswith(IMG_EXT):
+        return False
+    if not ('.mp4' in low or '.m3u8' in low or 'get_file' in low):
+        return False
+    if JUNK.search(low):
+        return False
+    return True
+
+
+def apply_site_rule(rule: dict, html: str, page_url: str) -> Optional[str]:
+    """Runs the saved regex list on a page and returns the best stream URL."""
+    strict = rule.get("strict", True)
+    cands: List[str] = []
+    for rx in rule.get("regex", []):
+        try:
+            for m in re.finditer(rx, html, re.I):
+                raw = m.group(1) if m.groups() else m.group(0)
+                if not raw:
+                    continue
+                u = _clean(raw, page_url)
+                if strict:
+                    ok = _valid_stream_url(u)
+                else:
+                    pu = urlparse(u)
+                    ok = pu.scheme in ('http', 'https') and not u.lower().split('?')[0].endswith(IMG_EXT)
+                if ok and u not in cands:
+                    cands.append(u)
+        except re.error as e:
+            logger.error(f"Bad site-rule regex {rx!r}: {e}")
+    if not cands:
+        return None
+    return sorted(cands, key=_rank)[0]
+
+
+def _candidates_with_raw(html: str, page_url: str) -> List[tuple]:
+    """[(raw_text_in_html, cleaned_url, pattern_index)] for every valid stream URL on a page."""
+    out, seen = [], set()
+    for idx, pat in enumerate(VIDEO_PATTERNS):
+        for m in re.finditer(pat, html, re.I):
+            raw = m.group(1)
+            if not raw:
+                continue
+            u = _clean(raw, page_url)
+            if _valid_stream_url(u) and u not in seen:
+                seen.add(u)
+                out.append((raw, u, idx))
+    return out
+
+
+def derive_regex(html: str, raw: str) -> Optional[str]:
+    """Builds a precise regex from the text that sits right before the stream URL."""
+    idx = html.find(raw)
+    if idx < 0:
+        return None
+    before = html[max(0, idx - 300):idx]
+    # <tag ... attr="URL"
+    m = re.search(r'<([A-Za-z][\w-]*)\b[^<>]*?\s([\w:-]+)\s*=\s*["\']$', before)
+    if m:
+        tag, attr = m.group(1), m.group(2)
+        return rf'<{re.escape(tag)}\b[^>]*?\b{re.escape(attr)}\s*=\s*["\']([^"\']+)["\']'
+    # key: "URL"   /   key = 'URL'   /   video_url: 'function/0/URL'
+    m = re.search(r'([A-Za-z_][\w.-]*)["\']?\s*[:=]\s*["\'](?:function/\d+/)?$', before)
+    if m:
+        key = m.group(1)
+        return rf'\b{re.escape(key)}["\']?\s*[:=]\s*["\'](?:function/\d+/)?([^"\']+)["\']'
+    return None
+
+
+async def build_auto_rule(url: str, domain: str) -> dict:
+    html0 = await fetch(url)
+    if not html0:
+        return {"ok": False, "report":
+                f"❌ Fetch failed: HTTP {LAST_STATUS.get(url, '?')} ({LAST_DETAIL.get(url, '')})\n"
+                f"Pehle /debug {url} se block/IP check karo."}
+
+    path = urlparse(url).path
+    start_is_video = path not in ('', '/') and _looks_like_single_video(url)
+
+    links = [l for l in find_video_links(html0, url, use_rule=False)
+             if l.rstrip('/') != url.rstrip('/')]
+    shapes: List[str] = []
+    for l in links:
+        sh = _shape(urlparse(l))
+        if sh not in shapes:
+            shapes.append(sh)
+
+    samples: List[tuple] = []
+    if start_is_video:
+        samples.append((url, html0))
+        own = _shape(urlparse(url))
+        if own not in shapes:
+            shapes.append(own)
+
+    pick = links[:4]
+    pages = await asyncio.gather(*[fetch(l, referer=url) for l in pick])
+    for l, h in zip(pick, pages):
+        if h and len(samples) < 3:
+            samples.append((l, h))
+
+    if not samples:
+        return {"ok": False, "report":
+                "❌ Koi video page sample nahi mila.\n"
+                "Listing me links nahi mile ya video pages fetch nahi hue.\n"
+                f"Tip: kisi ek video page ka URL do: /addscr <video page URL>\n"
+                f"Detail: /debug {url}"}
+
+    regexes: List[str] = []
+    note = ""
+    per_page = [_candidates_with_raw(h, v) for v, h in samples]
+    seed_i = next((i for i, c in enumerate(per_page) if c), None)
+    if seed_i is not None:
+        best = sorted(per_page[seed_i], key=lambda c: _rank(c[1]))[0]
+        options = []
+        drv = derive_regex(samples[seed_i][1], best[0])
+        if drv:
+            options.append((drv, "auto-derived regex"))
+        options.append((VIDEO_PATTERNS[best[2]], f"generic pattern #{best[2]}"))
+        for rx, label in options:
+            hits = sum(1 for v, h in samples
+                       if apply_site_rule({"regex": [rx], "strict": True}, h, v))
+            if hits * 2 >= len(samples):
+                regexes = [rx]
+                note = f"{label} ({hits}/{len(samples)} pages)"
+                break
+
+    if not regexes:
+        found_embed = False
+        for v, h in samples[:2]:
+            if await generic_extract(h, v):
+                found_embed = True
+                break
+        if not found_embed:
+            return {"ok": False, "report":
+                    f"❌ {len(samples)} video page(s) check kiye par stream URL (.mp4/.m3u8) nahi mila.\n"
+                    "Possible: JS se bana link, packed/base64 script, ya login chahiye.\n"
+                    f"Dekho: /dump {samples[0][0]} -> HTML file bhejo, main exact rule bana dunga.\n"
+                    f"Ya manual: /addscr {samples[0][0]} <regex with group 1 = stream URL>"}
+        note = "stream embed/iframe ke andar hai (generic follower use hoga)"
+
+    return {"ok": True, "regex": regexes, "shapes": shapes, "strict": True,
+            "note": note, "test_url": samples[0][0]}
+
+
+async def build_manual_rule(url: str, domain: str, rx_text: str) -> dict:
+    rx_text = rx_text.strip()
+    if not rx_text or len(rx_text) > 400:
+        return {"ok": False, "report": "❌ Regex khali hai ya 400 chars se lamba hai."}
+    try:
+        re.compile(rx_text)
+    except re.error as e:
+        return {"ok": False, "report": f"❌ Regex galat hai: {e}"}
+
+    path = urlparse(url).path
+    if path in ('', '/'):
+        return {"ok": True, "regex": [rx_text], "shapes": [], "strict": False,
+                "note": "manual regex (untested)",
+                "report": "⚠️ Video page URL nahi diya, isliye regex test nahi hua."}
+
+    html = await fetch(url)
+    if not html:
+        return {"ok": False, "report":
+                f"❌ Test page fetch failed: HTTP {LAST_STATUS.get(url, '?')} ({LAST_DETAIL.get(url, '')})"}
+    link = apply_site_rule({"regex": [rx_text], "strict": False}, html, url)
+    if not link:
+        return {"ok": False, "report": "❌ Is regex ne diye gaye page par koi stream URL nahi nikala. Regex check karo."}
+    return {"ok": True, "regex": [rx_text], "shapes": [], "strict": False,
+            "note": "manual regex (tested)", "test_url": url}
+
+
 async def extract_video_link(video_url: str, source_page: str = "") -> Optional[dict]:
     try:
         text = await fetch(video_url, referer=source_page or None)
@@ -657,6 +914,14 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         stream_link = None
         file_type = "VIDEO"
         domain = urlparse(video_url).netloc.lower()
+
+        # Site-specific extractor saved with /addscr (tried first)
+        rule = get_site_rule(video_url)
+        if rule and rule.get("regex"):
+            rule_link = apply_site_rule(rule, text, video_url)
+            if rule_link:
+                stream_link = rule_link
+                domain = ""   # rule matched -> skip the built-in domain chain
 
         # --------------------------------------------------
         # Site Specific Extractors (dedicated sites)
@@ -1346,7 +1611,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. **Full Web Player UI:** Custom Video & Media Player interface in HTML.\n"
         "2. **4 Files Export:** 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
         "3. **FFmpeg Downloader:** Upload `.txt` file to auto-download & send video.\n\n"
-        "🛠️ **Commands:** `/site`, `/addsite`, `/removesite`, `/login`, `/logout`, `/stop`, `/stats`, `/userlist`"
+        "🛠️ **Commands:** `/site`, `/scr`, `/addsite`, `/addscr`, `/delscr`, `/removesite`, `/login`, `/logout`, `/stop`, `/stats`, `/userlist`"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1497,23 +1762,27 @@ async def site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         dom = normalize_domain(context.args[0])
         has = get_cookie_for_url(f"https://{dom}/") is not None
+        rule = get_site_rule(dom)
+        ext = (f"🧩 ON ({rule.get('note') or 'saved'})" if rule else "none (generic extractor)")
         test_url = f"https://{dom}/"
         html = await fetch(test_url)
         status = "✅ reachable (HTTP 200)" if html else (
             f"❌ HTTP {LAST_STATUS.get(test_url, '?')} ({LAST_DETAIL.get(test_url, '')})")
         await update.message.reply_text(
-            f"🌐 {dom}\n🔑 Login: {'SIGNED IN 🟢' if has else 'not signed in ⚪'}\n📡 Test: {status}")
+            f"🌐 {dom}\n🔑 Login: {'SIGNED IN 🟢' if has else 'not signed in ⚪'}\n📡 Test: {status}\n🧩 Extractor: {ext}")
         return
 
     saved = set(list_cookie_domains())
-    lines = ["🌐 Supported Sites (full domains)", "🟢 = signed in | ⚪ = no login", ""]
+    rules = set(list_rule_domains())
+    lines = ["🌐 Supported Sites (full domains)",
+             "🟢 = signed in | ⚪ = no login | 🧩 = site-specific extractor (/addscr)", ""]
     for d in SITES_FULL:
-        lines.append(f"{'🟢' if d in saved else '⚪'} {d}")
+        lines.append(f"{'🟢' if d in saved else '⚪'} {d}{' 🧩' if d in rules else ''}")
     custom_sites = [d for d in get_all_sites() if d not in SITES_FULL]
     if custom_sites:
         lines += ["", "➕ Added by you (/addsite):"]
         for d in custom_sites:
-            lines.append(f"{'🟢' if d in saved else '⚪'} {d}")
+            lines.append(f"{'🟢' if d in saved else '⚪'} {d}{' 🧩' if d in rules else ''}")
     lines += [
         "",
         "🔎 Name-match (kisi bhi mirror/TLD par chalega):",
@@ -1526,7 +1795,9 @@ async def site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/site <domain> -> status + live test",
         "",
         "➕ Nayi site jodne ke liye: /addsite <full domain>",
-        "➖ Hatane ke liye: /removesite <domain>",
+        "🧩 Site ka apna extractor banane ke liye: /addscr <video/listing URL>",
+        "⚡ Nayi site ki fast scraping (auto extractor + /site me add): /scr <url> [pages]",
+        "➖ Hatane ke liye: /removesite <domain>  |  /delscr <domain>",
     ]
     keyboard = []
     if update.effective_user.id == ADMIN_ID:
@@ -1620,6 +1891,82 @@ async def removesite_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"➖ Removed: {domain}\n(Login cookie bhi hatani ho to: /logout {domain})")
     else:
         await update.message.reply_text(f"ℹ️ {domain} list me nahi mili.")
+
+async def addscr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addscr <video or listing URL> [regex]  -> builds a domain-specific extractor and adds the site."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    chat = update.effective_chat
+    parts = (update.message.text or "").split(None, 2)
+
+    if len(parts) < 2:
+        rules = list_rule_domains()
+        await chat.send_message(
+            "🧩 /addscr - site ke hisaab se extractor banata hai\n\n"
+            "Auto (recommended):\n"
+            "/addscr https://example.com/videos/        (listing URL)\n"
+            "/addscr https://example.com/video/abc-123  (video page URL)\n\n"
+            "Manual regex (group 1 = stream URL):\n"
+            '/addscr https://example.com/video/abc-123 src="(https[^"]+)"\n\n'
+            "Hatane ke liye: /delscr <domain>\n\n"
+            f"🧩 Abhi extractors: {', '.join(rules) if rules else 'none'}")
+        return
+
+    target = parts[1].strip()
+    manual = parts[2].strip() if len(parts) > 2 else ""
+    domain = normalize_domain(target)
+    if not DOMAIN_RE.match(domain):
+        await chat.send_message(f"❌ Invalid domain/URL: {target}\nFull domain ya URL do, jaise: https://example.com/videos/")
+        return
+    url = target if re.match(r'^https?://', target, re.I) else f"https://{domain}/"
+
+    status = await chat.send_message(f"🧩 {domain} analyze ho raha hai (2-3 pages fetch honge)...")
+
+    if domain not in get_all_sites():           # also appears in /site
+        add_custom_site_db(domain, update.effective_user.id)
+
+    try:
+        res = await (build_manual_rule(url, domain, manual) if manual else build_auto_rule(url, domain))
+    except Exception as e:
+        logger.error(f"/addscr error for {domain}: {e}")
+        await status.edit_text(f"❌ Analyze error: {e}")
+        return
+
+    if not res.get("ok"):
+        await status.edit_text(
+            f"⚠️ {domain} site list me hai, par extractor nahi ban paya.\n\n{res.get('report', '')}")
+        return
+
+    save_site_rule(domain, res["regex"], res["shapes"], res.get("strict", True), res.get("note", ""))
+
+    verify = ""
+    if res.get("test_url"):
+        item = await extract_video_link(res["test_url"], source_page=url)
+        verify = ("\n▶ Test: ✅ " + item["download_link"][:110]) if item else "\n▶ Test: ⚠️ extract fail"
+    extra = ("\n" + res["report"]) if res.get("report") else ""
+
+    await status.edit_text(
+        f"✅ Extractor saved: {domain}\n"
+        f"🧩 Mode: {res.get('note') or 'saved'}\n"
+        f"🔗 Video URL shapes: {', '.join(res['shapes']) if res['shapes'] else 'auto'}"
+        f"{verify}{extra}\n\n"
+        "Ab is site ka listing URL bot ko bhejo, scraping isi extractor se hogi.\n"
+        f"/site me 🧩 dikhega. Hatane ke liye: /delscr {domain}")
+
+async def delscr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delscr <domain> -> removes a site-specific extractor."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        rules = list_rule_domains()
+        await update.message.reply_text(
+            f"Usage: /delscr <domain>\nExtractors: {', '.join(rules) if rules else 'none'}")
+        return
+    domain = normalize_domain(context.args[0])
+    if delete_site_rule(domain):
+        await update.message.reply_text(f"🗑 Extractor removed: {domain}\n(Ab built-in/generic extractor use hoga)")
+    else:
+        await update.message.reply_text(f"ℹ️ {domain} ka koi extractor nahi tha.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1850,6 +2197,299 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await run_scrape_chunk(query, context, target_url, start_page=start_page, end_page=end_page)
 
 # ==========================================================
+# /scr  ->  NEW-SITE FAST SCRAPER (auto domain-specific extractor)
+# ==========================================================
+import html as _html
+from concurrent.futures import ThreadPoolExecutor as _TPE
+
+SCR_CONCURRENCY = 12        # parallel video-page extractions (fast)
+SCR_PAGE_CONCURRENCY = 6    # parallel listing-page fetches
+SCR_MAX_PAGES = 30          # max pages per single run
+_SCR_CACHE_TTL = 300        # seconds, html cache
+_FETCH_CACHE: Dict[str, tuple] = {}
+_STREAM_CACHE: Dict[str, dict] = {}   # video page url -> extracted result (instant re-runs)
+_EXECUTOR_READY = False
+
+
+def _ensure_fast_executor():
+    """Bigger thread pool so asyncio.to_thread(fetch_sync) really runs in parallel."""
+    global _EXECUTOR_READY
+    if not _EXECUTOR_READY:
+        asyncio.get_running_loop().set_default_executor(_TPE(max_workers=32))
+        _EXECUTOR_READY = True
+
+
+async def fast_fetch(url: str, referer: Optional[str] = None) -> Optional[str]:
+    """fetch() + short in-memory cache (same page is never downloaded twice)."""
+    hit = _FETCH_CACHE.get(url)
+    if hit and time.time() - hit[0] < _SCR_CACHE_TTL:
+        return hit[1]
+    page = await fetch(url, referer)
+    if page:
+        if len(_FETCH_CACHE) > 300:
+            _FETCH_CACHE.clear()
+        _FETCH_CACHE[url] = (time.time(), page)
+    return page
+
+
+def _is_builtin_domain(domain: str) -> bool:
+    """True if main.py already has a dedicated extractor for this domain."""
+    if domain in SITES_FULL:
+        return True
+    for k in SITES_KEYWORD:
+        for name in re.split(r'\s*/\s*', k):
+            if name and name.lower() in domain:
+                return True
+    return False
+
+
+async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None):
+    """Fast scraper: parallel pages + parallel extraction + cache + retry + self-heal."""
+    _ensure_fast_executor()
+    domain = normalize_domain(url)
+    rep = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0,
+           "cached": 0, "healed": False}
+
+    if _looks_like_single_video(url):
+        r = await extract_video_link(url, source_page=url)
+        if r:
+            rep.update(links=1, extracted=1)
+            return [r], rep
+
+    page_urls = await build_page_urls(url, start, end)
+    url_to_source: Dict[str, str] = {}
+    psem = asyncio.Semaphore(SCR_PAGE_CONCURRENCY)
+
+    async def crawl(pu: str):
+        if STOP_PROCESS.get(user_id):
+            return
+        async with psem:
+            page = await fast_fetch(pu)
+        if not page:
+            rep["pages_fail"].append(f"{pu} (HTTP {LAST_STATUS.get(pu, '?')})")
+            return
+        rep["pages_ok"] += 1
+        for l in find_video_links(page, pu):
+            url_to_source.setdefault(l, pu)
+
+    await asyncio.gather(*[crawl(p) for p in page_urls])
+    rep["links"] = len(url_to_source)
+    if not url_to_source:
+        return [], rep
+
+    results: Dict[str, dict] = {}
+    esem = asyncio.Semaphore(SCR_CONCURRENCY)
+    total = len(url_to_source)
+    state = {"done": 0, "last": 0.0}
+
+    async def work(v: str, s: str):
+        if STOP_PROCESS.get(user_id):
+            return
+        hit = _STREAM_CACHE.get(v)
+        if hit:
+            results[v] = hit
+            rep["cached"] += 1
+        else:
+            async with esem:
+                r = await extract_video_link(v, source_page=s)
+                if not r and not STOP_PROCESS.get(user_id):
+                    await asyncio.sleep(1)               # one quick retry
+                    r = await extract_video_link(v, source_page=s)
+            if r:
+                if len(_STREAM_CACHE) > 5000:
+                    _STREAM_CACHE.clear()
+                results[v] = r
+                _STREAM_CACHE[v] = r
+        state["done"] += 1
+        if progress and time.time() - state["last"] > 2.5:
+            state["last"] = time.time()
+            try:
+                await progress(state["done"], total)
+            except Exception:
+                pass
+
+    await asyncio.gather(*[work(v, s) for v, s in url_to_source.items()])
+
+    # ---- SELF-HEAL: saved rule stopped working (site changed) -> relearn once ----
+    failed = [v for v in url_to_source if v not in results]
+    if (get_site_rule(domain) and total >= 6 and len(results) < 0.3 * total
+            and not STOP_PROCESS.get(user_id)):
+        try:
+            res = await build_auto_rule(url, domain)
+            if res.get("ok"):
+                save_site_rule(domain, res["regex"], res["shapes"],
+                               res.get("strict", True), (res.get("note") or "") + " [auto-healed]")
+                rep["healed"] = True
+                await asyncio.gather(*[work(v, url_to_source[v]) for v in failed])
+        except Exception as e:
+            logger.error(f"self-heal error {domain}: {e}")
+
+    ordered = [results[v] for v in url_to_source if v in results]
+    rep["extracted"] = len(ordered)
+    return ordered, rep
+
+
+async def scr_send_files(chat, results: List[dict], start: int, end: int, domain: str, url: str):
+    tag = f"{domain}_p{start}_to_p{end}"
+    full = f"--- {domain} | Pages {start}-{end} | {len(results)} Items ---\n\n"
+    simple = f"--- {domain} Simple Links (Pages {start}-{end} | {len(results)} Items) ---\n\n"
+    for i, it in enumerate(results, 1):
+        full += (f"{i}. Title: {it['title']}\n   Source Listing Page: {it['source_page']}\n"
+                 f"   Permanent Video Page: {it['page_url']}\n   Direct Stream Link: {it['download_link']}\n\n")
+        simple += f"{it['title']}: {it['download_link']}\n"
+
+    def mk(text: str, name: str):
+        b = io.BytesIO(text.encode('utf-8'))
+        b.name = name
+        return b
+
+    cards = ""
+    for i, it in enumerate(results, 1):
+        cards += (f'<div class="card"><h3>{i}. {_html.escape(it["title"])} '
+                  f'<span class="tag">{it["type"]}</span></h3>'
+                  f'<p><a href="{_html.escape(it["download_link"])}" target="_blank">'
+                  f'{_html.escape(it["download_link"])}</a></p></div>')
+    simple_html = (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + _html.escape(domain) + '</title><style>'
+        'body{font-family:Segoe UI,sans-serif;background:#121212;color:#e0e0e0;margin:20px}'
+        '.card{background:#1e1e1e;padding:15px;margin-bottom:12px;border-radius:8px;border-left:5px solid #00cc66}'
+        'a{color:#4da6ff;word-break:break-all;text-decoration:none}'
+        '.tag{background:#00cc66;color:#fff;padding:2px 8px;border-radius:4px;font-size:12px}'
+        '</style></head><body><h2>' + _html.escape(domain) + f' ({start}-{end})</h2>' + cards + '</body></html>')
+
+    nxt = end + 1
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"▶️ Continue (Pages {nxt}-{nxt + 9})", callback_data="scr_continue")],
+        [InlineKeyboardButton("🛑 Stop", callback_data="scr_stop")]])
+
+    await chat.send_document(document=mk(full, f"{tag}_full.txt"), caption=f"📁 Full TXT ({len(results)} links)")
+    await chat.send_document(document=mk(simple, f"{tag}_simple.txt"), caption="📁 Simple TXT (Title: Stream Link)")
+    await chat.send_document(
+        document=mk(generate_web_app_html(results, title=f"{domain} ({start}-{end})"), f"{tag}_full.html"),
+        caption="🌐 Full Web App HTML (Player UI)")
+    await chat.send_document(
+        document=mk(simple_html, f"{tag}_simple.html"),
+        caption=f"🌐 Simple HTML\n\nAage ke pages ({nxt}-{nxt + 9}) ke liye button dabao:", reply_markup=kb)
+
+
+async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
+    domain = normalize_domain(url)
+    STOP_PROCESS[user_id] = False
+    status = await chat.send_message(f"⚡ {domain} | Pages {start}-{end} ...")
+
+    # ---- 1) NEW SITE? -> add to /site list + auto-build domain-specific extractor ----
+    learn = ""
+    if not get_site_rule(domain) and not _is_builtin_domain(domain):
+        if domain not in get_all_sites():
+            add_custom_site_db(domain, user_id)          # now visible in /site
+        await status.edit_text(f"🧩 Nayi site: {domain}\nAuto extractor ban raha hai (2-3 pages analyze)...")
+        try:
+            res = await build_auto_rule(url, domain)
+        except Exception as e:
+            res = {"ok": False, "report": str(e)}
+        if res.get("ok"):
+            save_site_rule(domain, res["regex"], res["shapes"], res.get("strict", True), res.get("note", ""))
+            learn = f"🧩 Extractor saved ({res.get('note') or 'auto'}) | /site me add ho gayi\n"
+        else:
+            learn = ("⚠️ Auto extractor nahi bana, generic extractor use ho raha hai "
+                     "(site /site me add hai)\n")
+        await status.edit_text(f"{learn}⚡ Scraping Pages {start}-{end} ...")
+
+    async def progress(done, total):
+        await status.edit_text(f"{learn}⚡ Extracting {done}/{total} ...")
+
+    try:
+        results, rep = await scr_scrape(url, start, end, user_id, progress)
+    except Exception as e:
+        logger.error(f"/scr error: {e}")
+        await status.edit_text(f"❌ Scraping error: {e}")
+        return
+
+    if not results:
+        await status.edit_text(
+            f"{learn}❌ Koi video link nahi mila.\n"
+            f"📄 Pages OK: {rep['pages_ok']} | 🚫 Failed: {rep['pages_fail'][:3]}\n"
+            f"🔗 Links: {rep['links']} | ✅ Extracted: {rep['extracted']}\n\n"
+            f"Check: /debug {url}   |   Raw HTML: /dump {url}")
+        return
+
+    heal = " | 🩹 extractor auto-healed" if rep["healed"] else ""
+    await status.edit_text(
+        f"{learn}✅ {len(results)}/{rep['links']} extracted (cache: {rep['cached']}){heal}\nFiles bhej raha hoon...")
+    context.user_data['scr_url'] = url
+    context.user_data['scr_next'] = end + 1
+    await scr_send_files(chat, results, start, end, domain, url)
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+
+async def scr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scr <url> [pages]   e.g.  /scr https://newsite.com/videos/   |   /scr <url> 5   |   /scr <url> 3-8"""
+    user_id = update.effective_user.id
+    if not is_user_allowed(user_id):
+        return
+    chat = update.effective_chat
+    args = context.args or []
+    if not args:
+        await chat.send_message(
+            "⚡ /scr - nayi site ki fast scraping\n\n"
+            "/scr <url>          -> pages 1-10\n"
+            "/scr <url> 5        -> pages 1-5\n"
+            "/scr <url> 3-8      -> pages 3-8\n\n"
+            "• Site main.py me nahi hai to auto domain-specific extractor banta hai\n"
+            "• Site apne aap /site list me add ho jaati hai\n"
+            "• Parallel fast scraping, cache, auto-retry, auto-heal\n"
+            f"• Max {SCR_MAX_PAGES} pages ek baar me\n\n"
+            f"🧩 Saved extractors: {', '.join(list_rule_domains()) or 'none'}")
+        return
+
+    m = re.search(r'https?://[^\s]+', " ".join(args))
+    target = m.group(0) if m else args[0]
+    domain = normalize_domain(target)
+    if not DOMAIN_RE.match(domain):
+        await chat.send_message(f"❌ Invalid URL/domain: {target}")
+        return
+    url = target if re.match(r'^https?://', target, re.I) else f"https://{domain}/"
+
+    start, end = 1, 10
+    for a in args:
+        rm = re.fullmatch(r'(\d+)(?:-(\d+))?', a)
+        if rm:
+            if rm.group(2):
+                start, end = int(rm.group(1)), int(rm.group(2))
+            else:
+                start, end = 1, int(rm.group(1))
+            break
+    start = max(1, start)
+    end = max(start, min(end, start + SCR_MAX_PAGES - 1))
+
+    await scr_run(chat, context, user_id, url, start, end)
+
+
+async def scr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_user_allowed(q.from_user.id):
+        return
+    if q.data == "scr_stop":
+        STOP_PROCESS[q.from_user.id] = True
+        try:
+            await q.edit_message_caption(caption=(q.message.caption or "") + "\n\n🛑 Stopped.")
+        except Exception:
+            pass
+        return
+    if q.data == "scr_continue":
+        url = context.user_data.get('scr_url')
+        nxt = context.user_data.get('scr_next', 11)
+        if not url:
+            await q.message.reply_text("❌ URL lost. /scr <url> dobara bhejo.")
+            return
+        await scr_run(q.message.chat, context, q.from_user.id, url, nxt, nxt + 9)
+
+
+# ==========================================================
 # MAIN ENTRYPOINT
 # ==========================================================
 def main():
@@ -1865,7 +2505,10 @@ def main():
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("dump", dump_command))
     app.add_handler(CommandHandler("site", site_command))
+    app.add_handler(CommandHandler("scr", scr_command))
     app.add_handler(CommandHandler("addsite", addsite_command))
+    app.add_handler(CommandHandler("addscr", addscr_command))
+    app.add_handler(CommandHandler("delscr", delscr_command))
     app.add_handler(CommandHandler("removesite", removesite_command))
     app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("logout", logout_command))
@@ -1874,6 +2517,8 @@ def main():
     app.add_handler(CommandHandler("removeuser", removeuser_command))
     app.add_handler(CommandHandler("userlist", userlist_command))
     
+    # /scr buttons MUST be registered before the generic callback handler
+    app.add_handler(CallbackQueryHandler(scr_callback, pattern=r"^scr_"))
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
