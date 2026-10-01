@@ -159,7 +159,7 @@ def self_ping_loop():
                 logger.error(f"Self-ping failed: {e}")
 
 # ==========================================================
-# DEDICATED DOMAIN EXTRACTION ENGINES (23 SITES)
+# DEDICATED DOMAIN EXTRACTION ENGINES (43 SITES)
 # ==========================================================
 def process_tpl_link(hls_link: str) -> str:
     try:
@@ -209,7 +209,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         domain = urlparse(video_url).netloc.lower()
 
         # --------------------------------------------------
-        # Site Specific Extractors (23 Dedicated Sites)
+        # Site Specific Extractors (43 Dedicated Sites)
         # --------------------------------------------------
         if "xvideos" in domain or "xvideos2" in domain:
             xv_high = re.search(r'html5player\.setVideoUrlHigh\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
@@ -298,7 +298,6 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                        re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
             if hq_match: stream_link = hq_match.group(1)
 
-        # --- Newly Added 7 Sites ---
         elif "eporner" in domain:
             ep_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
@@ -331,6 +330,109 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
             sp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
             if sp_match: stream_link = sp_match.group(1)
+
+        # --- Newly Added 20 Dedicated Sites ---
+        elif "rusvideos.net" in domain:
+            rv_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if rv_match: stream_link = rv_match.group(1)
+
+        elif "pornhd8k.me" in domain:
+            phd_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
+            if phd_match: stream_link = phd_match.group(1)
+
+        elif "evooli.com" in domain:
+            ev_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                      re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if ev_match: stream_link = ev_match.group(1)
+
+        elif "porn4days.pw" in domain:
+            p4d_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if p4d_match: stream_link = p4d_match.group(1)
+
+        elif "porneec.com" in domain:
+            pec_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if pec_match: stream_link = pec_match.group(1)
+
+        elif "redheadpornx.com" in domain:
+            rhp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if rhp_match: stream_link = rhp_match.group(1)
+
+        elif "vxxx.com" in domain:
+            vx_match = re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'"file":\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if vx_match: stream_link = vx_match.group(1)
+
+        elif "hdporn92.com" in domain:
+            hd92_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                         re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if hd92_match: stream_link = hd92_match.group(1)
+
+        elif "inxxx.com" in domain:
+            inx_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if inx_match: stream_link = inx_match.group(1)
+
+        elif "pornk.top" in domain:
+            pt_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if pt_match: stream_link = pt_match.group(1)
+
+        elif "24videos.space" in domain:
+            v24_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if v24_match: stream_link = v24_match.group(1)
+
+        elif "sex-studentki.guru" in domain:
+            ssg_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if ssg_match: stream_link = ssg_match.group(1)
+
+        elif "seksvideo.tv" in domain:
+            sv_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if sv_match: stream_link = sv_match.group(1)
+
+        elif "russkoeporno.mobi" in domain:
+            rpm_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if rpm_match: stream_link = rpm_match.group(1)
+
+        elif "megatube.xxx" in domain:
+            mt_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if mt_match: stream_link = mt_match.group(1)
+
+        elif "freshporno.org" in domain:
+            fp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if fp_match: stream_link = fp_match.group(1)
+
+        elif "darknessporn.com" in domain:
+            dp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if dp_match: stream_link = dp_match.group(1)
+
+        elif "bdsmx.tube" in domain:
+            bt_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if bt_match: stream_link = bt_match.group(1)
+
+        elif "85po.com" in domain:
+            p85_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if p85_match: stream_link = p85_match.group(1)
+
+        elif "vtrahe.to" in domain:
+            vt_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
+                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
+            if vt_match: stream_link = vt_match.group(1)
 
         # Fallback Extractor
         if not stream_link:
@@ -944,16 +1046,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚡ **23-Site Dedicated Bulk Link Scraper Bot Active!**\n\n"
-        "🌐 **Supported Platforms (23 Sites):**\n"
-        "1. XVideos/XVideos2  2. ViralXXXPorn  3. XHNews\n"
-        "4. xHamster           5. Joysporn      6. Xhaccess\n"
-        "7. Sxyprn              8. Pornhub       9. Spankbang\n"
-        "10. Redtube            11. Youporn      12. 4tube\n"
-        "13. IPornTV            14. HQPorn       15. JustPorn\n"
-        "16. SexVid             17. Eporner      18. Pornorus\n"
-        "19. Russkoe-Porno      20. GotPorn      21. Fak.xxx\n"
-        "22. AnySex             23. SuperPorn\n\n"
+        "⚡ **43-Site Dedicated Bulk Link Scraper Bot Active!**\n\n"
+        "🌐 **43 Supported Dedicated Platforms Included!**\n\n"
         "📌 **Features:**\n"
         "1. **Full Web Player UI:** Custom Video & Media Player interface in HTML.\n"
         "2. **4 Files Export:** 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
@@ -990,7 +1084,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 **Bot Status:**\n\n"
         f"• **Authorized Users:** {users_count}\n"
-        f"• **Dedicated Site Extractors:** 23 Sites Active\n"
+        f"• **Dedicated Site Extractors:** 43 Sites Active\n"
         f"• **Engine Status:** 24/7 Active 🟢"
     )
 
@@ -1215,7 +1309,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🤖 23-Site Dedicated Extractor & Web App Bot Running!")
+    print("🤖 43-Site Dedicated Extractor & Web App Bot Running!")
     app.run_polling()
 
 if __name__ == "__main__":
