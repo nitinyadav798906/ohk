@@ -8,9 +8,10 @@ import sqlite3
 import subprocess
 import threading
 import time
+from collections import Counter
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, List, Dict
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse, parse_qs
 
 import cloudscraper
 import requests
@@ -23,6 +24,12 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
+
+# Optional: real Chrome TLS fingerprint (pip install curl_cffi). Bot works without it too.
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
 
 # ==========================================================
 # LOGGING SETUP
@@ -189,9 +196,266 @@ def fetch_url_sync(url: str) -> Optional[str]:
 async def fetch_url_with_cloudscraper(url: str) -> Optional[str]:
     return await asyncio.to_thread(fetch_url_sync, url)
 
+# ==========================================================
+# NEW: ROBUST FETCH / LINK DISCOVERY / GENERIC EXTRACTOR
+# ==========================================================
+UA = DEFAULT_USER_AGENT
+
+SKIP_EXT = ('.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
+            '.ico', '.woff', '.woff2', '.xml', '.json', '.txt', '.pdf')
+
+# listing / navigation paths that are NOT video pages
+BAD_PATH = re.compile(
+    r'/(login|signin|register|signup|search|tags?|categories|category|cats?|'
+    r'channels?|pornstars?|models?|actors?|studios?|sites?|dmca|contact|terms|'
+    r'privacy|2257|upload|premium|history|favorites|page|blog|about|faq)(/|$)',
+    re.I)
+
+JUNK = re.compile(
+    r'(preview|trailer|thumb|poster|sprite|\.vtt|logo|banner|/ads?/|adserver|'
+    r'blank\.mp4|teaser)', re.I)
+
+LAST_STATUS: Dict[str, int] = {}
+LAST_REPORT: dict = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0}
+
+
+def make_headers(url: str, referer: Optional[str] = None) -> dict:
+    p = urlparse(url)
+    return {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": referer or f"{p.scheme or 'https'}://{p.netloc}/",
+    }
+
+
+def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
+    headers = make_headers(url, referer)
+    attempts = []
+    if cffi_requests:  # best against Cloudflare (real Chrome TLS fingerprint)
+        attempts.append(lambda: cffi_requests.get(
+            url, headers=headers, impersonate="chrome124", timeout=25))
+    attempts.append(lambda: scraper.get(url, headers=headers, timeout=25))
+    attempts.append(lambda: requests.get(url, headers=headers, timeout=25))
+
+    for fn in attempts:
+        try:
+            r = fn()
+            LAST_STATUS[url] = r.status_code
+            if r.status_code == 200 and len(r.text) > 500:
+                return r.text
+            logger.warning(f"fetch {url} -> HTTP {r.status_code}")
+        except Exception as e:
+            logger.warning(f"fetch {url} error: {e}")
+    return None
+
+
+async def fetch(url: str, referer: Optional[str] = None) -> Optional[str]:
+    return await asyncio.to_thread(fetch_sync, url, referer)
+
+
+def _shape(pu) -> str:
+    segs = []
+    for s in pu.path.split('/'):
+        if not s:
+            continue
+        s = re.sub(r'\.(?:html?|php)$', '', s, flags=re.I)
+        if s.isdigit():
+            segs.append('{n}')
+        elif '-' in s or '_' in s or re.search(r'\d', s) or len(s) > 20:
+            segs.append('{slug}')
+        else:
+            segs.append(s.lower())
+    q = ','.join(sorted(parse_qs(pu.query)))
+    return '/'.join(segs) + (('?' + q) if q else '')
+
+
+def find_video_links(html: str, page_url: str) -> List[str]:
+    host = urlparse(page_url).netloc.lower()
+    if host.startswith('www.'):
+        host = host[4:]
+    items: Dict[str, tuple] = {}
+
+    for m in re.finditer(r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                         html, re.I | re.S):
+        href = m.group(1).strip().replace('&amp;', '&')
+        inner = m.group(2)
+        if href.startswith(('javascript:', '#', 'mailto:', 'tel:')):
+            continue
+        full = urljoin(page_url, href).split('#')[0]
+        pu = urlparse(full)
+        if pu.scheme not in ('http', 'https'):
+            continue
+        link_host = pu.netloc.lower()
+        if link_host.startswith('www.'):
+            link_host = link_host[4:]
+        if link_host != host:
+            continue
+        if pu.path in ('', '/') or full.rstrip('/') == page_url.rstrip('/'):
+            continue
+        if pu.path.lower().endswith(SKIP_EXT) or BAD_PATH.search(pu.path):
+            continue
+        thumb = bool(re.search(r'<img\b|data-src|data-original|poster|background-image',
+                               inner, re.I))
+        old = items.get(full)
+        items[full] = (_shape(pu), thumb or (old[1] if old else False))
+
+    if not items:
+        return []
+
+    score, thumbs = Counter(), Counter()
+    for sh, th in items.values():
+        score[sh] += 1
+        thumbs[sh] += int(th)
+    top = max(score.values())
+
+    good = {sh for sh, c in score.items()
+            if c >= 3 and c >= 0.3 * top and thumbs[sh] >= 0.5 * c}
+    if not good:
+        good = {sh for sh, c in score.items() if c >= 3 and c >= 0.3 * top}
+    if not good:  # tiny page: just use anything with a thumbnail
+        return [u for u, (_, th) in items.items() if th]
+
+    return [u for u, (sh, _) in items.items() if sh in good]
+
+
+def _looks_like_single_video(url: str) -> bool:
+    path = urlparse(url).path
+    if path in ('', '/'):
+        return False
+    return bool(re.search(
+        r'/video\.|/video\d+|/videos?/[^/]+-\d+|/post/\d+|/watch/|/v/|/film/|'
+        r'/view_video|\.html?$', path))
+
+
+async def build_page_urls(url: str, start: int, end: int) -> List[str]:
+    host = urlparse(url).netloc.lower()
+    base = url.rstrip('/')
+
+    if "xvideos" in host:  # 0-indexed pages
+        tmpl = (url + "&p={p}") if '?' in url else (base + "/{p}")
+        return [url if p == 1 else tmpl.replace('{p}', str(p - 1))
+                for p in range(start, end + 1)]
+
+    html1 = await fetch(url)
+    templates = []
+    if html1:
+        m = re.search(r'rel=["\']next["\'][^>]*href=["\']([^"\']+)|'
+                      r'href=["\']([^"\']+)["\'][^>]*rel=["\']next["\']', html1, re.I)
+        if m:
+            href = urljoin(url, (m.group(1) or m.group(2)).replace('&amp;', '&'))
+            t = re.sub(r'(?<=[/=])2(?=/|&|$)', '{p}', href, count=1)
+            if '{p}' in t:
+                templates.append(t)
+
+    if '?' in url:
+        templates.append(url + "&page={p}")
+    else:
+        templates += [base + "/page/{p}/", base + "/{p}/", base + "?page={p}",
+                      base + "/page/{p}", base + "/{p}", base + "/?page={p}"]
+
+    if end < 2:
+        return [url]
+
+    p1_links = set(find_video_links(html1, url)) if html1 else set()
+    chosen = None
+    for t in templates:
+        u2 = t.replace('{p}', '2')
+        h2 = await fetch(u2)
+        if not h2:
+            continue
+        l2 = set(find_video_links(h2, u2))
+        if l2 and l2 != p1_links:
+            chosen = t
+            break
+
+    if not chosen:
+        logger.warning(f"No pagination pattern found for {url}")
+        return [url] if start == 1 else []
+
+    return [url if p == 1 else chosen.replace('{p}', str(p))
+            for p in range(start, end + 1)]
+
+
+VIDEO_PATTERNS = [
+    r'<source[^>]+?src=["\']([^"\']+)["\']',
+    r'<video[^>]+?src=["\']([^"\']+)["\']',
+    r'property=["\']og:video(?::url|:secure_url)?["\'][^>]+content=["\']([^"\']+)',
+    r'"contentUrl"\s*:\s*"([^"]+)"',
+    # KVS engine: video_url: 'function/0/https://site/get_file/...mp4/'
+    r'(?:video_url|video_alt_url\d*)\s*[:=]\s*["\']([^"\']+)["\']',
+    r'(?:file|src|source|stream_url|videoUrl|hls|mp4|m3u8)["\']?\s*[:=]\s*'
+    r'["\']([^"\']+\.(?:m3u8|mp4)[^"\']*)["\']',
+    r'data-(?:src|video|file)=["\']([^"\']+\.(?:m3u8|mp4)[^"\']*)',
+    r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:m3u8|mp4)(?:\?[^\s"\'<>]*)?)',
+]
+
+
+def _clean(raw: str, page_url: str) -> str:
+    u = (raw.replace('\\/', '/').replace('\\u002F', '/')
+            .replace('\\u0026', '&').replace('&amp;', '&').strip())
+    u = re.sub(r'^function/\d+/', '', u)          # KVS prefix
+    if u.startswith('//'):
+        u = 'https:' + u
+    return urljoin(page_url, u)
+
+
+def _collect_candidates(html: str, page_url: str) -> List[str]:
+    out = []
+    for pat in VIDEO_PATTERNS:
+        for m in re.finditer(pat, html, re.I):
+            u = _clean(m.group(1), page_url)
+            pu = urlparse(u)
+            low = u.lower()
+            if pu.scheme not in ('http', 'https'):
+                continue
+            if low.split('?')[0].endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif',
+                                           '.svg', '.vtt', '.js', '.css')):
+                continue
+            if not ('.mp4' in low or '.m3u8' in low or 'get_file' in low):
+                continue
+            if JUNK.search(low):
+                continue
+            if u not in out:
+                out.append(u)
+    return out
+
+
+def _rank(u: str) -> float:
+    s = 0.0
+    low = u.lower()
+    if '.mp4' in low or 'get_file' in low:
+        s += 2
+    elif '.m3u8' in low:
+        s += 1
+    q = re.search(r'(\d{3,4})p', low)
+    if q:
+        s += int(q.group(1)) / 10000
+    return -s
+
+
+async def generic_extract(html: str, page_url: str, depth: int = 0) -> Optional[str]:
+    cands = _collect_candidates(html, page_url)
+    if cands:
+        return sorted(cands, key=_rank)[0]
+
+    if depth < 2:  # follow iframe embeds
+        for m in re.finditer(r'<iframe[^>]+?src=["\']([^"\']+)["\']', html, re.I):
+            src = _clean(m.group(1), page_url)
+            if not src.startswith('http'):
+                continue
+            if re.search(r'(doubleclick|banner|facebook|twitter|/ads?/)', src, re.I):
+                continue
+            h = await fetch(src, referer=page_url)
+            if h:
+                r = await generic_extract(h, src, depth + 1)
+                if r:
+                    return r
+    return None
+
 async def extract_video_link(video_url: str, source_page: str = "") -> Optional[dict]:
     try:
-        text = await fetch_url_with_cloudscraper(video_url)
+        text = await fetch(video_url, referer=source_page or None)
         if not text:
             return None
 
@@ -209,7 +473,10 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         domain = urlparse(video_url).netloc.lower()
 
         # --------------------------------------------------
-        # Site Specific Extractors (43 Dedicated Sites)
+        # Site Specific Extractors (dedicated sites)
+        # The newly added 20 sites now use the smart generic extractor below
+        # (generic_extract) which handles <source>, file:, video_url (KVS),
+        # //cdn links, escaped links and iframe embeds.
         # --------------------------------------------------
         if "xvideos" in domain or "xvideos2" in domain:
             xv_high = re.search(r'html5player\.setVideoUrlHigh\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
@@ -331,126 +598,9 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
             if sp_match: stream_link = sp_match.group(1)
 
-        # --- Newly Added 20 Dedicated Sites ---
-        elif "rusvideos.net" in domain:
-            rv_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if rv_match: stream_link = rv_match.group(1)
-
-        elif "pornhd8k.me" in domain:
-            phd_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'(https?:[^\s"\']*?\.mp4[^\s"\']*)', text)
-            if phd_match: stream_link = phd_match.group(1)
-
-        elif "evooli.com" in domain:
-            ev_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                      re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if ev_match: stream_link = ev_match.group(1)
-
-        elif "porn4days.pw" in domain:
-            p4d_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if p4d_match: stream_link = p4d_match.group(1)
-
-        elif "porneec.com" in domain:
-            pec_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if pec_match: stream_link = pec_match.group(1)
-
-        elif "redheadpornx.com" in domain:
-            rhp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if rhp_match: stream_link = rhp_match.group(1)
-
-        elif "vxxx.com" in domain:
-            vx_match = re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'"file":\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if vx_match: stream_link = vx_match.group(1)
-
-        elif "hdporn92.com" in domain:
-            hd92_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                         re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if hd92_match: stream_link = hd92_match.group(1)
-
-        elif "inxxx.com" in domain:
-            inx_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if inx_match: stream_link = inx_match.group(1)
-
-        elif "pornk.top" in domain:
-            pt_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if pt_match: stream_link = pt_match.group(1)
-
-        elif "24videos.space" in domain:
-            v24_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if v24_match: stream_link = v24_match.group(1)
-
-        elif "sex-studentki.guru" in domain:
-            ssg_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if ssg_match: stream_link = ssg_match.group(1)
-
-        elif "seksvideo.tv" in domain:
-            sv_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if sv_match: stream_link = sv_match.group(1)
-
-        elif "russkoeporno.mobi" in domain:
-            rpm_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if rpm_match: stream_link = rpm_match.group(1)
-
-        elif "megatube.xxx" in domain:
-            mt_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'video_url\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if mt_match: stream_link = mt_match.group(1)
-
-        elif "freshporno.org" in domain:
-            fp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if fp_match: stream_link = fp_match.group(1)
-
-        elif "darknessporn.com" in domain:
-            dp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if dp_match: stream_link = dp_match.group(1)
-
-        elif "bdsmx.tube" in domain:
-            bt_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if bt_match: stream_link = bt_match.group(1)
-
-        elif "85po.com" in domain:
-            p85_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                        re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if p85_match: stream_link = p85_match.group(1)
-
-        elif "vtrahe.to" in domain:
-            vt_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'file\s*:\s*["\'](https?:[^\s"\']+?)["\']', text)
-            if vt_match: stream_link = vt_match.group(1)
-
-        # Fallback Extractor
+        # Smart Generic Extractor (all remaining / newly added sites + fallback)
         if not stream_link:
-            m_hls = re.findall(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
-            for hls_candidate in m_hls:
-                clean_hls = hls_candidate.replace('\\/', '/')
-                if not any(clean_hls.lower().endswith(ext) for ext in ['.jpg', '.png', '.jpeg', '.webp']):
-                    stream_link = clean_hls
-                    break
-
-        if not stream_link:
-            m_mp4 = re.findall(r'(https?:[^\s"\']*?\.mp4(?:\?[^\s"\']*)?)', text)
-            for mp4_candidate in m_mp4:
-                clean_mp4 = mp4_candidate.replace('\\/', '/')
-                if any(clean_mp4.lower().endswith(ext) for ext in ['.jpg', '.png', '.jpeg', '.webp']):
-                    continue
-                stream_link = clean_mp4
-                break
+            stream_link = await generic_extract(text, video_url)
 
         if stream_link:
             final_link = process_tpl_link(stream_link) if ".m3u8" in stream_link else stream_link
@@ -490,89 +640,47 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
         return False
 
 # ==========================================================
-# MULTI-PAGE SCRAPING ENGINE
+# MULTI-PAGE SCRAPING ENGINE (UPGRADED)
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
-    url_to_source = {}
-    parsed = urlparse(url)
-    domain_name = parsed.netloc or "xvideos2.com"
-    base_domain = f"https://{domain_name}"
+    global LAST_REPORT
+    rep = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0}
+    LAST_REPORT = rep
 
-    is_single_video = (
-        url.endswith('.html') or 
-        re.search(r'/video\.', url) or
-        re.search(r'/video\d+', url) or
-        re.search(r'/videos?/[^/]+-\d+', url) or
-        re.search(r'/post/\d+', url) or
-        re.search(r'/watch/', url) or
-        re.search(r'/v/', url) or
-        re.search(r'/film/', url)
-    )
-    
-    if is_single_video and not any(url.endswith(x) for x in ['index.html', 'ilisting.html', '/']):
+    if _looks_like_single_video(url):
         res = await extract_video_link(url, source_page=url)
-        return [res] if res else []
+        if res:
+            rep["extracted"] = 1
+            return [res]
+        # extraction failed -> maybe it was actually a listing page, continue below
 
-    page_urls = []
-    base_u = url.rstrip('/')
+    page_urls = await build_page_urls(url, start_page, end_page)
+    url_to_source: Dict[str, str] = {}
 
-    for p in range(start_page, end_page + 1):
-        if p == 1:
-            page_urls.append(url)
-            continue
-        
-        if "xvideos" in domain_name or "xvideos2" in domain_name:
-            page_urls.append(f"{url}&p={p-1}" if "?" in url else f"{base_u}/{p-1}")
-        elif "xhamster" in domain_name or "pornhub" in domain_name or "spankbang" in domain_name or "eporner" in domain_name:
-            page_urls.append(f"{url}&page={p}" if "?" in url else f"{base_u}/{p}")
-        else:
-            page_urls.append(f"{base_u}/{p}")
-            page_urls.append(f"{base_u}?page={p}")
-            page_urls.append(f"{base_u}/page/{p}/")
+    async def crawl(pu: str):
+        html = await fetch(pu)
+        if not html:
+            rep["pages_fail"].append(f"{pu} (HTTP {LAST_STATUS.get(pu, '?')})")
+            return
+        rep["pages_ok"] += 1
+        for l in find_video_links(html, pu):
+            url_to_source.setdefault(l, pu)
 
-    async def fetch_page_links(p_url):
-        try:
-            html_text = await fetch_url_with_cloudscraper(p_url)
-            if not html_text:
-                return
-
-            raw_links = re.findall(r'href=["\']([^"\']+)["\']', html_text)
-
-            for href in raw_links:
-                if not href or href.startswith("javascript:") or href.startswith("#"):
-                    continue
-
-                clean_href = href.split('?')[0].split('#')[0]
-                if any(clean_href.lower().endswith(ext) for ext in ['.css', '.js', '.jpg', '.png', '.gif', '.svg', '.jpeg', '.webp', '.ico']):
-                    continue
-
-                full_u = href if href.startswith("http") else urljoin(base_domain, href)
-                video_patterns = [
-                    r'/video\.', r'/video\d+', r'/videos?/', r'/view_video', r'/watch/', r'/post/', 
-                    r'/film/', r'\.html$', r'/v/', r'/play/', r'/categories/', r'/cat/'
-                ]
-
-                if any(re.search(pat, clean_href.lower()) for pat in video_patterns):
-                    if not re.search(r'/videos?/?$', clean_href) and not re.search(r'/category/?$', clean_href):
-                        url_to_source[full_u] = p_url
-
-        except Exception as e:
-            logger.error(f"Error crawling page {p_url}: {e}")
-
-    await asyncio.gather(*[fetch_page_links(pu) for pu in page_urls])
-
+    await asyncio.gather(*[crawl(p) for p in page_urls])
+    rep["links"] = len(url_to_source)
     if not url_to_source:
         return []
 
-    semaphore = asyncio.Semaphore(10)
+    semaphore = asyncio.Semaphore(5)
+
     async def sem_extract(v_url, src_p):
         async with semaphore:
             return await extract_video_link(v_url, source_page=src_p)
 
-    tasks = [sem_extract(v_url, src_p) for v_url, src_p in url_to_source.items()]
-    results = await asyncio.gather(*tasks)
-    
-    return [res for res in results if res is not None]
+    results = [r for r in await asyncio.gather(
+        *[sem_extract(v, s) for v, s in url_to_source.items()]) if r]
+    rep["extracted"] = len(results)
+    return results
 
 # ==========================================================
 # HTML WEB APP GENERATOR
@@ -1092,6 +1200,34 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STOP_PROCESS[update.effective_user.id] = True
     await update.message.reply_text("🛑 **Process Stop Request Sent!**")
 
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/debug <url> -> shows exactly why a site fails (fetch / link discovery / extraction)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /debug <listing_or_video_url>")
+        return
+    url = context.args[0]
+    html = await fetch(url)
+    if not html:
+        await update.message.reply_text(
+            f"❌ Fetch failed. HTTP: {LAST_STATUS.get(url, '?')}\n"
+            "403/503 = Cloudflare/IP block | 404 = wrong URL | ? = timeout/DNS")
+        return
+
+    lines = [f"✅ Fetched {len(html)} bytes"]
+    links = find_video_links(html, url)
+    lines.append(f"🔗 Video-like links on page: {len(links)}")
+    lines += links[:3]
+    if links:
+        h = await fetch(links[0], referer=url)
+        s = await generic_extract(h, links[0]) if h else None
+        lines.append(f"▶ Extract test on 1st link: {s or 'FAILED'}")
+    else:
+        s = await generic_extract(html, url)
+        lines.append(f"▶ Treated as single video page: {s or 'no stream found'}")
+    await update.message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_allowed(user_id): return
@@ -1175,7 +1311,15 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
         results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
 
         if not results:
-            await status_msg.edit_text(f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.")
+            r = LAST_REPORT
+            await status_msg.edit_text(
+                f"❌ Pages {start_page} to {end_page} par koi video links nahi mile.\n\n"
+                f"📄 Pages OK: {r['pages_ok']}\n"
+                f"🚫 Failed: {r['pages_fail'][:3]}\n"
+                f"🔗 Links found: {r['links']}\n"
+                f"✅ Extracted: {r['extracted']}\n\n"
+                f"Detail ke liye: /debug {target_url}"
+            )
             return
 
         await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! 2 TXT aur 2 HTML files generate ho rahi hain...")
@@ -1300,6 +1444,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("debug", debug_command))
     
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
