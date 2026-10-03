@@ -1,4 +1,5 @@
 import asyncio
+import html as _html
 import io
 import json
 import logging
@@ -9,6 +10,7 @@ import subprocess
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor as _TPE
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, List, Dict
 from urllib.parse import unquote, urljoin, urlparse, parse_qs
@@ -43,7 +45,8 @@ logger = logging.getLogger(__name__)
 # ==========================================================
 # CONFIGURATION
 # ==========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7673015455:AAFW01HGes-gzQUg_1Fb6gKD2HlSTOZcG0Y")
+# SECURITY: token ab sirf environment variable se aayega (code me mat likho).
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1714266885"))
 BOT_OWNER_NAME = os.getenv("BOT_OWNER_NAME", "@Mascotchlowa")
 TELEGRAM_LINK = os.getenv("TELEGRAM_LINK", "https://t.me/Mascotchlowa")
@@ -322,7 +325,7 @@ def get_custom_headers(url: str) -> dict:
     parsed = urlparse(url)
     domain = parsed.netloc or "xvideos2.com"
     referer = f"https://{domain}/"
-    
+
     return {
         "User-Agent": DEFAULT_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -347,7 +350,7 @@ class DummyPortServer(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot Status: Active and Running 24/7!")
-        
+
     def log_message(self, format, *args):
         return
 
@@ -374,6 +377,26 @@ def self_ping_loop():
 # ==========================================================
 # DEDICATED DOMAIN EXTRACTION ENGINES (43 SITES)
 # ==========================================================
+def xh_best_stream(text: str) -> Optional[str]:
+    """xhamster: page me jitne bhi .m3u8 hain unme se best (multi= master playlist > h264 > av1)."""
+    t = (text.replace('\\/', '/').replace('\\u002F', '/')
+             .replace('\\u0026', '&').replace('&amp;', '&'))
+    urls = re.findall(r'https?://[^\s"\'<>\\]+?\.m3u8[^\s"\'<>\\]*', t)
+    best, best_score = None, -1
+    for u in dict.fromkeys(urls):
+        low = u.lower()
+        if JUNK.search(low):
+            continue
+        score = 0
+        if 'multi=' in low: score += 4      # quality-selector wali master playlist
+        if 'xhcdn' in low: score += 1
+        if '.h264.' in low: score += 2
+        elif '.av1.' in low: score += 1
+        if score > best_score:
+            best, best_score = u, score
+    return best
+
+
 def process_tpl_link(hls_link: str) -> str:
     try:
         if "_TPL_" not in hls_link:
@@ -403,7 +426,7 @@ async def fetch_url_with_cloudscraper(url: str) -> Optional[str]:
     return await asyncio.to_thread(fetch_url_sync, url)
 
 # ==========================================================
-# NEW: ROBUST FETCH / LINK DISCOVERY / GENERIC EXTRACTOR
+# ROBUST FETCH / LINK DISCOVERY / GENERIC EXTRACTOR
 # ==========================================================
 UA = DEFAULT_USER_AGENT
 
@@ -441,23 +464,39 @@ def make_headers(url: str, referer: Optional[str] = None) -> dict:
 
 LAST_DETAIL: Dict[str, str] = {}
 
+# ---- fast fetch: per-thread connection reuse + remembers best engine per site ----
+_TL = threading.local()
+_BEST_ENGINE: Dict[str, str] = {}
+
+
+def _cffi_sess():
+    s = getattr(_TL, "cffi", None)
+    if s is None:
+        s = cffi_requests.Session(impersonate="chrome124")
+        _TL.cffi = s
+    return s
+
 
 def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
     headers = make_headers(url, referer)
     proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-    attempts = []
+    engines = {}
     if cffi_requests:  # best against Cloudflare (real Chrome TLS fingerprint)
-        attempts.append(("curl_cffi", lambda: cffi_requests.get(
-            url, headers=headers, impersonate="chrome124", timeout=25, proxies=proxies)))
-    attempts.append(("cloudscraper", lambda: scraper.get(
-        url, headers=headers, timeout=25, proxies=proxies)))
-    attempts.append(("requests", lambda: requests.get(
-        url, headers=headers, timeout=25, proxies=proxies)))
+        engines["curl_cffi"] = lambda: _cffi_sess().get(url, headers=headers, timeout=15, proxies=proxies)
+    engines["cloudscraper"] = lambda: scraper.get(url, headers=headers, timeout=15, proxies=proxies)
+    engines["requests"] = lambda: requests.get(url, headers=headers, timeout=15, proxies=proxies)
+
+    root = _root_host(urlparse(url).netloc)
+    order = list(engines)
+    pref = _BEST_ENGINE.get(root)
+    if pref in engines:
+        order.remove(pref)
+        order.insert(0, pref)
 
     detail = []
-    for name, fn in attempts:
+    for name in order:
         try:
-            r = fn()
+            r = engines[name]()
             LAST_STATUS[url] = r.status_code
             if r.status_code == 200 and len(r.text) > 500:
                 if re.search(r'<title>\s*(Just a moment|Attention Required|Access denied|'
@@ -467,6 +506,7 @@ def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
                     logger.warning(f"fetch {url} -> bot challenge page ({name})")
                     continue
                 LAST_DETAIL[url] = ""
+                _BEST_ENGINE[root] = name
                 return r.text
             detail.append(f"{name}:{r.status_code}")
             logger.warning(f"fetch {url} -> HTTP {r.status_code} ({name})")
@@ -601,7 +641,7 @@ async def build_page_urls(url: str, start: int, end: int) -> List[str]:
         return [url if p == 1 else tmpl.replace('{p}', str(p - 1))
                 for p in range(start, end + 1)]
 
-    html1 = await fetch(url)
+    html1 = await fast_fetch(url)
     templates = []
     if html1:
         m = re.search(r'rel=["\']next["\'][^>]*href=["\']([^"\']+)|'
@@ -622,16 +662,17 @@ async def build_page_urls(url: str, start: int, end: int) -> List[str]:
         return [url]
 
     p1_links = set(find_video_links(html1, url)) if html1 else set()
-    chosen = None
-    for t in templates:
+
+    async def probe(t):
         u2 = t.replace('{p}', '2')
-        h2 = await fetch(u2)
+        h2 = await fast_fetch(u2)
         if not h2:
-            continue
+            return None
         l2 = set(find_video_links(h2, u2))
-        if l2 and l2 != p1_links:
-            chosen = t
-            break
+        return t if (l2 and l2 != p1_links) else None
+
+    probes = await asyncio.gather(*[probe(t) for t in templates])
+    chosen = next((t for t in probes if t), None)
 
     if not chosen:
         logger.warning(f"No pagination pattern found for {url}")
@@ -688,10 +729,11 @@ def _collect_candidates(html: str, page_url: str) -> List[str]:
 def _rank(u: str) -> float:
     s = 0.0
     low = u.lower()
-    if '.mp4' in low or 'get_file' in low:
+    path = low.split('?')[0]
+    if '.m3u8' in path:                      # .mp4.m3u8 ab sahi se HLS count hoga
+        s += 3 if 'xhcdn' in low else 1      # xhamster CDN par HLS hi chalta hai
+    elif '.mp4' in path or 'get_file' in low:
         s += 2
-    elif '.m3u8' in low:
-        s += 1
     q = re.search(r'(\d{3,4})p', low)
     if q:
         s += int(q.group(1)) / 10000
@@ -898,7 +940,7 @@ async def build_manual_rule(url: str, domain: str, rx_text: str) -> dict:
 
 async def extract_video_link(video_url: str, source_page: str = "") -> Optional[dict]:
     try:
-        text = await fetch(video_url, referer=source_page or None)
+        text = await fast_fetch(video_url, referer=source_page or None)
         if not text:
             return None
 
@@ -906,7 +948,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         title_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE | re.DOTALL)
         if not title_match:
             title_match = re.search(r'<title>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
-            
+
         if title_match:
             title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
             title = re.sub(r'\s+', ' ', title)
@@ -915,9 +957,9 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         file_type = "VIDEO"
         domain = urlparse(video_url).netloc.lower()
 
-        # Site-specific extractor saved with /addscr (tried first)
+        # Site-specific extractor saved with /addscr (tried first; xhamster uses its own HLS picker)
         rule = get_site_rule(video_url)
-        if rule and rule.get("regex"):
+        if rule and rule.get("regex") and "xhamster" not in domain:
             rule_link = apply_site_rule(rule, text, video_url)
             if rule_link:
                 stream_link = rule_link
@@ -925,9 +967,6 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
 
         # --------------------------------------------------
         # Site Specific Extractors (dedicated sites)
-        # The newly added 20 sites now use the smart generic extractor below
-        # (generic_extract) which handles <source>, file:, video_url (KVS),
-        # //cdn links, escaped links and iframe embeds.
         # --------------------------------------------------
         if "xvideos" in domain or "xvideos2" in domain:
             xv_high = re.search(r'html5player\.setVideoUrlHigh\s*\(\s*["\'](https?:[^\s"\']+?)["\']\s*\)', text)
@@ -948,10 +987,14 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
             if xhn_match: stream_link = xhn_match.group(1)
 
         elif "xhamster" in domain:
-            xh_match = re.search(r'"m3u8":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'"mp4":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
-                       re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text)
-            if xh_match: stream_link = xh_match.group(1).replace('\\/', '/')
+            xh_link = xh_best_stream(text)
+            if xh_link:
+                stream_link = xh_link
+            else:
+                xh_match = re.search(r'"m3u8":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                           re.search(r'"mp4":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
+                           re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text)
+                if xh_match: stream_link = xh_match.group(1).replace('\\/', '/')
 
         elif "joysporn" in domain:
             jp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
@@ -1055,7 +1098,7 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
 
         if stream_link:
             final_link = process_tpl_link(stream_link) if ".m3u8" in stream_link else stream_link
-            
+
             if ".pdf" in final_link.lower(): file_type = "PDF"
             elif any(ext in final_link.lower() for ext in ['.mp3', '.wav', '.m4a', '.aac']): file_type = "AUDIO"
             elif any(ext in final_link.lower() for ext in ['.jpg', '.png', '.jpeg', '.webp']): file_type = "IMAGE"
@@ -1095,6 +1138,7 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
     global LAST_REPORT
+    _ensure_fast_executor()
     rep = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0}
     LAST_REPORT = rep
 
@@ -1109,7 +1153,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     url_to_source: Dict[str, str] = {}
 
     async def crawl(pu: str):
-        html = await fetch(pu)
+        html = await fast_fetch(pu)
         if not html:
             rep["pages_fail"].append(f"{pu} (HTTP {LAST_STATUS.get(pu, '?')})")
             return
@@ -1122,7 +1166,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     if not url_to_source:
         return []
 
-    semaphore = asyncio.Semaphore(5)
+    semaphore = asyncio.Semaphore(SCR_CONCURRENCY)
 
     async def sem_extract(v_url, src_p):
         async with semaphore:
@@ -1159,17 +1203,22 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
         elif item['type'] == 'AUDIO': icon = "🎵"
         elif item['type'] == 'IMAGE': icon = "🖼"
 
+        safe_title = _html.escape(item['title'])
         items_html += f"""
         <div class="list-item" id="item-{idx}" data-type="{item['type']}" onclick="openCinema({idx})">
             <div class="item-icon-box">{icon}</div>
             <div class="item-info">
-                <div class="item-title">{item['title']}</div>
+                <div class="item-title">{safe_title}</div>
                 <div class="item-meta">
                     <span class="meta-tag tag-{item['type']}">{item['type']}</span>
                     <span id="list-fav-{idx}" style="display:none; color:var(--red);">❤️ Fav</span>
                 </div>
             </div>
         </div>"""
+
+    # "</script>" ya "</" title me aaye to page na toote
+    playlist_json = json.dumps(js_playlist).replace("</", "<\\/")
+    safe_page_title = _html.escape(title)
 
     login_html = ""
     security_script = ""
@@ -1190,7 +1239,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
 <html lang="en" data-theme="dark" data-color="blue">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-    <title>{title}</title>
+    <title>{safe_page_title}</title>
     <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
@@ -1208,7 +1257,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
 
         body {{ font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding-bottom: 80px; transition: 0.3s; }}
         * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
-        #app-wrapper {{ display: none; }} 
+        #app-wrapper {{ display: none; }}
 
         #login-screen {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg); z-index: 9999; display: none; justify-content: center; align-items: center; }}
         .login-box {{ background: var(--card-bg); padding: 25px; border-radius: 12px; width: 85%; max-width: 300px; border: 1px solid var(--border); text-align: center; }}
@@ -1250,7 +1299,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
 
         .cinema-modal, .player-overlay {{ display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; z-index: 3000; }}
         .player-overlay {{ z-index: 4000; background: black; flex-direction: column; }}
-        
+
         .bg-layer {{ position: absolute; top: 0; left: 0; width: 100%; height: 60%; background-size: cover; background-position: center; mask-image: linear-gradient(to bottom, black 20%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, black 20%, transparent 100%); opacity: 0.6; }}
         .cinema-content {{ position: absolute; bottom: 0; width: 100%; height: 60%; padding: 20px; background: linear-gradient(to top, #000 20%, transparent); display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 15px; }}
         .c-poster {{ width: 120px; height: 180px; border-radius: 8px; object-fit: cover; box-shadow: 0 5px 20px black; border: 1px solid rgba(255,255,255,0.2); }}
@@ -1269,7 +1318,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
         .bottom-controls {{ background: #000; padding: 15px; display: flex; justify-content: center; gap: 8px; border-top: 1px solid #222; flex-wrap: wrap; z-index: 60; }}
         .ctrl-btn {{ background: #222; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }}
         .ctrl-next {{ background: var(--primary); color: white; }}
-        
+
         .settings-menu {{ position: absolute; top: 60px; right: 20px; background: rgba(20,20,20,0.95); border: 1px solid #333; border-radius: 8px; padding: 15px; z-index: 100; display: none; flex-direction: column; gap: 10px; width: 220px; backdrop-filter: blur(10px); }}
         .sm-item {{ display: flex; flex-direction: column; gap: 5px; }}
 
@@ -1277,12 +1326,12 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
         .sm-select {{ background: #333; color: white; border: none; padding: 8px; border-radius: 4px; font-size: 14px; }}
         .clean-btn {{ background: #ef4444; color: white; border: none; padding: 8px; width: 100%; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 5px; }}
         .lock-icon {{ position: absolute; bottom: 30px; right: 20px; color: white; background: rgba(255,255,255,0.2); padding: 12px; border-radius: 50%; cursor: pointer; z-index: 65; font-size: 18px; }}
-        
+
         body.minimized .player-overlay {{ width: 320px !important; height: 180px !important; top: auto !important; left: auto !important; bottom: 20px !important; right: 20px !important; border-radius: 12px; border: 2px solid var(--primary); box-shadow: 0 10px 40px rgba(0,0,0,0.5); }}
         body.minimized .bottom-controls, body.minimized .settings-menu, body.minimized .lock-icon, body.minimized .watermark, body.minimized .red-bar-box, body.minimized .gesture-val {{ display: none !important; }}
         body.minimized .player-header {{ padding: 5px; }}
         body.minimized #pTitle {{ font-size: 10px; white-space: nowrap; }}
-        body.minimized .player-mid {{ pointer-events: none; }} 
+        body.minimized .player-mid {{ pointer-events: none; }}
 
         .pdf-frame {{ width: 100%; height: 100%; border: none; background: white; }}
         .img-view {{ width: 100%; height: 100%; object-fit: contain; }}
@@ -1296,7 +1345,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
     <div id="app-wrapper">
         <div class="header">
             <div class="h-top">
-                <div class="h-title">{title}</div>
+                <div class="h-title">{safe_page_title}</div>
                 <div class="right-actions">
                     <a href="{TELEGRAM_LINK}" target="_blank" class="tg-link">✈ Join TG</a>
                     <span class="mode-btn" onclick="toggleMode()">🌓</span>
@@ -1353,7 +1402,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
         <div class="red-bar-box"><div class="red-bar" id="redBar"></div></div>
         <div class="gesture-val" id="gVal">50%</div>
         <div class="watermark">{BOT_OWNER_NAME}</div>
-        
+
         <div class="player-header">
             <div style="display:flex; align-items:center; gap:15px; width:70%;">
                 <span style="color:white; font-weight:600; font-size:14px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;" id="pTitle">Player</span>
@@ -1396,7 +1445,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
             <button class="ctrl-btn" onclick="toggleFav('pFavBtn')" id="pFavBtn">🤍 Fav</button>
         </div>
     </div>
-    
+
     <div id="toast">Alert</div>
 
     <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
@@ -1423,11 +1472,11 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
         }}
         {security_script}
 
-        const playlist = {json.dumps(js_playlist)};
+        const playlist = {playlist_json};
         let currentIndex = -1;
         let hls = new Hls();
         let isLocked = false;
-        
+
         const player = new Plyr('#player', {{
             controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'settings', 'fullscreen'],
             hideControls: true, speed: {{ selected: 1, options: [0.5, 1, 1.5, 2, 3, 4] }}
@@ -1515,7 +1564,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
             redBar.style.height = h + "%";
             gVal.style.opacity = '1';
             if(e.touches[0].clientX > window.innerWidth / 2) {{
-                let change = delta / 500; 
+                let change = delta / 500;
                 let newVol = Math.min(Math.max(player.volume + change, 0), 1);
                 player.volume = newVol;
                 gVal.innerText = "Vol: " + Math.round(newVol * 100) + "%";
@@ -1538,7 +1587,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
             document.getElementById('extControls').style.display = isLocked ? 'none' : 'flex';
         }}
         function toggleMinimize() {{ document.body.classList.toggle('minimized'); }}
-        
+
         function toggleFav(btnId) {{
             const url = playlist[currentIndex].url;
             if(localStorage.getItem('fav_'+url)) {{
@@ -1601,17 +1650,17 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ **Access Denied! Aap is bot ko use nahi kar sakte.**")
+        await update.message.reply_text("⛔ Access Denied! Aap is bot ko use nahi kar sakte.")
         return
 
     await update.message.reply_text(
-        "⚡ **43-Site Dedicated Bulk Link Scraper Bot Active!**\n\n"
-        "🌐 **43 Supported Dedicated Platforms Included!**\n\n"
-        "📌 **Features:**\n"
-        "1. **Full Web Player UI:** Custom Video & Media Player interface in HTML.\n"
-        "2. **4 Files Export:** 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
-        "3. **FFmpeg Downloader:** Upload `.txt` file to auto-download & send video.\n\n"
-        "🛠️ **Commands:** `/site`, `/scr`, `/addsite`, `/addscr`, `/delscr`, `/removesite`, `/login`, `/logout`, `/stop`, `/stats`, `/userlist`"
+        "⚡ 43-Site Dedicated Bulk Link Scraper Bot Active!\n\n"
+        "🌐 43 Supported Dedicated Platforms Included!\n\n"
+        "📌 Features:\n"
+        "1. Full Web Player UI: Custom Video & Media Player interface in HTML.\n"
+        "2. 4 Files Export: 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
+        "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n\n"
+        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /stop, /stats, /userlist, /debug, /dump"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1641,15 +1690,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id): return
     users_count = len(get_all_users())
     await update.message.reply_text(
-        f"📊 **Bot Status:**\n\n"
-        f"• **Authorized Users:** {users_count}\n"
-        f"• **Dedicated Site Extractors:** 43 Sites Active\n"
-        f"• **Engine Status:** 24/7 Active 🟢"
+        f"📊 Bot Status:\n\n"
+        f"• Authorized Users: {users_count}\n"
+        f"• Dedicated Site Extractors: 43 Sites Active\n"
+        f"• Engine Status: 24/7 Active 🟢"
     )
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STOP_PROCESS[update.effective_user.id] = True
-    await update.message.reply_text("🛑 **Process Stop Request Sent!**")
+    await update.message.reply_text("🛑 Process Stop Request Sent!")
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/debug <url> -> shows exactly why a site fails (fetch / link discovery / extraction)."""
@@ -1678,7 +1727,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = await generic_extract(h, links[0]) if h else None
         lines.append(f"▶ Extract test on 1st link: {s or 'FAILED'}")
     else:
-        s = await generic_extract(html, url)
+        # single video page? test with the real extractor (xhamster HLS picker included)
+        item = await extract_video_link(url, source_page=url)
+        s = item["download_link"] if item else None
         lines.append(f"▶ Treated as single video page: {s or 'no stream found'}")
     await update.message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
 
@@ -1973,12 +2024,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(user_id): return
 
     doc = update.message.document
-    if not doc or not doc.file_name.endswith('.txt'):
-        await update.message.reply_text("❌ Valid `.txt` file upload karein.")
+    if not doc or not (doc.file_name or "").lower().endswith('.txt'):
+        await update.message.reply_text("❌ Valid .txt file upload karein.")
         return
 
     STOP_PROCESS[user_id] = False
-    status_msg = await update.message.reply_text("📥 **TXT file reading started...**")
+    status_msg = await update.message.reply_text("📥 TXT file reading started...")
 
     try:
         file = await context.bot.get_file(doc.file_id)
@@ -1994,14 +2045,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         total = len(urls)
-        await status_msg.edit_text(f"🚀 Total **{total}** links queued! Stop karne ke liye `/stop` bhejein.")
+        await status_msg.edit_text(f"🚀 Total {total} links queued! Stop karne ke liye /stop bhejein.")
 
         for idx, raw_url in enumerate(urls, 1):
             if STOP_PROCESS.get(user_id, False):
-                await update.message.reply_text("🛑 **Task Stopped By User!**")
+                await update.message.reply_text("🛑 Task Stopped By User!")
                 break
 
-            progress_msg = await update.message.reply_text(f"⏳ **[{idx}/{total}] Processing...**")
+            progress_msg = await update.message.reply_text(f"⏳ [{idx}/{total}] Processing...")
             stream_url = raw_url
             video_title = f"Video #{idx}"
 
@@ -2016,36 +2067,36 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try: os.remove(output_file)
                 except Exception: pass
 
-            await progress_msg.edit_text(f"📥 **[{idx}/{total}] Downloading Video...**")
+            await progress_msg.edit_text(f"📥 [{idx}/{total}] Downloading Video...")
             success = await download_video_ffmpeg(stream_url, output_file)
 
             if success:
-                await progress_msg.edit_text(f"📤 **[{idx}/{total}] Telegram Uploading...**")
+                await progress_msg.edit_text(f"📤 [{idx}/{total}] Telegram Uploading...")
                 try:
                     with open(output_file, 'rb') as vf:
                         await update.message.reply_video(
-                            video=vf, 
-                            caption=f"🎥 **{video_title}**\n\n🔗 **Item {idx}/{total}**",
+                            video=vf,
+                            caption=f"🎥 {video_title}\n\n🔗 Item {idx}/{total}",
                             supports_streaming=True
                         )
                     await progress_msg.delete()
                 except Exception as upload_err:
                     await progress_msg.edit_text(f"❌ Upload Error: {str(upload_err)}")
             else:
-                await progress_msg.edit_text(f"❌ **[{idx}/{total}] Download Failed!**")
+                await progress_msg.edit_text(f"❌ [{idx}/{total}] Download Failed!")
 
             if os.path.exists(output_file):
                 try: os.remove(output_file)
                 except Exception: pass
 
-        await status_msg.edit_text("✅ **Processing completed!**")
+        await status_msg.edit_text("✅ Processing completed!")
 
     except Exception as e:
         logger.error(f"Error processing document: {e}")
         await status_msg.edit_text(f"❌ File Process Error: {str(e)}")
 
 async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
-    status_msg = await update_or_query.message.reply_text(f"⚡ **Scraping Pages {start_page} to {end_page}...**")
+    status_msg = await update_or_query.message.reply_text(f"⚡ Scraping Pages {start_page} to {end_page}...")
 
     try:
         results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
@@ -2062,7 +2113,7 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
             )
             return
 
-        await status_msg.edit_text(f"✅ Total **{len(results)}** Videos Extracted! 2 TXT aur 2 HTML files generate ho rahi hain...")
+        await status_msg.edit_text(f"✅ Total {len(results)} Videos Extracted! 2 TXT aur 2 HTML files generate ho rahi hain...")
 
         # FILE 1: FULL DETAILS TXT
         txt_full_content = f"--- Scraped Video Links Full (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
@@ -2101,8 +2152,8 @@ a:hover {{ text-decoration: underline; }}
 
         for idx, item in enumerate(results, 1):
             html_simple_content += f"""<div class="card">
-<h3>{idx}. {item['title']} <span class="tag">{item['type']}</span></h3>
-<p><strong>⚡ Stream URL:</strong> <a href="{item['download_link']}" target="_blank">{item['download_link']}</a></p>
+<h3>{idx}. {_html.escape(item['title'])} <span class="tag">{item['type']}</span></h3>
+<p><strong>⚡ Stream URL:</strong> <a href="{_html.escape(item['download_link'])}" target="_blank">{_html.escape(item['download_link'])}</a></p>
 </div>"""
         html_simple_content += "</body></html>"
 
@@ -2121,12 +2172,12 @@ a:hover {{ text-decoration: underline; }}
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update_or_query.message.reply_document(document=txt_full_bytes, caption=f"📁 **Pages {start_page}-{end_page} Full TXT File** ({len(results)} Links)")
-        await update_or_query.message.reply_document(document=txt_simple_bytes, caption=f"📁 **Pages {start_page}-{end_page} Simple TXT File** (Title: Direct Stream Link)")
-        await update_or_query.message.reply_document(document=html_full_bytes, caption=f"🌐 **Pages {start_page}-{end_page} Full Web App HTML File** (Interactive Player UI)")
+        await update_or_query.message.reply_document(document=txt_full_bytes, caption=f"📁 Pages {start_page}-{end_page} Full TXT File ({len(results)} Links)")
+        await update_or_query.message.reply_document(document=txt_simple_bytes, caption=f"📁 Pages {start_page}-{end_page} Simple TXT File (Title: Direct Stream Link)")
+        await update_or_query.message.reply_document(document=html_full_bytes, caption=f"🌐 Pages {start_page}-{end_page} Full Web App HTML File (Interactive Player UI)")
         await update_or_query.message.reply_document(
-            document=html_simple_bytes, 
-            caption=f"🌐 **Pages {start_page}-{end_page} Simple HTML File**\n\nAage ke pages (**{next_start} to {next_end}**) scrape karne ke liye button click karein:",
+            document=html_simple_bytes,
+            caption=f"🌐 Pages {start_page}-{end_page} Simple HTML File\n\nAage ke pages ({next_start} to {next_end}) scrape karne ke liye button click karein:",
             reply_markup=reply_markup
         )
         await status_msg.delete()
@@ -2137,7 +2188,7 @@ a:hover {{ text-decoration: underline; }}
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ **Access Denied!**")
+        await update.message.reply_text("⛔ Access Denied!")
         return
 
     text = update.message.text.strip()
@@ -2182,7 +2233,11 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if query.data == "stop_scrape":
-        await query.edit_message_caption(caption=query.message.caption + "\n\n🛑 **Scraping Stopped By User.**")
+        STOP_PROCESS[query.from_user.id] = True
+        try:
+            await query.edit_message_caption(caption=(query.message.caption or "") + "\n\n🛑 Scraping Stopped By User.")
+        except Exception:
+            pass
         return
 
     if query.data == "continue_scrape":
@@ -2199,11 +2254,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 # ==========================================================
 # /scr  ->  NEW-SITE FAST SCRAPER (auto domain-specific extractor)
 # ==========================================================
-import html as _html
-from concurrent.futures import ThreadPoolExecutor as _TPE
-
-SCR_CONCURRENCY = 12        # parallel video-page extractions (fast)
-SCR_PAGE_CONCURRENCY = 6    # parallel listing-page fetches
+SCR_CONCURRENCY = 24        # parallel video-page extractions (fast)
+SCR_PAGE_CONCURRENCY = 10   # parallel listing-page fetches
 SCR_MAX_PAGES = 30          # max pages per single run
 _SCR_CACHE_TTL = 300        # seconds, html cache
 _FETCH_CACHE: Dict[str, tuple] = {}
@@ -2236,7 +2288,7 @@ def _ensure_fast_executor():
     """Bigger thread pool so asyncio.to_thread(fetch_sync) really runs in parallel."""
     global _EXECUTOR_READY
     if not _EXECUTOR_READY:
-        asyncio.get_running_loop().set_default_executor(_TPE(max_workers=32))
+        asyncio.get_running_loop().set_default_executor(_TPE(max_workers=64))
         _EXECUTOR_READY = True
 
 
@@ -3058,13 +3110,21 @@ async def scr_spa_fallback(url: str, html: str, page_url: str, start: int, end: 
 # ==========================================================
 # MAIN ENTRYPOINT
 # ==========================================================
+async def _post_init(app):
+    _ensure_fast_executor()
+
+
 def main():
+    if not BOT_TOKEN:
+        raise SystemExit("❌ BOT_TOKEN environment variable set nahi hai. "
+                         "Naya token BotFather se lo aur env me BOT_TOKEN=... rakho.")
     init_db()
     threading.Thread(target=run_dummy_server, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
-    
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
+
+    app = (ApplicationBuilder().token(BOT_TOKEN)
+           .concurrent_updates(True).post_init(_post_init).build())
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("stats", stats_command))
@@ -3078,17 +3138,17 @@ def main():
     app.add_handler(CommandHandler("removesite", removesite_command))
     app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("logout", logout_command))
-    
+
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
     app.add_handler(CommandHandler("userlist", userlist_command))
-    
+
     # /scr buttons MUST be registered before the generic callback handler
     app.add_handler(CallbackQueryHandler(scr_callback, pattern=r"^scr_"))
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
+
     logger.info(f"curl_cffi: {'ON' if cffi_requests else 'OFF (pip install curl_cffi)'} | "
                 f"Proxy: {'ON' if PROXY_URL else 'OFF'}")
     print("🤖 43-Site Dedicated Extractor & Web App Bot Running!")
