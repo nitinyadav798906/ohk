@@ -397,6 +397,85 @@ def xh_best_stream(text: str) -> Optional[str]:
     return best
 
 
+EXTRACT_NOTE = {"v": ""}
+_XH_EMBED = {"tried": 0, "ok": 0}
+
+
+def page_diag(text: str) -> str:
+    """Video page me kya mila / kya nahi -> failure ka asli karan dikhane ke liye."""
+    t = text or ""
+    low = t.lower()
+    title = re.search(r'<title[^>]*>(.*?)</title>', t, re.I | re.S)
+    keys = ["initials", "xplayersettings", "unavailable", "premium", "sign in", "captcha",
+            "just a moment", ".m3u8", ".mp4", "<video", "<iframe"]
+    cnt = ", ".join(f"{k}={low.count(k)}" for k in keys)
+    ttl = re.sub(r'\s+', ' ', title.group(1)).strip()[:70] if title else "none"
+    return f"📄 {len(t)} bytes | title: {ttl}\n🔎 {cnt}"
+
+
+def note_hint() -> str:
+    n = EXTRACT_NOTE.get("v")
+    return f"\n🔬 Last failed video page:\n{n[:700]}\n" if n else ""
+
+
+def xh_from_initials(text: str) -> Optional[str]:
+    """xhamster: window.initials JSON ke andar se HLS/MP4 sources (m3u8 ko priority)."""
+    t = text
+    for m in re.finditer(r'(?:window\.)?initials\s*=\s*\{', t):
+        blob = _balanced(t, m.end() - 1)
+        if not blob:
+            continue
+        try:
+            data = json.loads(blob)
+        except Exception:
+            continue
+        found: List[str] = []
+
+        def walk(o, d=0):
+            if d > 16:
+                return
+            if isinstance(o, dict):
+                for v in o.values():
+                    walk(v, d + 1)
+            elif isinstance(o, list):
+                for v in o[:300]:
+                    walk(v, d + 1)
+            elif isinstance(o, str):
+                low = o.lower()
+                if ('.m3u8' in low or '.mp4' in low) and o.startswith(('http', '//')) and not JUNK.search(low):
+                    found.append(o)
+
+        walk(data)
+        urls = [_clean(u, "https://x.invalid/") for u in found]
+        hls = [u for u in urls if '.m3u8' in u.lower().split('?')[0]]
+        if hls:
+            return sorted(hls, key=lambda u: (0 if 'multi=' in u.lower() else 1,
+                                              0 if '.h264.' in u.lower() else 1))[0]
+        if urls:
+            return sorted(urls, key=_rank)[0]
+    return None
+
+
+async def xh_embed_try(video_url: str) -> Optional[str]:
+    """Video page me stream na mile to embed page try karo (sirf failure par, limited)."""
+    if _XH_EMBED["tried"] >= 5 and _XH_EMBED["ok"] == 0:
+        return None
+    pu = urlparse(video_url)
+    m = re.search(r'-(xh[A-Za-z0-9]+)/?$', pu.path)
+    if not m:
+        return None
+    _XH_EMBED["tried"] += 1
+    base = f"{pu.scheme}://{pu.netloc}"
+    for u in (f"{base}/xembed.php?video={m.group(1)}", f"{base}/embed/{m.group(1)}"):
+        h = await fetch(u, referer=video_url)
+        if h:
+            s_ = xh_best_stream(h) or xh_from_initials(h)
+            if s_:
+                _XH_EMBED["ok"] += 1
+                return s_
+    return None
+
+
 def process_tpl_link(hls_link: str) -> str:
     try:
         if "_TPL_" not in hls_link:
@@ -468,6 +547,40 @@ LAST_DETAIL: Dict[str, str] = {}
 _TL = threading.local()
 _BEST_ENGINE: Dict[str, str] = {}
 
+# ---- per-host success/fail counters: blocked site ko jaldi pakadne ke liye ----
+_HOST_STATS: Dict[str, dict] = {}
+
+
+def reset_host_stats(url: str):
+    _HOST_STATS.pop(_root_host(urlparse(url).netloc), None)
+    EXTRACT_NOTE["v"] = ""
+    _XH_EMBED.update(tried=0, ok=0)
+
+
+def host_is_blocked(root: str) -> bool:
+    """Is run me ek bhi fetch success nahi hua aur 12+ fail -> site IP block kar rahi hai."""
+    st = _HOST_STATS.get(root)
+    return bool(st and st["ok"] == 0 and st["fail"] >= 12)
+
+
+def block_hint(url: str) -> str:
+    st = _HOST_STATS.get(_root_host(urlparse(url).netloc))
+    if st and st["ok"] == 0 and st["fail"] >= 3:
+        return ("\n🚫 Site is server ki IP ko BLOCK kar rahi hai (Cloudflare / bot protection).\n"
+                "Fix: 1) bot ko ghar ke PC/Indian IP par chalao (Render jaise datacenter IP aksar block hote hain), "
+                "ya 2) PROXY_URL env me residential proxy do, 3) pip install curl_cffi.\n")
+    return ""
+
+
+async def guarded_extract(v: str, s: str) -> Optional[dict]:
+    """extract_video_link + hard timeout + blocked-host par turant skip."""
+    if host_is_blocked(_root_host(urlparse(v).netloc)):
+        return None
+    try:
+        return await asyncio.wait_for(extract_video_link(v, source_page=s), timeout=40)
+    except asyncio.TimeoutError:
+        return None
+
 
 def _cffi_sess():
     s = getattr(_TL, "cffi", None)
@@ -480,18 +593,24 @@ def _cffi_sess():
 def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
     headers = make_headers(url, referer)
     proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    root = _root_host(urlparse(url).netloc)
+    st = _HOST_STATS.get(root)
+    degraded = bool(st and st["ok"] == 0 and st["fail"] >= 6)   # lagataar fail -> fast-fail mode
+    tmo = (5, 8) if degraded else (6, 15)
+
     engines = {}
     if cffi_requests:  # best against Cloudflare (real Chrome TLS fingerprint)
-        engines["curl_cffi"] = lambda: _cffi_sess().get(url, headers=headers, timeout=15, proxies=proxies)
-    engines["cloudscraper"] = lambda: scraper.get(url, headers=headers, timeout=15, proxies=proxies)
-    engines["requests"] = lambda: requests.get(url, headers=headers, timeout=15, proxies=proxies)
+        engines["curl_cffi"] = lambda: _cffi_sess().get(url, headers=headers, timeout=tmo[1] + 3, proxies=proxies)
+    engines["cloudscraper"] = lambda: scraper.get(url, headers=headers, timeout=tmo, proxies=proxies)
+    engines["requests"] = lambda: requests.get(url, headers=headers, timeout=tmo, proxies=proxies)
 
-    root = _root_host(urlparse(url).netloc)
     order = list(engines)
     pref = _BEST_ENGINE.get(root)
     if pref in engines:
         order.remove(pref)
         order.insert(0, pref)
+    if degraded:
+        order = order[:1]
 
     detail = []
     for name in order:
@@ -507,6 +626,7 @@ def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
                     continue
                 LAST_DETAIL[url] = ""
                 _BEST_ENGINE[root] = name
+                _HOST_STATS.setdefault(root, {"ok": 0, "fail": 0})["ok"] += 1
                 return r.text
             detail.append(f"{name}:{r.status_code}")
             logger.warning(f"fetch {url} -> HTTP {r.status_code} ({name})")
@@ -514,6 +634,7 @@ def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
             detail.append(f"{name}:error")
             logger.warning(f"fetch {url} error ({name}): {e}")
     LAST_DETAIL[url] = ", ".join(detail)
+    _HOST_STATS.setdefault(root, {"ok": 0, "fail": 0})["fail"] += 1
     return None
 
 
@@ -628,8 +749,8 @@ def _looks_like_single_video(url: str) -> bool:
     if path in ('', '/'):
         return False
     return bool(re.search(
-        r'/video\.|/video\d+|/videos?/[^/]+-\d+|/post/\d+|/watch/|/v/|/film/|'
-        r'/view_video|\.html?$', path))
+        r'/video\.|/video\d+|/videos?/[^/]+-\d+|/videos?/[^/]+-xh[A-Za-z0-9]+/?$|'
+        r'/post/\d+|/watch/|/v/|/film/|/view_video|\.html?$', path))
 
 
 async def build_page_urls(url: str, start: int, end: int) -> List[str]:
@@ -640,6 +761,9 @@ async def build_page_urls(url: str, start: int, end: int) -> List[str]:
         tmpl = (url + "&p={p}") if '?' in url else (base + "/{p}")
         return [url if p == 1 else tmpl.replace('{p}', str(p - 1))
                 for p in range(start, end + 1)]
+
+    if "xhamster" in host and '?' not in url:   # pages: /, /2, /3 ... (no probing needed)
+        return [url if p == 1 else f"{base}/{p}" for p in range(start, end + 1)]
 
     html1 = await fast_fetch(url)
     templates = []
@@ -940,7 +1064,7 @@ async def build_manual_rule(url: str, domain: str, rx_text: str) -> dict:
 
 async def extract_video_link(video_url: str, source_page: str = "") -> Optional[dict]:
     try:
-        text = await fast_fetch(video_url, referer=source_page or None)
+        text = await fetch(video_url, referer=source_page or None)
         if not text:
             return None
 
@@ -987,14 +1111,19 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
             if xhn_match: stream_link = xhn_match.group(1)
 
         elif "xhamster" in domain:
-            xh_link = xh_best_stream(text)
-            if xh_link:
-                stream_link = xh_link
-            else:
+            xh_link = xh_best_stream(text) or xh_from_initials(text)
+            if not xh_link:
                 xh_match = re.search(r'"m3u8":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
                            re.search(r'"mp4":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
                            re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text)
-                if xh_match: stream_link = xh_match.group(1).replace('\\/', '/')
+                if xh_match:
+                    cand = xh_match.group(1).replace('\\/', '/')
+                    if not JUNK.search(cand.lower()):
+                        xh_link = cand
+            if not xh_link:
+                xh_link = await xh_embed_try(video_url)
+            if xh_link:
+                stream_link = xh_link
 
         elif "joysporn" in domain:
             jp_match = re.search(r'<source\s+src=["\'](https?:[^\s"\']+?)["\']', text) or \
@@ -1096,6 +1225,9 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
         if not stream_link:
             stream_link = await generic_extract(text, video_url)
 
+        if not stream_link:
+            EXTRACT_NOTE["v"] = f"{video_url}\n{page_diag(text)}"
+
         if stream_link:
             final_link = process_tpl_link(stream_link) if ".m3u8" in stream_link else stream_link
 
@@ -1136,9 +1268,11 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
 # ==========================================================
 # MULTI-PAGE SCRAPING ENGINE (UPGRADED)
 # ==========================================================
-async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10) -> List[dict]:
+async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10,
+                                   progress=None) -> List[dict]:
     global LAST_REPORT
     _ensure_fast_executor()
+    reset_host_stats(url)
     rep = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0}
     LAST_REPORT = rep
 
@@ -1167,10 +1301,19 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
         return []
 
     semaphore = asyncio.Semaphore(SCR_CONCURRENCY)
+    total = len(url_to_source)
+    state = {"done": 0}
 
     async def sem_extract(v_url, src_p):
         async with semaphore:
-            return await extract_video_link(v_url, source_page=src_p)
+            r = await guarded_extract(v_url, src_p)
+        state["done"] += 1
+        if progress:
+            try:
+                await progress(state["done"], total)
+            except Exception:
+                pass
+        return r
 
     results = [r for r in await asyncio.gather(
         *[sem_extract(v, s) for v, s in url_to_source.items()]) if r]
@@ -1708,24 +1851,39 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /debug <listing_or_video_url>")
         return
     url = context.args[0]
+    reset_host_stats(url)
+    _t0 = time.time()
     html = await fetch(url)
+    _dt = time.time() - _t0
     if not html:
         await update.message.reply_text(
-            f"❌ Fetch failed. HTTP: {LAST_STATUS.get(url, '?')}\n"
+            f"❌ Fetch failed after {_dt:.1f}s. HTTP: {LAST_STATUS.get(url, '?')}\n"
             f"🔧 Engines: {LAST_DETAIL.get(url, '?')}\n"
             f"curl_cffi installed: {'YES' if cffi_requests else 'NO'} | "
             f"Proxy set: {'YES' if PROXY_URL else 'NO'}\n\n"
             "403/503 = Cloudflare/IP block | 404 = wrong URL | ? = timeout/DNS")
         return
 
-    lines = [f"✅ Fetched {len(html)} bytes", link_stats(html, url)]
+    lines = [f"✅ Fetched {len(html)} bytes in {_dt:.1f}s "
+             f"(engine: {_BEST_ENGINE.get(_root_host(urlparse(url).netloc), '?')} | "
+             f"curl_cffi: {'YES' if cffi_requests else 'NO'})",
+             link_stats(html, url)]
+    if _looks_like_single_video(url):
+        item = await extract_video_link(url, source_page=url)
+        lines.append(f"▶ Extract (this video page): {item['download_link'] if item else 'FAILED'}")
+        if not item:
+            lines.append(page_diag(html))
+        await update.message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+        return
     links = find_video_links(html, url)
     lines.append(f"🔗 Video-like links on page: {len(links)}")
     lines += links[:3]
     if links:
-        h = await fetch(links[0], referer=url)
-        s = await generic_extract(h, links[0]) if h else None
+        item = await extract_video_link(links[0], source_page=url)
+        s = item["download_link"] if item else None
         lines.append(f"▶ Extract test on 1st link: {s or 'FAILED'}")
+        if not item:
+            lines.append(note_hint())
     else:
         # single video page? test with the real extractor (xhamster HLS picker included)
         item = await extract_video_link(url, source_page=url)
@@ -2099,7 +2257,16 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
     status_msg = await update_or_query.message.reply_text(f"⚡ Scraping Pages {start_page} to {end_page}...")
 
     try:
-        results = await scrape_multi_pages_chunk(target_url, start_page=start_page, end_page=end_page)
+        last = {"t": 0.0}
+
+        async def progress(done, total):
+            if time.time() - last["t"] < 3:
+                return
+            last["t"] = time.time()
+            await status_msg.edit_text(f"⚡ Extracting {done}/{total} (Pages {start_page}-{end_page})...")
+
+        results = await scrape_multi_pages_chunk(target_url, start_page=start_page,
+                                                 end_page=end_page, progress=progress)
 
         if not results:
             r = LAST_REPORT
@@ -2108,7 +2275,8 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
                 f"📄 Pages OK: {r['pages_ok']}\n"
                 f"🚫 Failed: {r['pages_fail'][:3]}\n"
                 f"🔗 Links found: {r['links']}\n"
-                f"✅ Extracted: {r['extracted']}\n\n"
+                f"✅ Extracted: {r['extracted']}\n"
+                f"{block_hint(target_url)}{note_hint()}\n"
                 f"Detail ke liye: /debug {target_url}\nRaw HTML ke liye: /dump {target_url}"
             )
             return
@@ -2299,7 +2467,7 @@ async def fast_fetch(url: str, referer: Optional[str] = None) -> Optional[str]:
         return hit[1]
     page = await fetch(url, referer)
     if page:
-        if len(_FETCH_CACHE) > 300:
+        if len(_FETCH_CACHE) > 40:
             _FETCH_CACHE.clear()
         _FETCH_CACHE[url] = (time.time(), page)
     return page
@@ -2404,6 +2572,7 @@ def _scr_diag(html: str, page_url: str, links: List[str]) -> str:
 async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None):
     """Fast scraper: parallel pages + parallel extraction + cache + retry + self-heal."""
     _ensure_fast_executor()
+    reset_host_stats(url)
     domain = normalize_domain(url)
     rep = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0,
            "cached": 0, "healed": False, "diag": ""}
@@ -2454,10 +2623,11 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
                 rep["cached"] += 1
             else:
                 async with esem:
-                    r = await extract_video_link(v, source_page=s)
-                    if not r and not STOP_PROCESS.get(user_id):
+                    r = await guarded_extract(v, s)
+                    if (not r and not STOP_PROCESS.get(user_id)
+                            and not host_is_blocked(_root_host(urlparse(v).netloc))):
                         await asyncio.sleep(1)               # one quick retry
-                        r = await extract_video_link(v, source_page=s)
+                        r = await guarded_extract(v, s)
                 if r:
                     if len(_STREAM_CACHE) > 5000:
                         _STREAM_CACHE.clear()
@@ -2604,6 +2774,7 @@ async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
                f"🔗 Links: {rep['links']} | ✅ Extracted: {rep['extracted']}\n")
         if rep.get("diag"):
             msg += f"\n🔍 Diagnosis:\n{rep['diag']}\n"
+        msg += block_hint(url) + note_hint()
         msg += ("\n💡 Ye site JS se load hoti lagti hai. Browser DevTools -> Network -> XHR/Fetch me jo "
                 "videos-list API URL dikhe wo bhejo, ya /dump " + url + " ki HTML file bhejo.")
         await status.edit_text(msg[:4000], disable_web_page_preview=True)
