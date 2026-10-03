@@ -1803,7 +1803,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Full Web Player UI: Custom Video & Media Player interface in HTML.\n"
         "2. 4 Files Export: 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
         "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n\n"
-        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /stop, /stats, /userlist, /debug, /dump"
+        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /stop, /stats, /userlist, /debug, /dump"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2368,6 +2368,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❎ Sign in cancel ho gaya.")
             return
         await save_cookie_flow(update, pending_domain, text)
+        return
+
+    cf = context.user_data.get('cookie_flow')
+    if cf and user_id == ADMIN_ID:
+        await cookie_flow_step(update, context, cf, text)
         return
 
     url_match = re.search(r'(https?://[^\s]+)', text)
@@ -3281,6 +3286,228 @@ async def scr_spa_fallback(url: str, html: str, page_url: str, start: int, end: 
 # ==========================================================
 # MAIN ENTRYPOINT
 # ==========================================================
+# ==========================================================
+# /cookie <website>  ->  id + password maango, login karke cookies bhejo
+# ==========================================================
+_LOGIN_PATHS = ("/login", "/signin", "/user/login", "/account/login", "/login/", "/sign-in",
+                "/auth/login", "/users/login", "/accounts/login", "/member/login")
+
+
+def _attr(a: str, k: str) -> str:
+    mm = re.search(rf'\b{k}\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', a, re.I)
+    return _html.unescape((mm.group(1) or mm.group(2) or mm.group(3) or "")) if mm else ""
+
+
+def parse_forms(html: str) -> List[dict]:
+    forms = []
+    for fm in re.finditer(r'<form\b([^>]*)>(.*?)</form>', html, re.I | re.S):
+        attrs, body = fm.group(1), fm.group(2)
+        inputs = []
+        for im in re.finditer(r'<input\b([^>]*)>', body, re.I | re.S):
+            a = im.group(1)
+            inputs.append({"name": _attr(a, "name"),
+                           "type": (_attr(a, "type") or "text").lower(),
+                           "value": _attr(a, "value")})
+        forms.append({"action": _attr(attrs, "action"),
+                      "method": (_attr(attrs, "method") or "post").lower(),
+                      "inputs": inputs})
+    return forms
+
+
+def _login_form(html: str) -> Optional[dict]:
+    for f in parse_forms(html):
+        if any(i["type"] == "password" and i["name"] for i in f["inputs"]):
+            return f
+    return None
+
+
+def _cookie_dict(sess) -> dict:
+    try:
+        return dict(sess.cookies.get_dict())
+    except Exception:
+        try:
+            return {k: v for k, v in sess.cookies.items()}
+        except Exception:
+            return {}
+
+
+def cookie_login_sync(base: str, user: str, pwd: str) -> dict:
+    """Generic form login: login page dhundo -> form bharo (hidden/csrf fields ke saath) -> POST -> cookies."""
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    if cffi_requests:
+        sess = cffi_requests.Session(impersonate="chrome124")
+    else:
+        sess = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+    statuses: List[str] = []
+
+    def hdrs(ref=None):
+        h = make_headers(base + "/", ref)
+        h.pop("Cookie", None)
+        return h
+
+    def get(u, ref=None):
+        return sess.get(u, headers=hdrs(ref), timeout=20, proxies=proxies)
+
+    # 1) login page dhundo
+    cands: List[str] = []
+    try:
+        r0 = get(base + "/")
+        statuses.append(f"/:{r0.status_code}")
+        if r0.status_code == 200:
+            for m in re.finditer(r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', r0.text, re.I | re.S):
+                txt = re.sub(r'<[^>]+>', ' ', m.group(2))
+                if re.search(r'log\s*-?in|sign\s*-?in|login|signin', m.group(1) + " " + txt, re.I):
+                    u = urljoin(base + "/", m.group(1).replace('&amp;', '&')).split('#')[0]
+                    if u.startswith('http') and u not in cands:
+                        cands.append(u)
+    except Exception as e:
+        statuses.append(f"/:error({str(e)[:40]})")
+    for pth in _LOGIN_PATHS:
+        u = base + pth
+        if u not in cands:
+            cands.append(u)
+
+    page_url, page_html, form = None, None, None
+    for u in cands[:10]:
+        try:
+            r = get(u, base + "/")
+        except Exception as e:
+            statuses.append(f"{urlparse(u).path}:error")
+            continue
+        statuses.append(f"{urlparse(u).path or '/'}:{r.status_code}")
+        if r.status_code == 200:
+            f = _login_form(r.text)
+            if f:
+                page_url, page_html, form = u, r.text, f
+                break
+    if not form:
+        return {"ok": False, "error": "login form nahi mila", "statuses": statuses,
+                "cookies": _cookie_dict(sess)}
+
+    # 2) form bharo
+    pw_name = next(i["name"] for i in form["inputs"] if i["type"] == "password" and i["name"])
+    text_inputs = [i for i in form["inputs"] if i["type"] in ("text", "email", "tel") and i["name"]]
+    user_field = next((i for i in text_inputs
+                       if re.search(r'user|login|email|mail|name|id', i["name"], re.I)),
+                      text_inputs[0] if text_inputs else None)
+    if not user_field:
+        return {"ok": False, "error": "form me id/email field nahi mila", "statuses": statuses,
+                "cookies": _cookie_dict(sess)}
+    data = {}
+    for i in form["inputs"]:
+        n, t = i["name"], i["type"]
+        if not n or t in ("submit", "button", "image", "file", "reset"):
+            continue
+        if t == "checkbox":
+            if re.search(r'remember|keep|stay', n, re.I):
+                data[n] = i["value"] or "1"
+            continue
+        if t == "radio":
+            data.setdefault(n, i["value"])
+            continue
+        data[n] = i["value"]
+    data[user_field["name"]] = user
+    data[pw_name] = pwd
+
+    action = urljoin(page_url, form["action"]) if form["action"] else page_url
+    h = hdrs(page_url)
+    h["Origin"] = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+    before = set(_cookie_dict(sess))
+    try:
+        if form["method"] == "get":
+            r = sess.get(action, params=data, headers=h, timeout=25, proxies=proxies)
+        else:
+            r = sess.post(action, data=data, headers=h, timeout=25, proxies=proxies)
+    except Exception as e:
+        return {"ok": False, "error": f"submit error: {str(e)[:80]}", "statuses": statuses,
+                "cookies": _cookie_dict(sess)}
+    statuses.append(f"POST:{r.status_code}")
+    cookies = _cookie_dict(sess)
+    still_form = bool(_login_form(r.text or ""))
+    new_names = sorted(set(cookies) - before)
+    ok = r.status_code < 400 and not still_form
+    return {"ok": ok, "cookies": cookies, "new": new_names, "statuses": statuses,
+            "still_form": still_form, "final_url": str(getattr(r, "url", action))[:120],
+            "http": r.status_code}
+
+
+async def cookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cookie <website>  -> id + password poochta hai, login karke cookie string bhejta hai."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "🍪 /cookie <website>\n\nExample:\n/cookie example.com\n\n"
+            "Phir bot ID/email aur password maangega, login karke cookies bhej dega.\n"
+            "Cancel karne ke liye: cancel")
+        return
+    domain = normalize_domain(context.args[0])
+    if not DOMAIN_RE.match(domain):
+        await update.message.reply_text(f"❌ Invalid domain: {context.args[0]}")
+        return
+    context.user_data['cookie_flow'] = {"domain": domain, "step": "id"}
+    await update.message.reply_text(
+        f"🍪 {domain}\n👤 Apna ID / email bhejo (cancel likhne par band):")
+
+
+async def cookie_flow_step(update: Update, context: ContextTypes.DEFAULT_TYPE, cf: dict, text: str):
+    chat = update.effective_chat
+    if text.strip().lower() == "cancel":
+        context.user_data.pop('cookie_flow', None)
+        await chat.send_message("❎ Cookie login cancel ho gaya.")
+        return
+    try:
+        await update.message.delete()           # id/password wala message turant delete
+    except Exception:
+        pass
+    if cf["step"] == "id":
+        cf["user"] = text.strip()
+        cf["step"] = "pass"
+        await chat.send_message("🔒 Ab password bhejo (message turant delete ho jayega):")
+        return
+
+    context.user_data.pop('cookie_flow', None)
+    domain, user, pwd = cf["domain"], cf["user"], text.strip()
+    status = await chat.send_message(f"⏳ {domain} par login ho raha hai...")
+    try:
+        res = await asyncio.wait_for(
+            asyncio.to_thread(cookie_login_sync, f"https://{domain}", user, pwd), timeout=120)
+    except Exception as e:
+        await status.edit_text(f"❌ Login error: {str(e)[:200]}")
+        return
+
+    cookies = res.get("cookies") or {}
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    stat = ", ".join(res.get("statuses", []))
+
+    if res.get("error"):
+        hint = ""
+        if any(x.endswith(":403") or x.endswith(":503") for x in res.get("statuses", [])):
+            hint = ("\n🚫 403/503 = site tumhare server ki IP ko block kar rahi hai, isliye login page hi nahi khul raha.\n"
+                    "Fix: bot ko ghar ke PC/Indian IP par chalao ya PROXY_URL (residential) lagao.")
+        elif cookies:
+            hint = "\nℹ️ Site JS/AJAX login use karti ho sakti hai (form nahi hai)."
+        await status.edit_text(f"❌ {domain}: {res['error']}\n📡 {stat}{hint}")
+        return
+
+    head = ("✅ Login ho gaya lagta hai" if res.get("ok")
+            else "⚠️ Login confirm nahi hua (password galat ya JS/captcha login ho sakta hai)")
+    info = (f"{head}\n🌐 {domain}\n📡 {stat}\n🍪 Cookies: {len(cookies)}"
+            f"{' | naye: ' + ', '.join(res['new'][:6]) if res.get('new') else ''}")
+    if not cookie_str:
+        await status.edit_text(info + "\n\n❌ Koi cookie nahi mili.")
+        return
+    use = f"/login {domain} {cookie_str}"
+    if len(use) < 3500:
+        await status.edit_text(info + "\n\nBot me lagane ke liye ye bhejo:")
+        await chat.send_message(use, disable_web_page_preview=True)
+    else:
+        await status.edit_text(info + "\n\nCookie lambi hai, file me bhej raha hoon.")
+        buf = io.BytesIO(use.encode('utf-8'))
+        buf.name = f"cookie_{domain}.txt"
+        await chat.send_document(document=buf, caption=f"🍪 {domain} cookies (/login ke saath use karo)")
+
+
 async def _post_init(app):
     _ensure_fast_executor()
 
@@ -3309,6 +3536,7 @@ def main():
     app.add_handler(CommandHandler("removesite", removesite_command))
     app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("logout", logout_command))
+    app.add_handler(CommandHandler("cookie", cookie_command))
 
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
