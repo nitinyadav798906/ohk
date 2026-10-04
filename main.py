@@ -51,7 +51,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "1714266885"))
 BOT_OWNER_NAME = os.getenv("BOT_OWNER_NAME", "@Mascotchlowa")
 TELEGRAM_LINK = os.getenv("TELEGRAM_LINK", "https://t.me/Mascotchlowa")
 SKY_PASSWORD = os.getenv("SKY_PASSWORD", "7989")
-DB_FILE = "bot_data.db"
+DB_FILE = os.getenv("DB_FILE", "bot_data.db")
 PROXY_URL = os.getenv("PROXY_URL", "").strip()  # e.g. http://user:pass@host:port (optional)
 
 STOP_PROCESS: Dict[int, bool] = {}
@@ -107,8 +107,65 @@ def init_db():
             updated DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS api_logins (
+            domain TEXT PRIMARY KEY,
+            url TEXT,
+            payload TEXT,
+            updated DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS watches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            url TEXT,
+            minutes INTEGER,
+            last_run REAL,
+            baselined INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS watch_seen (
+            watch_id INTEGER,
+            page_url TEXT,
+            PRIMARY KEY (watch_id, page_url)
+        )
+    """)
     conn.commit()
     conn.close()
+
+def set_api_login(domain: str, url: str, payload: Optional[str]):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO api_logins (domain, url, payload) VALUES (?, ?, ?) "
+        "ON CONFLICT(domain) DO UPDATE SET url=excluded.url, payload=excluded.payload, updated=CURRENT_TIMESTAMP",
+        (domain, url, payload))
+    conn.commit()
+    conn.close()
+
+def get_api_login(domain: str):
+    """-> (api_url, payload_template_or_None) ya None. xhamster mirrors ke liye same path guess."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT url, payload FROM api_logins WHERE domain = ?", (domain,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0], row[1]
+    except Exception:
+        pass
+    if "xhamster" in domain or "xhaccess" in domain:
+        return f"https://{domain}/api/front/user/login", None
+    return None
 
 def is_user_allowed(user_id: int) -> bool:
     conn = sqlite3.connect(DB_FILE)
@@ -546,6 +603,7 @@ def clean_results(items: List[dict]):
         seen_pages.add(it["page_url"])
         seen_links.add(it["download_link"])
         out.append(it)
+    out = apply_filters(out)
     return out, len(items) - len(out)
 
 
@@ -675,6 +733,7 @@ def reset_host_stats(url: str):
     _HOST_STATS.pop(_root_host(urlparse(url).netloc), None)
     EXTRACT_NOTE["v"] = ""
     _XH_EMBED.update(tried=0, ok=0)
+    globals().get("_YTDLP_STATS", {}).pop(_root_host(urlparse(url).netloc), None)
 
 
 def host_is_blocked(root: str) -> bool:
@@ -1423,6 +1482,18 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
         if not stream_link:
             stream_link = await generic_extract(text, video_url)
 
+        if not stream_link:                      # packed JS / base64 ke andar chhupa link
+            extra = await asyncio.to_thread(deobfuscate_extra, text)
+            if extra:
+                stream_link = await generic_extract(extra, video_url, depth=2)
+
+        if not stream_link and ytdlp_allowed(video_url):     # yt-dlp fallback (hazaaron sites)
+            y = await ytdlp_try(video_url, source_page or None)
+            if y:
+                stream_link = y[1]
+                if y[0] and title in ("Video", ""):
+                    title = y[0]
+
         if not stream_link:
             EXTRACT_NOTE["v"] = f"{video_url}\n{page_diag(text)}"
 
@@ -1438,7 +1509,10 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
                 "type": file_type,
                 "page_url": video_url,
                 "source_page": source_page or video_url,
-                "download_link": final_link
+                "download_link": final_link,
+                "expires": stream_expiry(final_link),
+                "thumb": best_thumb(text, video_url),
+                "duration": best_duration(text)
             }
     except Exception as e:
         logger.error(f"Extraction Error for {video_url}: {e}")
@@ -1467,7 +1541,7 @@ async def download_video_ffmpeg(url: str, output_path: str) -> bool:
 # MULTI-PAGE SCRAPING ENGINE (UPGRADED)
 # ==========================================================
 async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int = 10,
-                                   progress=None) -> List[dict]:
+                                   progress=None, user_id: int = 0) -> List[dict]:
     global LAST_REPORT
     _ensure_fast_executor()
     reset_host_stats(url)
@@ -1498,13 +1572,16 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     if not url_to_source:
         return []
 
-    semaphore = asyncio.Semaphore(SCR_CONCURRENCY)
+    limiter = AdaptiveLimiter(SCR_CONCURRENCY)
     total = len(url_to_source)
     state = {"done": 0}
 
     async def sem_extract(v_url, src_p):
-        async with semaphore:
+        if user_id and STOP_PROCESS.get(user_id):
+            return None
+        async with limiter:
             r = await guarded_extract(v_url, src_p)
+            limiter.feedback(v_url, bool(r))
         state["done"] += 1
         if progress:
             try:
@@ -1516,476 +1593,748 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     results = [r for r in await asyncio.gather(
         *[sem_extract(v, s) for v, s in url_to_source.items()]) if r]
     results, dropped = clean_results(results)
+    results = await verify_results(results, rep)
     rep["dropped"] = dropped
     rep["extracted"] = len(results)
     return results
 
 # ==========================================================
-# HTML WEB APP GENERATOR
+# HTML WEB APP GENERATOR  (YouTube-style player: thumbnails, favorites, all formats)
 # ==========================================================
-def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web Player") -> str:
-    js_playlist = []
-    items_html = ""
+import hashlib
 
-    v_c = sum(1 for x in results if x.get('type') == 'VIDEO')
-    a_c = sum(1 for x in results if x.get('type') == 'AUDIO')
-    p_c = sum(1 for x in results if x.get('type') == 'PDF')
-    i_c = sum(1 for x in results if x.get('type') == 'IMAGE')
-    raw_lines = results
 
-    for idx, item in enumerate(results):
-        js_playlist.append({
-            "name": item['title'],
-            "url": item['download_link'],
-            "type": item['type'],
-            "poster": "https://images.unsplash.com/photo-1574375927938-d5a98e8ffe85?w=500&q=80"
-        })
+def best_thumb(text: str, page_url: str) -> str:
+    """Page se poster/thumbnail URL (og:image, twitter:image, <video poster>, JSON-LD)."""
+    head = text[:150000]
+    for rx in (r'<meta[^>]+(?:property|name)=["\']og:image(?::secure_url|:url)?["\'][^>]*content=["\']([^"\']+)',
+               r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']og:image(?::secure_url|:url)?["\']',
+               r'<meta[^>]+(?:property|name)=["\']twitter:image(?::src)?["\'][^>]*content=["\']([^"\']+)',
+               r'<video[^>]+poster=["\']([^"\']+)',
+               r'"thumbnailUrl"\s*:\s*\[?\s*"([^"]+)"'):
+        m = re.search(rx, head, re.I)
+        if m:
+            u = _html.unescape(m.group(1)).replace('\\/', '/').strip()
+            if u and not u.startswith('data:'):
+                return urljoin(page_url, u)
+    return ""
 
-        icon = "🎬"
-        if item['type'] == 'PDF': icon = "📄"
-        elif item['type'] == 'AUDIO': icon = "🎵"
-        elif item['type'] == 'IMAGE': icon = "🖼"
 
-        safe_title = _html.escape(item['title'])
-        items_html += f"""
-        <div class="list-item" id="item-{idx}" data-type="{item['type']}" onclick="openCinema({idx})">
-            <div class="item-icon-box">{icon}</div>
-            <div class="item-info">
-                <div class="item-title">{safe_title}</div>
-                <div class="item-meta">
-                    <span class="meta-tag tag-{item['type']}">{item['type']}</span>
-                    <span id="list-fav-{idx}" style="display:none; color:var(--red);">❤️ Fav</span>
-                </div>
-            </div>
-        </div>"""
+def _iso_duration(s: str) -> int:
+    m = re.match(r'^P(?:\d+D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$', (s or "").strip(), re.I)
+    if not m or not any(m.groups()):
+        return 0
+    h, mi, se = m.groups()
+    return int(h or 0) * 3600 + int(mi or 0) * 60 + int(float(se or 0))
 
-    # "</script>" ya "</" title me aaye to page na toote
-    playlist_json = json.dumps(js_playlist).replace("</", "<\\/")
-    safe_page_title = _html.escape(title)
 
-    login_html = ""
-    security_script = ""
-    if SKY_PASSWORD:
-        login_html = f"""
-        <div id="login-screen" style="display:flex;">
-            <div class="login-box">
-                <h3 style="margin-top:0;">Protected Access</h3>
-                <input type="password" id="passInput" placeholder="Enter Password">
-                <button onclick="checkPass()">Unlock Player</button>
-                <p id="errMsg" style="color:red; font-size:12px; margin-top:10px;"></p>
-            </div>
-        </div>"""
-    else:
-        security_script = "document.getElementById('app-wrapper').style.display = 'block';"
+def best_duration(text: str) -> int:
+    """Seconds me duration (og:video:duration / JSON-LD / "duration": N), warna 0."""
+    head = text[:200000]
+    cands = []
+    for m in re.finditer(r'<meta[^>]+(?:property|name|itemprop)=["\'](?:og:video:duration|video:duration|duration)["\']'
+                         r'[^>]*content=["\']([^"\']+)', head, re.I):
+        cands.append(m.group(1))
+    cands += re.findall(r'"duration"\s*:\s*"([^"]+)"', head)
+    cands += re.findall(r'"duration"\s*:\s*(\d{1,6})\b', head)
+    for c in cands:
+        c = c.strip()
+        sec = int(float(c)) if re.match(r'^\d+(?:\.\d+)?$', c) else _iso_duration(c)
+        if 1 <= sec <= 172800:
+            return sec
+    return 0
 
-    html_template = f"""<!DOCTYPE html>
-<html lang="en" data-theme="dark" data-color="blue">
+
+_PLAYER_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
 <head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-    <title>{safe_page_title}</title>
-    <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {{ --red: #ef4444; --green: #10b981; --orange: #f59e0b; }}
-        [data-theme="dark"] {{ --bg: #0f172a; --card-bg: #1e293b; --text: #f8fafc; --text-sec: #94a3b8; --border: #334155; --modal-bg: #000; }}
-        [data-theme="light"] {{ --bg: #f8fafc; --card-bg: #ffffff; --text: #1e293b; --text-sec: #64748b; --border: #e2e8f0; --modal-bg: #fff; }}
-
-        [data-color="blue"] {{ --primary: #3b82f6; }}
-        [data-color="red"] {{ --primary: #ef4444; }}
-        [data-color="green"] {{ --primary: #22c55e; }}
-        [data-color="purple"] {{ --primary: #a855f7; }}
-        [data-color="orange"] {{ --primary: #f97316; }}
-        [data-color="pink"] {{ --primary: #ec4899; }}
-        [data-color="cyan"] {{ --primary: #06b6d4; }}
-
-        body {{ font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding-bottom: 80px; transition: 0.3s; }}
-        * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
-        #app-wrapper {{ display: none; }}
-
-        #login-screen {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg); z-index: 9999; display: none; justify-content: center; align-items: center; }}
-        .login-box {{ background: var(--card-bg); padding: 25px; border-radius: 12px; width: 85%; max-width: 300px; border: 1px solid var(--border); text-align: center; }}
-        .login-box input {{ width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); outline: none; }}
-        .login-box button {{ width: 100%; padding: 12px; background: var(--primary); color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; }}
-
-        .header {{ background: var(--card-bg); padding: 15px; position: sticky; top: 0; z-index: 50; border-bottom: 1px solid var(--border); }}
-        .h-top {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }}
-        .h-title {{ margin: 0; font-size: 16px; font-weight: 700; color: var(--primary); }}
-        .right-actions {{ display: flex; align-items: center; gap: 12px; }}
-        .tg-link {{ color: white; background: var(--primary); text-decoration: none; font-size: 11px; font-weight: bold; padding: 5px 12px; border-radius: 20px; }}
-        .mode-btn {{ cursor: pointer; font-size: 18px; }}
-
-        .theme-row {{ display: flex; gap: 8px; overflow-x: auto; padding-bottom: 5px; }}
-        .t-dot {{ width: 22px; height: 22px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; transition: 0.2s; flex-shrink: 0; }}
-        .t-dot:hover {{ transform: scale(1.2); }}
-
-        .stats-container {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 15px; }}
-        .stat-card {{ background: var(--card-bg); padding: 10px 5px; border-radius: 8px; text-align: center; cursor: pointer; border: 1px solid var(--border); transition: 0.2s; }}
-        .stat-num {{ font-size: 14px; font-weight: 800; display: block; }}
-        .stat-label {{ font-size: 9px; font-weight: 600; text-transform: uppercase; margin-top: 2px; color: var(--text-sec); }}
-        .sc-fav {{ color: var(--red); border-color: var(--red); }}
-        .sc-vid {{ color: var(--primary); }}
-        .sc-aud {{ color: var(--orange); }}
-        .sc-pdf {{ color: var(--green); }}
-
-        .list-container {{ padding: 0 15px; }}
-        .search-box {{ display: flex; align-items: center; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; }}
-        .search-bar {{ width: 100%; padding: 12px; border: none; background: transparent; color: var(--text); outline: none; }}
-        .clear-search {{ padding: 0 12px; cursor: pointer; display: none; color: var(--text-sec); }}
-        .list-item {{ background: var(--card-bg); margin-bottom: 8px; border-radius: 8px; padding: 12px; display: flex; align-items: center; border: 1px solid var(--border); cursor: pointer; }}
-        .item-icon-box {{ width: 40px; height: 40px; background: rgba(100,100,100,0.1); border-radius: 8px; display: flex; justify-content: center; align-items: center; margin-right: 12px; font-size: 18px; }}
-
-        .item-info {{ flex-grow: 1; min-width: 0; }}
-        .item-title {{ font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }}
-        .item-meta {{ display: flex; align-items: center; gap: 8px; }}
-        .meta-tag {{ font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: bold; background: rgba(100,100,100,0.1); }}
-        .tag-VIDEO {{ color: var(--primary); }} .tag-PDF {{ color: var(--green); }} .tag-AUDIO {{ color: var(--orange); }}
-
-        .cinema-modal, .player-overlay {{ display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; z-index: 3000; }}
-        .player-overlay {{ z-index: 4000; background: black; flex-direction: column; }}
-
-        .bg-layer {{ position: absolute; top: 0; left: 0; width: 100%; height: 60%; background-size: cover; background-position: center; mask-image: linear-gradient(to bottom, black 20%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, black 20%, transparent 100%); opacity: 0.6; }}
-        .cinema-content {{ position: absolute; bottom: 0; width: 100%; height: 60%; padding: 20px; background: linear-gradient(to top, #000 20%, transparent); display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 15px; }}
-        .c-poster {{ width: 120px; height: 180px; border-radius: 8px; object-fit: cover; box-shadow: 0 5px 20px black; border: 1px solid rgba(255,255,255,0.2); }}
-        .c-title {{ font-size: 20px; font-weight: 800; color: white; text-align: center; margin: 0; }}
-        .action-btn {{ width: 100%; padding: 14px; border-radius: 8px; font-size: 15px; font-weight: 700; border: none; cursor: pointer; }}
-        .btn-main {{ background: var(--primary); color: white; }}
-        .btn-sub {{ background: rgba(255,255,255,0.15); color: white; border: 1px solid rgba(255,255,255,0.2); backdrop-filter: blur(5px); }}
-
-        .watermark {{ position: absolute; top: 15px; right: 60px; color: rgba(255,255,255,0.4); font-weight: 900; font-size: 16px; pointer-events: none; z-index: 55; text-shadow: 0 2px 5px black; }}
-        .red-bar-box {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 50; display: flex; justify-content: center; align-items: center; }}
-        .red-bar {{ width: 50px; height: 0%; background: linear-gradient(to top, rgba(255,0,0,0.8), transparent); box-shadow: 0 0 40px #ff0000; opacity: 0; transition: height 0.1s; border-radius: 20px; }}
-        .gesture-val {{ position: absolute; color: white; font-weight: bold; font-size: 30px; opacity: 0; z-index: 60; top: 40%; left: 50%; transform: translateX(-50%); text-shadow: 0 0 10px black; }}
-
-        .player-header {{ position: absolute; top: 0; width: 100%; padding: 15px; display: flex; justify-content: space-between; z-index: 50; background: linear-gradient(to bottom, rgba(0,0,0,0.8), transparent); align-items: center; }}
-        .player-mid {{ flex-grow: 1; position: relative; display: flex; align-items: center; justify-content: center; width: 100%; }}
-        .bottom-controls {{ background: #000; padding: 15px; display: flex; justify-content: center; gap: 8px; border-top: 1px solid #222; flex-wrap: wrap; z-index: 60; }}
-        .ctrl-btn {{ background: #222; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }}
-        .ctrl-next {{ background: var(--primary); color: white; }}
-
-        .settings-menu {{ position: absolute; top: 60px; right: 20px; background: rgba(20,20,20,0.95); border: 1px solid #333; border-radius: 8px; padding: 15px; z-index: 100; display: none; flex-direction: column; gap: 10px; width: 220px; backdrop-filter: blur(10px); }}
-        .sm-item {{ display: flex; flex-direction: column; gap: 5px; }}
-
-        .sm-label {{ font-size: 12px; color: #aaa; text-transform: uppercase; }}
-        .sm-select {{ background: #333; color: white; border: none; padding: 8px; border-radius: 4px; font-size: 14px; }}
-        .clean-btn {{ background: #ef4444; color: white; border: none; padding: 8px; width: 100%; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 5px; }}
-        .lock-icon {{ position: absolute; bottom: 30px; right: 20px; color: white; background: rgba(255,255,255,0.2); padding: 12px; border-radius: 50%; cursor: pointer; z-index: 65; font-size: 18px; }}
-
-        body.minimized .player-overlay {{ width: 320px !important; height: 180px !important; top: auto !important; left: auto !important; bottom: 20px !important; right: 20px !important; border-radius: 12px; border: 2px solid var(--primary); box-shadow: 0 10px 40px rgba(0,0,0,0.5); }}
-        body.minimized .bottom-controls, body.minimized .settings-menu, body.minimized .lock-icon, body.minimized .watermark, body.minimized .red-bar-box, body.minimized .gesture-val {{ display: none !important; }}
-        body.minimized .player-header {{ padding: 5px; }}
-        body.minimized #pTitle {{ font-size: 10px; white-space: nowrap; }}
-        body.minimized .player-mid {{ pointer-events: none; }}
-
-        .pdf-frame {{ width: 100%; height: 100%; border: none; background: white; }}
-        .img-view {{ width: 100%; height: 100%; object-fit: contain; }}
-        .footer {{ text-align: center; padding: 20px; color: var(--text-sec); font-size: 11px; }}
-        #toast {{ position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: white; padding: 8px 16px; border-radius: 20px; font-size: 12px; z-index: 5000; display: none; }}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0f0f0f">
+<title>__TITLE__</title>
+<style>
+:root{--red:#f00;--bg:#0f0f0f;--bg2:#272727;--tx:#f1f1f1;--tx2:#aaa;--line:#303030;--chip:#272727;--chipA:#f1f1f1;--chipAt:#0f0f0f;--hh:56px}
+[data-theme=light]{--bg:#fff;--bg2:#f2f2f2;--tx:#0f0f0f;--tx2:#606060;--line:#e5e5e5;--chip:#f2f2f2;--chipA:#0f0f0f;--chipAt:#fff}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--tx);font-family:Roboto,"Segoe UI",Arial,sans-serif}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+[hidden]{display:none!important}
+a{color:inherit}
+/* ---------- lock ---------- */
+#lock{position:fixed;inset:0;z-index:9999;background:var(--bg);display:flex;align-items:center;justify-content:center}
+.lbox{width:88%;max-width:320px;background:var(--bg2);border-radius:16px;padding:26px;text-align:center}
+.lbox h3{margin:10px 0 16px}
+.lbox input{width:100%;padding:12px 14px;border-radius:24px;border:1px solid var(--line);background:var(--bg);color:var(--tx);outline:0;margin-bottom:12px;font-size:15px}
+.lbox button{width:100%;padding:12px;border-radius:24px;background:var(--red);color:#fff;font-weight:600}
+#lerr{color:#ff5252;font-size:12px;min-height:16px;margin-top:8px}
+.lg{display:inline-flex;width:32px;height:22px;border-radius:7px;background:var(--red);align-items:center;justify-content:center}
+.lg svg{width:14px;height:14px}
+/* ---------- header ---------- */
+.top{position:sticky;top:0;z-index:60;height:var(--hh);display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--bg);border-bottom:1px solid var(--line)}
+.logo{display:flex;align-items:center;gap:8px;text-decoration:none;font-weight:700;font-size:17px;min-width:0}
+.logo b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34vw}
+.search{flex:1;max-width:640px;margin:0 auto;display:flex;position:relative}
+.search input{width:100%;height:38px;border-radius:20px;border:1px solid var(--line);background:var(--bg);color:var(--tx);padding:0 38px 0 16px;outline:0;font-size:15px}
+.search input:focus{border-color:#3ea6ff}
+#qclr{position:absolute;right:10px;top:8px;color:var(--tx2)}
+.tools{display:flex;gap:6px;align-items:center}
+.tools button,.tools a{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;text-decoration:none;font-size:18px}
+.tools button:hover,.tools a:hover{background:var(--bg2)}
+/* ---------- chips ---------- */
+.chips{position:sticky;top:var(--hh);z-index:50;background:var(--bg);display:flex;gap:10px;padding:10px 14px;overflow-x:auto;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;padding:7px 13px;border-radius:9px;background:var(--chip);font-size:14px;font-weight:500;white-space:nowrap}
+.chip.on{background:var(--chipA);color:var(--chipAt)}
+/* ---------- grid ---------- */
+.bar{display:flex;justify-content:space-between;align-items:center;padding:4px 16px 8px;color:var(--tx2);font-size:13px}
+.bar select{background:var(--chip);color:var(--tx);border:0;border-radius:8px;padding:6px 8px;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:22px 16px;padding:8px 16px 40px}
+.card{cursor:pointer;min-width:0;outline:0}
+.thumb{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:linear-gradient(135deg,var(--g1,#333),var(--g2,#111))}
+.thumb .tImg,.thumb .tVid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+.thumb .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:44px;font-weight:700;color:rgba(255,255,255,.55)}
+.thumb.has .ph{display:none}
+.dur{position:absolute;right:6px;bottom:8px;background:rgba(0,0,0,.8);color:#fff;font-size:12px;font-weight:600;padding:2px 5px;border-radius:5px}
+.fmt{position:absolute;left:6px;top:6px;background:rgba(0,0,0,.65);color:#fff;font-size:10px;font-weight:700;padding:2px 6px;border-radius:5px;letter-spacing:.4px}
+.fv{position:absolute;right:6px;top:6px;width:32px;height:32px;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:17px;display:flex;align-items:center;justify-content:center;opacity:0;transition:.15s}
+.fv.on{opacity:1;color:#ff4d6d}
+.card:hover .fv,.card:focus .fv{opacity:1}
+@media(hover:none){.fv{opacity:1}}
+.prog{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,.3)}
+.prog i{display:block;height:100%;background:var(--red)}
+.meta{display:flex;gap:12px;padding:12px 2px 0}
+.av{flex:none;width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:15px}
+.tx{flex:1;min-width:0}
+.ttl{margin:0;font-size:15px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.sub{color:var(--tx2);font-size:13px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.more{flex:none;width:32px;height:32px;border-radius:50%;font-size:18px;color:var(--tx2)}
+.more:hover{background:var(--bg2)}
+.empty{text-align:center;color:var(--tx2);padding:70px 20px}
+.foot{text-align:center;color:var(--tx2);font-size:12px;padding:10px 0 40px}
+@media(max-width:600px){.grid{grid-template-columns:1fr;gap:18px;padding:0 0 40px}.thumb{border-radius:0}.meta{padding:10px 12px 0}.bar{padding:4px 12px 8px}.logo b{display:none}}
+/* ---------- watch ---------- */
+.wl{display:grid;grid-template-columns:minmax(0,1fr) 400px;gap:24px;padding:20px 24px 40px;max-width:1800px;margin:0 auto}
+.theater .wl{grid-template-columns:1fr}
+.theater .player{border-radius:0;max-height:80vh}
+.theater .wmain{margin:0 -24px}
+.theater .wmain>*:not(.player){margin-left:24px;margin-right:24px}
+.player{position:relative;background:#000;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);border-radius:12px;overflow:hidden;user-select:none}
+.player video,.player #imgv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+.player:fullscreen{max-height:none;border-radius:0}
+.aud{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:90px;color:#555}
+.ov{position:absolute;inset:0 0 54px 0;z-index:3}
+.big{position:absolute;left:50%;top:50%;width:68px;height:68px;margin:-34px;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;font-size:30px;display:flex;align-items:center;justify-content:center;opacity:0;transition:.2s;pointer-events:none}
+.paused .big{opacity:1}
+.spin{position:absolute;left:50%;top:50%;width:46px;height:46px;margin:-23px;border:4px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp 1s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.rip{position:absolute;top:50%;margin-top:-34px;padding:14px 18px;border-radius:40px;background:rgba(0,0,0,.6);color:#fff;font-weight:600;opacity:0;transition:.25s;pointer-events:none}
+.rip.l{left:10%}.rip.r{right:10%}.rip.on{opacity:1}
+.err{position:absolute;inset:0;background:rgba(0,0,0,.88);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:18px;text-align:center;font-size:14px;z-index:5}
+.err .eb{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.err a,.err button{background:#fff;color:#000;padding:8px 14px;border-radius:18px;font-weight:600;font-size:13px;text-decoration:none}
+.ctl{position:absolute;left:0;right:0;bottom:0;z-index:4;padding:0 12px 6px;background:linear-gradient(transparent,rgba(0,0,0,.85));opacity:0;transition:opacity .2s;color:#fff}
+.player.show .ctl,.player.paused .ctl{opacity:1}
+.player:not(.show):not(.paused){cursor:none}
+.seek{position:relative;height:18px;cursor:pointer;touch-action:none;display:flex;align-items:center}
+.seek:before{content:"";position:absolute;left:0;right:0;height:4px;background:rgba(255,255,255,.3);border-radius:2px;transition:height .1s}
+.seek:hover:before{height:6px}
+.buf,.pro{position:absolute;left:0;height:4px;border-radius:2px;width:0;pointer-events:none}
+.seek:hover .buf,.seek:hover .pro{height:6px}
+.buf{background:rgba(255,255,255,.45)}.pro{background:var(--red)}
+.knob{position:absolute;left:0;width:14px;height:14px;margin-left:-7px;border-radius:50%;background:var(--red);transform:scale(0);transition:transform .1s;pointer-events:none}
+.seek:hover .knob,.seek.drag .knob{transform:scale(1)}
+.tip{position:absolute;bottom:22px;transform:translateX(-50%);background:rgba(0,0,0,.85);padding:2px 6px;border-radius:4px;font-size:12px;display:none;pointer-events:none}
+.seek:hover .tip{display:block}
+.crow{display:flex;align-items:center;gap:2px;font-size:13px}
+.crow button{width:38px;height:38px;border-radius:50%;font-size:17px;color:#fff;display:flex;align-items:center;justify-content:center}
+.crow button:hover{background:rgba(255,255,255,.15)}
+.crow .t{padding:0 8px;white-space:nowrap}
+.sp{flex:1}
+.crow .tx2{width:auto;padding:0 10px;border-radius:18px;font-size:13px;font-weight:600}
+#vol{width:70px;accent-color:#fff}
+@media(max-width:600px){#vol{display:none}}
+.menu{position:absolute;right:10px;bottom:62px;background:rgba(28,28,28,.96);border-radius:12px;padding:6px 0;min-width:130px;max-height:60%;overflow:auto}
+.menu button{display:block;width:100%;text-align:left;padding:9px 18px;color:#fff;font-size:14px}
+.menu button:hover{background:rgba(255,255,255,.12)}
+.menu button.on{font-weight:700;color:#3ea6ff}
+#wt{font-size:20px;line-height:1.35;margin:14px 0 8px;font-weight:700;word-break:break-word}
+.acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.act{display:inline-flex;align-items:center;gap:6px;padding:9px 15px;border-radius:20px;background:var(--bg2);font-size:14px;font-weight:600;text-decoration:none}
+.act:hover{filter:brightness(1.2)}
+.act.on{background:var(--chipA);color:var(--chipAt)}
+.desc{background:var(--bg2);border-radius:12px;padding:12px 14px;font-size:14px;line-height:1.6;color:var(--tx2);word-break:break-all}
+.desc b{color:var(--tx)}
+.ah{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;font-size:15px}
+.ah label{font-size:13px;color:var(--tx2);display:flex;gap:6px;align-items:center}
+.up{display:flex;gap:10px;margin-bottom:12px;cursor:pointer}
+.up .thumb{width:168px;flex:none;border-radius:8px}
+.up .tx .ttl{font-size:14px}
+.up.cur .ttl{color:#3ea6ff}
+@media(max-width:1000px){.wl{grid-template-columns:1fr;padding:0 0 40px;gap:14px}.player{position:sticky;top:var(--hh);z-index:40;border-radius:0;max-height:none}.wmain>*:not(.player){margin-left:14px;margin-right:14px}.wside{padding:0 14px}.theater .wmain{margin:0}.theater .wmain>*:not(.player){margin-left:14px;margin-right:14px}}
+/* ---------- popup / toast ---------- */
+.pop{position:fixed;z-index:200;background:var(--bg2);border-radius:12px;padding:6px 0;min-width:190px;box-shadow:0 6px 30px rgba(0,0,0,.5)}
+.pop button,.pop a{display:block;width:100%;text-align:left;padding:10px 16px;font-size:14px;text-decoration:none}
+.pop button:hover,.pop a:hover{background:rgba(128,128,128,.25)}
+#toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#323232;color:#fff;padding:10px 18px;border-radius:8px;font-size:14px;z-index:300;opacity:0;pointer-events:none;transition:.25s}
+#toast.on{opacity:1}
+</style>
 </head>
 <body>
-    {login_html}
+<div id="lock" hidden><div class="lbox"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><h3>Protected</h3><input id="pw" type="password" placeholder="Password" autocomplete="off"><button id="pwb">Unlock</button><div id="lerr"></div></div></div>
+<div id="app" hidden>
+<header class="top">
+  <a class="logo" href="#/"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><b id="siteT"></b></a>
+  <div class="search"><input id="q" type="search" placeholder="Search" autocomplete="off"><button id="qclr" hidden>&#10005;</button></div>
+  <div class="tools"><button id="themeB" title="Theme">&#127763;</button><a id="tgB" target="_blank" rel="noopener" title="Telegram">&#9992;</a></div>
+</header>
+<nav class="chips" id="chips"></nav>
+<main id="home">
+  <div class="bar"><span id="count"></span><select id="sort"><option value="def">Default</option><option value="az">A &rarr; Z</option><option value="za">Z &rarr; A</option><option value="long">Longest</option><option value="short">Shortest</option></select></div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" hidden></div>
+  <div class="foot" id="foot"></div>
+</main>
+<section id="watch" hidden>
+ <div class="wl">
+  <div class="wmain">
+   <div class="player paused" id="pl">
+     <video id="v" playsinline preload="auto"></video>
+     <img id="imgv" hidden alt="">
+     <div class="aud" id="aud" hidden>&#9835;</div>
+     <div class="ov" id="ov">
+       <div class="spin" id="spin" hidden></div>
+       <div class="rip l" id="ripL">&#9194; 10s</div><div class="rip r" id="ripR">10s &#9193;</div>
+       <div class="big" id="big">&#9654;</div>
+     </div>
+     <div class="err" id="err" hidden></div>
+     <div class="ctl" id="ctl">
+       <div class="seek" id="seek"><div class="buf" id="buf"></div><div class="pro" id="pro"></div><div class="knob" id="knob"></div><div class="tip" id="tip">0:00</div></div>
+       <div class="crow">
+         <button id="bPlay" title="Play (k)">&#9654;</button><button id="bNext" title="Next (n)">&#9197;</button>
+         <button id="bVol" title="Mute (m)">&#128266;</button><input id="vol" type="range" min="0" max="1" step="0.05" value="1">
+         <span class="t" id="tm">0:00 / 0:00</span><span class="sp"></span>
+         <button class="tx2" id="bSpd" title="Speed">1x</button><button class="tx2" id="bQ" title="Quality" hidden>Auto</button>
+         <button id="bPip" title="Picture in picture">&#10064;</button><button id="bTh" title="Theater (t)">&#9645;</button><button id="bFs" title="Fullscreen (f)">&#9974;</button>
+       </div>
+       <div class="menu" id="menu" hidden></div>
+     </div>
+   </div>
+   <h1 id="wt"></h1>
+   <div class="acts" id="acts"></div>
+   <div class="desc" id="desc"></div>
+  </div>
+  <aside class="wside"><div class="ah"><b>Up next</b><label><input type="checkbox" id="auto" checked> Autoplay</label></div><div id="upn"></div></aside>
+ </div>
+</section>
+</div>
+<div id="toast"></div>
+<script>
+(function(){
+"use strict";
+var DATA=__DATA__, CFG=__CFG__;
+var HLS_URL="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js",
+    DASH_URL="https://cdn.jsdelivr.net/npm/dashjs@4/dist/dash.all.min.js",
+    TS_URL="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.js";
+function $(s,r){return (r||document).querySelector(s)}
+function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
+var LS={get:function(k,d){try{var v=localStorage.getItem(k);return v===null?d:JSON.parse(v)}catch(e){return d}},
+        set:function(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
+var SS={get:function(k){try{return sessionStorage.getItem(k)}catch(e){return null}},set:function(k,v){try{sessionStorage.setItem(k,v)}catch(e){}}};
 
-    <div id="app-wrapper">
-        <div class="header">
-            <div class="h-top">
-                <div class="h-title">{safe_page_title}</div>
-                <div class="right-actions">
-                    <a href="{TELEGRAM_LINK}" target="_blank" class="tg-link">✈ Join TG</a>
-                    <span class="mode-btn" onclick="toggleMode()">🌓</span>
-                </div>
-            </div>
-            <div class="theme-row">
-                <div class="t-dot" style="background:#3b82f6" onclick="setTheme('blue')"></div>
-                <div class="t-dot" style="background:#ef4444" onclick="setTheme('red')"></div>
-                <div class="t-dot" style="background:#22c55e" onclick="setTheme('green')"></div>
-                <div class="t-dot" style="background:#a855f7" onclick="setTheme('purple')"></div>
-                <div class="t-dot" style="background:#f97316" onclick="setTheme('orange')"></div>
-                <div class="t-dot" style="background:#ec4899" onclick="setTheme('pink')"></div>
-                <div class="t-dot" style="background:#06b6d4" onclick="setTheme('cyan')"></div>
-            </div>
-        </div>
+/* ---------- sha256 (password gate, secure-context nahi chahiye) ---------- */
+function sha256(ascii){
+  function rr(v,a){return (v>>>a)|(v<<(32-a))}
+  var mp=Math.pow,mw=mp(2,32),i,j,result="",words=[],abl=ascii.length*8;
+  var hash=sha256.h=sha256.h||[],k=sha256.k=sha256.k||[],pc=k.length,ic={};
+  for(var c=2;pc<64;c++){if(!ic[c]){for(i=0;i<313;i+=c)ic[i]=c;hash[pc]=(mp(c,.5)*mw)|0;k[pc++]=(mp(c,1/3)*mw)|0}}
+  ascii+="\x80";while(ascii.length%64-56)ascii+="\x00";
+  for(i=0;i<ascii.length;i++){j=ascii.charCodeAt(i);if(j>>8)return"";words[i>>2]|=j<<((3-i)%4)*8}
+  words[words.length]=((abl/mw)|0);words[words.length]=abl;
+  for(j=0;j<words.length;){
+    var w=words.slice(j,j+=16),old=hash;hash=hash.slice(0,8);
+    for(i=0;i<64;i++){
+      var w15=w[i-15],w2=w[i-2],a=hash[0],e=hash[4];
+      var t1=hash[7]+(rr(e,6)^rr(e,11)^rr(e,25))+((e&hash[5])^((~e)&hash[6]))+k[i]+(w[i]=(i<16)?w[i]:(w[i-16]+(rr(w15,7)^rr(w15,18)^(w15>>>3))+w[i-7]+(rr(w2,17)^rr(w2,19)^(w2>>>10)))|0);
+      var t2=(rr(a,2)^rr(a,13)^rr(a,22))+((a&hash[1])^(a&hash[2])^(hash[1]&hash[2]));
+      hash=[(t1+t2)|0].concat(hash);hash[4]=(hash[4]+t1)|0;
+    }
+    for(i=0;i<8;i++)hash[i]=(hash[i]+old[i])|0;
+  }
+  for(i=0;i<8;i++)for(j=3;j+1;j--){var b=(hash[i]>>(j*8))&255;result+=((b<16)?0:"")+b.toString(16)}
+  return result;
+}
+function hashPw(p){return sha256(unescape(encodeURIComponent(p)))}
 
-        <div class="stats-container">
-            <div class="stat-card" onclick="filterList('all')"><span class="stat-num">{len(raw_lines)}</span><span class="stat-label">All</span></div>
-            <div class="stat-card sc-fav" onclick="filterList('FAV')"><span class="stat-num" id="favCount">-</span><span class="stat-label">❤️ Favs</span></div>
-            <div class="stat-card sc-vid" onclick="filterList('VIDEO')"><span class="stat-num">{v_c}</span><span class="stat-label">Video</span></div>
-            <div class="stat-card sc-aud" onclick="filterList('AUDIO')"><span class="stat-num">{a_c}</span><span class="stat-label">Audio</span></div>
-            <div class="stat-card" onclick="filterList('PDF')"><span class="stat-num" style="color:var(--green)">{p_c}</span><span class="stat-label">PDF</span></div>
-            <div class="stat-card" onclick="filterList('IMAGE')"><span class="stat-num" style="color:var(--orange)">{i_c}</span><span class="stat-label">Img</span></div>
-        </div>
+/* ---------- helpers ---------- */
+function fmtTime(s){s=Math.max(0,Math.floor(s||0));var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return (h?h+":"+(m<10?"0":""):"")+m+":"+(x<10?"0":"")+x}
+function domainOf(u){try{return new URL(u).hostname.replace(/^www\./,"")}catch(e){return ""}}
+function hnum(s){var h=0;for(var i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))|0;return Math.abs(h)}
+function grad(t){var h=hnum(t||"x")%360;return ["hsl("+h+",55%,38%)","hsl("+((h+45)%360)+",60%,20%)"]}
+function pathOf(u){return u.split("#")[0].split("?")[0].toLowerCase()}
+function extOf(u){var m=pathOf(u).match(/\.([a-z0-9]{2,5})$/);return m?m[1]:""}
+var AUDIO_EXT=["mp3","m4a","aac","wav","ogg","oga","opus","flac","wma"];
+function fmtOf(it){
+  var u=it.u.toLowerCase();
+  if(u.indexOf(".m3u8")>-1)return "HLS";
+  var e=extOf(u);
+  if(e==="mpd")return "DASH";
+  if(e==="m4v")return "MP4";
+  if(e)return e.toUpperCase();
+  return it.k||"VIDEO";
+}
+function isAudio(it){return it.k==="AUDIO"||AUDIO_EXT.indexOf(extOf(it.u))>-1}
+function engineOf(it){
+  var u=it.u.toLowerCase(),e=extOf(u);
+  if(u.indexOf(".m3u8")>-1)return "hls";
+  if(e==="mpd")return "dash";
+  if(e==="ts"||e==="flv"||e==="m2ts")return "mpegts";
+  return "native";
+}
+var _sc={};
+function loadScript(u){
+  if(_sc[u])return _sc[u];
+  _sc[u]=new Promise(function(ok,no){var s=document.createElement("script");s.src=u;s.async=true;s.onload=ok;s.onerror=function(){delete _sc[u];no(new Error("script load fail"))};document.head.appendChild(s)});
+  return _sc[u];
+}
+var toastT;
+function toast(m){var t=$("#toast");t.textContent=m;t.className="on";clearTimeout(toastT);toastT=setTimeout(function(){t.className=""},2200)}
+function copy(t){
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){toast("Link copied")},function(){fb()})}else fb();
+  function fb(){var a=document.createElement("textarea");a.value=t;document.body.appendChild(a);a.select();try{document.execCommand("copy");toast("Link copied")}catch(e){toast("Copy fail")}a.remove()}
+}
+function extLinks(u){
+  var enc=encodeURIComponent(u),ua=navigator.userAgent||"",ios=/iPhone|iPad|iPod/.test(ua),and=/Android/.test(ua),a=[];
+  a.push({n:"VLC",h:ios?"vlc-x-callback://x-callback-url/stream?url="+enc:(and?"intent:"+u+"#Intent;package=org.videolan.vlc;type=video/*;end":"vlc://"+u)});
+  if(and)a.push({n:"MX Player",h:"intent:"+u+"#Intent;package=com.mxtech.videoplayer.ad;type=video/*;end"});
+  a.push({n:"Open link",h:u});
+  return a;
+}
 
-        <div class="list-container">
-            <div class="search-box">
-                <input type="text" class="search-bar" id="searchInput" placeholder="Search..." onkeyup="searchList()">
-                <span class="clear-search" onclick="clearSearch()">✕</span>
-            </div>
-            <div id="playlistContainer">{items_html}</div>
-            <div class="footer">Credits: {BOT_OWNER_NAME}</div>
-        </div>
-    </div>
+/* ---------- state ---------- */
+var FAV=LS.get("ytb_fav",{}),LATER=LS.get("ytb_later",{}),HIST=LS.get("ytb_hist",{});
+var ALL=DATA.slice(),BYURL={},DUR={},THUMBS={};
+function slim(it){return {t:it.t,u:it.u,k:it.k,p:it.p,th:it.th,d:it.d}}
+ALL.forEach(function(it){BYURL[it.u]=it});
+[FAV,LATER].forEach(function(m){Object.keys(m).forEach(function(u){if(!BYURL[u]&&m[u]&&m[u].u){var o=m[u];o._x=1;BYURL[u]=o;ALL.push(o)}})});
+Object.keys(HIST).forEach(function(u){var h=HIST[u];if(!BYURL[u]&&h&&h.it&&h.it.u){h.it._x=1;BYURL[u]=h.it;ALL.push(h.it)}});
+var VIEW={chip:"all",q:"",sort:"def"},LIST=[],CUR=null;
+function saveLists(){LS.set("ytb_fav",FAV);LS.set("ytb_later",LATER)}
+function toggleFav(it){if(FAV[it.u]){delete FAV[it.u];toast("Removed from Favorites")}else{FAV[it.u]=slim(it);toast("Added to Favorites \u2665")}saveLists();updChips()}
+function toggleLater(it){if(LATER[it.u]){delete LATER[it.u];toast("Removed from Watch later")}else{LATER[it.u]=slim(it);toast("Saved to Watch later")}saveLists();updChips()}
+function saveHist(it,pos,dur){
+  HIST[it.u]={ts:Date.now(),pos:pos,dur:dur,it:slim(it)};
+  var ks=Object.keys(HIST);if(ks.length>300){ks.sort(function(a,b){return HIST[a].ts-HIST[b].ts});for(var i=0;i<ks.length-300;i++)delete HIST[ks[i]]}
+  LS.set("ytb_hist",HIST);
+}
 
-    <div id="cinemaModal" class="cinema-modal">
-        <div onclick="closeCinema()" style="position:absolute; top:20px; left:20px; color:white; font-size:24px; z-index:60; cursor:pointer;">✕</div>
-        <div class="bg-layer" id="bgLayer"></div>
-        <div class="cinema-content">
-            <img src="" class="c-poster" id="cPoster">
-            <h1 class="c-title" id="cTitle">Title</h1>
-            <div style="display:flex; gap:10px; font-size:12px; opacity:0.8;">
-                <span style="background:rgba(255,255,255,0.2); padding:2px 6px; border-radius:4px;">HD</span>
-                <span id="cType">VIDEO</span>
-            </div>
-            <div style="width:100%; display:flex; flex-direction:column; gap:10px;">
-                <button class="action-btn btn-main" onclick="startPlayer()">▶ Watch Now</button>
-                <button class="action-btn btn-sub" onclick="toggleFav('favBtn')" id="favBtn">❤️ Add to Favorites</button>
-            </div>
-        </div>
-    </div>
+/* ---------- thumbnails ---------- */
+var thumbQ=[],thumbRun=0,liveVid=0;
+function queueThumb(fn){thumbQ.push(fn);pump()}
+function pump(){while(thumbRun<3&&thumbQ.length){var f=thumbQ.shift();thumbRun++;f().then(function(){thumbRun--;pump()},function(){thumbRun--;pump()})}}
+function setThumb(box,node){box.insertBefore(node,box.firstChild);box.classList.add("has")}
+function setDur(it,sec,box){
+  if(!isFinite(sec)||sec<=0)return;DUR[it.u]=sec;if(!it.d)it.d=sec;
+  var d=box&&box.querySelector(".dur");if(d){d.textContent=fmtTime(sec);d.hidden=false}
+}
+function fillThumb(it,box){
+  if(THUMBS[it.u]){var im=new Image();im.className="tImg";im.src=THUMBS[it.u];setThumb(box,im);return}
+  if(it.k==="IMAGE"){var i2=new Image();i2.className="tImg";i2.referrerPolicy="no-referrer";i2.onload=function(){setThumb(box,i2)};i2.src=it.u;return}
+  if(isAudio(it)||it.k==="PDF"){return}
+  if(it.th){
+    var img=new Image();img.className="tImg";img.referrerPolicy="no-referrer";img.decoding="async";
+    img.onload=function(){setThumb(box,img)};img.onerror=function(){frameThumb(it,box)};img.src=it.th;
+  }else frameThumb(it,box);
+}
+function frameThumb(it,box){
+  var eng=engineOf(it);
+  if(eng!=="native"&&eng!=="hls")return;
+  queueThumb(function(){return new Promise(function(res){
+    var v=document.createElement("video"),done=false,h=null,cors=true,timer,tries=0;
+    v.muted=true;v.setAttribute("playsinline","");v.preload="metadata";v.className="tVid";
+    function cleanup(){try{if(h){h.destroy();h=null}}catch(e){}try{v.removeAttribute("src");v.load()}catch(e){}}
+    function finish(ok,keep){
+      if(done)return;done=true;clearTimeout(timer);
+      if(ok&&keep){setThumb(box,v);liveVid++}else cleanup();
+      res();
+    }
+    function capture(){
+      try{
+        var w=v.videoWidth,hh=v.videoHeight;if(!w||!hh)return false;
+        var c=document.createElement("canvas");c.width=320;c.height=Math.round(320*hh/w);
+        c.getContext("2d").drawImage(v,0,0,c.width,c.height);
+        var url=c.toDataURL("image/jpeg",.7);THUMBS[it.u]=url;
+        var im=new Image();im.className="tImg";im.src=url;setThumb(box,im);return true;
+      }catch(e){return false}
+    }
+    function ready(){
+      if(done)return;
+      if(capture()){finish(true,false);return}
+      if(eng==="native"&&liveVid<40){finish(true,true)}else finish(false,false);
+    }
+    v.addEventListener("loadedmetadata",function(){
+      if(isFinite(v.duration)&&v.duration>0){setDur(it,v.duration,box);
+        try{v.currentTime=Math.min(Math.max(v.duration*.12,1),20)}catch(e){}}
+      setTimeout(function(){if(!done&&v.readyState>=2)ready()},2500);
+    });
+    v.addEventListener("seeked",ready);
+    v.addEventListener("loadeddata",function(){if(eng==="hls")setTimeout(ready,300)});
+    v.addEventListener("error",function(){
+      if(eng==="native"&&cors&&tries===0){tries++;cors=false;v.removeAttribute("crossorigin");v.src=it.u;return}
+      finish(false,false);
+    });
+    timer=setTimeout(function(){finish(false,false)},15000);
+    if(eng==="hls"){
+      loadScript(HLS_URL).then(function(){
+        if(!window.Hls||!Hls.isSupported()){finish(false,false);return}
+        h=new Hls({maxBufferLength:2,maxMaxBufferLength:4,startPosition:3,enableWorker:false});
+        h.on(Hls.Events.ERROR,function(e,d){if(d.fatal)finish(false,false)});
+        h.loadSource(it.u);h.attachMedia(v);
+      },function(){finish(false,false)});
+    }else{v.crossOrigin="anonymous";v.src=it.u}
+  })});
+}
+var obs=null;
+if(window.IntersectionObserver){obs=new IntersectionObserver(function(es){es.forEach(function(en){if(en.isIntersecting){obs.unobserve(en.target);fillThumb(en.target._it,en.target)}})},{rootMargin:"400px"})}
+function mkThumb(it){
+  var th=el("div","thumb"),g=grad(it.t);th.style.setProperty("--g1",g[0]);th.style.setProperty("--g2",g[1]);
+  th.appendChild(el("span","ph",(it.t||"?").trim().charAt(0).toUpperCase()||"?"));
+  th.appendChild(el("span","fmt",fmtOf(it)));
+  var d=el("span","dur",(it.d||DUR[it.u])?fmtTime(it.d||DUR[it.u]):"");if(!d.textContent)d.hidden=true;th.appendChild(d);
+  th._it=it;if(obs)obs.observe(th);else fillThumb(it,th);
+  return th;
+}
 
-    <div id="playerOverlay" class="player-overlay">
-        <div class="red-bar-box"><div class="red-bar" id="redBar"></div></div>
-        <div class="gesture-val" id="gVal">50%</div>
-        <div class="watermark">{BOT_OWNER_NAME}</div>
+/* ---------- home (grid) ---------- */
+var grid=$("#grid"),chipsEl=$("#chips");
+function curDur(it){return it.d||DUR[it.u]||0}
+function computeList(){
+  var base,c=VIEW.chip;
+  if(c==="fav")base=Object.keys(FAV).map(function(u){return BYURL[u]}).filter(Boolean);
+  else if(c==="later")base=Object.keys(LATER).map(function(u){return BYURL[u]}).filter(Boolean);
+  else if(c==="hist")base=Object.keys(HIST).sort(function(a,b){return HIST[b].ts-HIST[a].ts}).map(function(u){return BYURL[u]}).filter(Boolean);
+  else{base=DATA.slice();if(c.indexOf("f:")===0)base=base.filter(function(it){return fmtOf(it)===c.slice(2)})}
+  var q=VIEW.q.trim().toLowerCase();
+  if(q)base=base.filter(function(it){return (it.t||"").toLowerCase().indexOf(q)>-1||domainOf(it.u).indexOf(q)>-1});
+  if(c!=="hist"){
+    if(VIEW.sort==="az")base.sort(function(a,b){return (a.t||"").localeCompare(b.t||"")});
+    else if(VIEW.sort==="za")base.sort(function(a,b){return (b.t||"").localeCompare(a.t||"")});
+    else if(VIEW.sort==="long")base.sort(function(a,b){return curDur(b)-curDur(a)});
+    else if(VIEW.sort==="short")base.sort(function(a,b){return (curDur(a)||1e9)-(curDur(b)||1e9)});
+  }
+  return base;
+}
+function updChips(){
+  chipsEl.textContent="";
+  var counts={};DATA.forEach(function(it){var f=fmtOf(it);counts[f]=(counts[f]||0)+1});
+  var defs=[["all","All"],["fav","\u2665 Favorites ("+Object.keys(FAV).length+")"],["later","\u23F1 Watch later ("+Object.keys(LATER).length+")"],["hist","\u21BB History ("+Object.keys(HIST).length+")"]];
+  Object.keys(counts).sort(function(a,b){return counts[b]-counts[a]}).forEach(function(f){defs.push(["f:"+f,f+" ("+counts[f]+")"])});
+  defs.forEach(function(d){
+    var b=el("button","chip"+(VIEW.chip===d[0]?" on":""),d[1]);
+    b.onclick=function(){VIEW.chip=d[0];updChips();renderGrid()};chipsEl.appendChild(b);
+  });
+}
+function popMenu(anchor,it){
+  closePop();
+  var p=el("div","pop");p.id="pop";
+  function add(txt,fn){var b=el("button","",txt);b.onclick=function(e){e.stopPropagation();closePop();fn()};p.appendChild(b)}
+  add("\u25B6  Play",function(){go(it)});
+  add((FAV[it.u]?"\u2665  Remove favorite":"\u2661  Add to favorites"),function(){toggleFav(it);renderGrid()});
+  add((LATER[it.u]?"\u23F1  Remove from Watch later":"\u23F1  Watch later"),function(){toggleLater(it);if(VIEW.chip==="later")renderGrid()});
+  add("\uD83D\uDCCB  Copy link",function(){copy(it.u)});
+  extLinks(it.u).forEach(function(x){var a=el("a","","\uD83D\uDCFA  "+(x.n==="Open link"?"Open / Download":"Open in "+x.n));a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";p.appendChild(a)});
+  document.body.appendChild(p);
+  var r=anchor.getBoundingClientRect(),w=p.offsetWidth||200,hh=p.offsetHeight||240;
+  p.style.left=Math.max(8,Math.min(window.innerWidth-w-8,r.right-w))+"px";
+  p.style.top=Math.max(8,Math.min(window.innerHeight-hh-8,r.bottom+4))+"px";
+}
+function closePop(){var p=$("#pop");if(p)p.remove()}
+document.addEventListener("click",closePop);
+function mkCard(it){
+  var c=el("article","card");c.tabIndex=0;
+  var th=mkThumb(it);
+  var fv=el("button","fv"+(FAV[it.u]?" on":""),FAV[it.u]?"\u2665":"\u2661");fv.title="Favorite";
+  fv.onclick=function(e){e.stopPropagation();toggleFav(it);fv.className="fv"+(FAV[it.u]?" on":"");fv.textContent=FAV[it.u]?"\u2665":"\u2661";if(VIEW.chip==="fav")renderGrid()};
+  th.appendChild(fv);
+  var h=HIST[it.u];if(h&&h.dur>0){var pr=el("div","prog"),i=el("i");i.style.width=Math.min(100,h.pos/h.dur*100)+"%";pr.appendChild(i);th.appendChild(pr)}
+  c.appendChild(th);
+  var m=el("div","meta"),av=el("div","av",(domainOf(it.u)||"?").charAt(0).toUpperCase()),g=grad(domainOf(it.u));av.style.background=g[0];
+  var tx=el("div","tx"),t=el("h3","ttl",it.t||"Video");t.title=it.t||"";
+  tx.appendChild(t);tx.appendChild(el("div","sub",(domainOf(it.u)||"stream")+" \u2022 "+fmtOf(it)));
+  var mb=el("button","more","\u22EE");mb.onclick=function(e){e.stopPropagation();popMenu(mb,it)};
+  m.appendChild(av);m.appendChild(tx);m.appendChild(mb);c.appendChild(m);
+  c.onclick=function(){go(it)};
+  c.onkeydown=function(e){if(e.key==="Enter")go(it)};
+  return c;
+}
+function renderGrid(){
+  LIST=computeList();grid.textContent="";
+  var frag=document.createDocumentFragment();LIST.forEach(function(it){frag.appendChild(mkCard(it))});grid.appendChild(frag);
+  $("#count").textContent=LIST.length+" item"+(LIST.length===1?"":"s");
+  var em=$("#empty");em.hidden=LIST.length>0;
+  if(!LIST.length)em.textContent=VIEW.chip==="fav"?"Koi favorite nahi. Kisi video par \u2661 dabao.":VIEW.chip==="later"?"Watch later khali hai.":VIEW.chip==="hist"?"Abhi koi video nahi dekha.":"Kuch nahi mila.";
+}
+function go(it){location.hash="#/w/"+ALL.indexOf(it)}
 
-        <div class="player-header">
-            <div style="display:flex; align-items:center; gap:15px; width:70%;">
-                <span style="color:white; font-weight:600; font-size:14px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;" id="pTitle">Player</span>
-                <span onclick="toggleMinimize()" style="color:white; cursor:pointer; font-size:18px;">📉</span>
-            </div>
-            <div style="display:flex; gap:20px;">
-                <span onclick="toggleSettings()" style="color:white; font-size:20px; cursor:pointer;">⚙️</span>
-                <span onclick="closePlayer()" style="color:white; font-size:24px; cursor:pointer;">✕</span>
-            </div>
-        </div>
+/* ---------- player ---------- */
+var V=$("#v"),PL=$("#pl"),hls=null,mp=null,dash=null,retries=0,hideT,lastSave=0,dragging=false,IMGV=$("#imgv");
+var isTouch=false;try{isTouch=window.matchMedia&&matchMedia("(pointer:coarse)").matches}catch(e){}
+function destroyEngines(){
+  try{if(hls){hls.destroy()}}catch(e){}hls=null;
+  try{if(mp){mp.destroy()}}catch(e){}mp=null;
+  try{if(dash){dash.reset()}}catch(e){}dash=null;
+  try{V.pause();V.removeAttribute("src");V.load()}catch(e){}
+}
+function setLoading(b){$("#spin").hidden=!b}
+function showErr(msg,it){
+  var e=$("#err");
+  if(!msg){e.hidden=true;e.textContent="";return}
+  e.textContent="";e.hidden=false;setLoading(false);
+  e.appendChild(el("div","",msg));
+  var box=el("div","eb");
+  var rt=el("button","","Retry");rt.onclick=function(){if(CUR)loadItem(CUR)};box.appendChild(rt);
+  if(it){
+    extLinks(it.u).forEach(function(x){var a=el("a","",x.n==="Open link"?"Open / Download":x.n);a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";box.appendChild(a)});
+    var cp=el("button","","Copy link");cp.onclick=function(){copy(it.u)};box.appendChild(cp);
+  }
+  e.appendChild(box);
+}
+function fail(it,why){showErr((why||"Ye stream browser me play nahi ho raha")+" ("+fmtOf(it)+"). Kisi external player me kholo:",it)}
+function buildQuality(){
+  var b=$("#bQ");if(!hls||!hls.levels||hls.levels.length<2){b.hidden=true;return}
+  b.hidden=false;b.textContent="Auto";
+}
+function loadItem(it){
+  destroyEngines();showErr("");retries=0;V.hidden=true;IMGV.hidden=true;$("#aud").hidden=true;$("#menu").hidden=true;
+  if(it.k==="IMAGE"){IMGV.hidden=false;IMGV.referrerPolicy="no-referrer";IMGV.src=it.u;setLoading(false);return}
+  if(it.k==="PDF"){showErr("PDF file hai.",it);return}
+  V.hidden=false;$("#aud").hidden=!isAudio(it);setLoading(true);
+  var eng=engineOf(it),u=it.u;
+  var go2=function(){var p=V.play();if(p&&p.catch)p.catch(function(){})};
+  if(eng==="hls"){
+    loadScript(HLS_URL).then(function(){
+      if(window.Hls&&Hls.isSupported()){
+        hls=new Hls({enableWorker:true,maxBufferLength:40});
+        hls.on(Hls.Events.MANIFEST_PARSED,function(){buildQuality();go2()});
+        hls.on(Hls.Events.ERROR,function(e,d){
+          if(!d.fatal)return;
+          if(d.type===Hls.ErrorTypes.NETWORK_ERROR&&retries++<2){hls.startLoad()}
+          else if(d.type===Hls.ErrorTypes.MEDIA_ERROR&&retries++<3){hls.recoverMediaError()}
+          else fail(it,"HLS stream load nahi hui (CORS/expired link/block ho sakta hai)");
+        });
+        hls.loadSource(u);hls.attachMedia(V);
+      }else if(V.canPlayType("application/vnd.apple.mpegurl")){V.src=u;go2()}
+      else fail(it,"HLS support nahi");
+    },function(){if(V.canPlayType("application/vnd.apple.mpegurl")){V.src=u;go2()}else fail(it,"hls.js load nahi hui (internet?)")});
+  }else if(eng==="dash"){
+    loadScript(DASH_URL).then(function(){dash=dashjs.MediaPlayer().create();dash.initialize(V,u,true)},function(){fail(it,"dash.js load nahi hui")});
+  }else if(eng==="mpegts"){
+    loadScript(TS_URL).then(function(){
+      if(window.mpegts&&mpegts.isSupported()){mp=mpegts.createPlayer({type:extOf(u)==="flv"?"flv":"mpegts",url:u,isLive:false});mp.attachMediaElement(V);mp.load();go2()}
+      else fail(it,"TS/FLV is browser me supported nahi");
+    },function(){fail(it,"mpegts.js load nahi hui")});
+  }else{V.src=u;go2()}
+}
+function togglePlay(){if(V.paused){var p=V.play();if(p&&p.catch)p.catch(function(){})}else V.pause()}
+function skip(s,rip){
+  if(isFinite(V.duration))V.currentTime=Math.max(0,Math.min(V.duration,V.currentTime+s));else V.currentTime=Math.max(0,V.currentTime+s);
+  if(rip){rip.classList.add("on");setTimeout(function(){rip.classList.remove("on")},450)}
+}
+function showCtl(){PL.classList.add("show");clearTimeout(hideT);if(!V.paused)hideT=setTimeout(function(){PL.classList.remove("show");$("#menu").hidden=true},2800)}
+function updPlayIcon(){$("#bPlay").innerHTML=V.paused?"&#9654;":"&#10074;&#10074;";PL.classList.toggle("paused",V.paused)}
+function updTime(){
+  var d=V.duration,c=V.currentTime||0;
+  $("#tm").textContent=fmtTime(c)+" / "+(isFinite(d)?fmtTime(d):"LIVE");
+  if(isFinite(d)&&d>0&&!dragging){var p=c/d*100;$("#pro").style.width=p+"%";$("#knob").style.left=p+"%"}
+}
+function updBuf(){
+  try{var d=V.duration,b=V.buffered;if(b.length&&isFinite(d)&&d>0){var c=V.currentTime,e=0;for(var i=0;i<b.length;i++){if(b.start(i)<=c&&b.end(i)>=c)e=b.end(i)}$("#buf").style.width=(e/d*100)+"%"}}catch(e){}
+}
+V.addEventListener("play",function(){updPlayIcon();showCtl()});
+V.addEventListener("pause",function(){updPlayIcon();showCtl()});
+V.addEventListener("waiting",function(){setLoading(true)});
+V.addEventListener("playing",function(){setLoading(false);showErr("")});
+V.addEventListener("canplay",function(){setLoading(false)});
+V.addEventListener("progress",updBuf);
+V.addEventListener("timeupdate",function(){
+  updTime();updBuf();
+  if(CUR&&Date.now()-lastSave>4000&&V.currentTime>1){lastSave=Date.now();saveHist(CUR,V.currentTime,isFinite(V.duration)?V.duration:0)}
+});
+V.addEventListener("loadedmetadata",function(){
+  updTime();if(CUR&&isFinite(V.duration))DUR[CUR.u]=V.duration;
+  var h=CUR&&HIST[CUR.u];
+  if(h&&h.pos>5&&isFinite(V.duration)&&h.pos<V.duration-8){V.currentTime=h.pos;toast("Resumed from "+fmtTime(h.pos))}
+});
+V.addEventListener("ended",function(){
+  if(CUR)saveHist(CUR,0,isFinite(V.duration)?V.duration:0);
+  if($("#auto").checked){var n=nextItem(1);if(n)go(n)}
+});
+V.addEventListener("error",function(){if(CUR&&!hls&&!mp&&!dash&&V.getAttribute("src"))fail(CUR,"Ye format/codec browser support nahi karta (MKV/AVI/HEVC/WMV etc.)")});
+V.addEventListener("volumechange",function(){$("#bVol").innerHTML=(V.muted||V.volume===0)?"&#128263;":"&#128266;";$("#vol").value=V.muted?0:V.volume});
+$("#vol").addEventListener("input",function(){V.muted=false;V.volume=parseFloat(this.value)});
+$("#bVol").onclick=function(){V.muted=!V.muted};
+$("#bPlay").onclick=togglePlay;
+$("#bNext").onclick=function(){var n=nextItem(1);if(n)go(n);else toast("Aur video nahi hai")};
+function upList(){return LIST.indexOf(CUR)>-1?LIST:DATA}
+function nextItem(d){var l=upList(),i=l.indexOf(CUR);return l[i+d]||null}
+/* seek bar */
+var seek=$("#seek");
+function frac(e){var r=seek.getBoundingClientRect();return Math.min(1,Math.max(0,(e.clientX-r.left)/r.width))}
+seek.addEventListener("pointerdown",function(e){dragging=true;seek.classList.add("drag");try{seek.setPointerCapture(e.pointerId)}catch(x){}move(e)});
+seek.addEventListener("pointermove",function(e){var f=frac(e),d=V.duration;if(isFinite(d)){$("#tip").textContent=fmtTime(f*d);$("#tip").style.left=(f*100)+"%"}if(dragging)move(e)});
+seek.addEventListener("pointerup",function(e){if(dragging){move(e);dragging=false;seek.classList.remove("drag")}});
+function move(e){var f=frac(e),d=V.duration;if(isFinite(d)&&d>0){$("#pro").style.width=(f*100)+"%";$("#knob").style.left=(f*100)+"%";V.currentTime=f*d}}
+/* gestures on overlay */
+var ov=$("#ov"),lastTap=0,tapT=null;
+ov.addEventListener("click",function(e){
+  var now=Date.now(),r=ov.getBoundingClientRect(),x=(e.clientX-r.left)/r.width;
+  if(now-lastTap<300){clearTimeout(tapT);lastTap=0;if(x<.33)skip(-10,$("#ripL"));else if(x>.67)skip(10,$("#ripR"));else toggleFs()}
+  else{lastTap=now;tapT=setTimeout(function(){if(isTouch&&!PL.classList.contains("show")&&!V.paused)showCtl();else togglePlay()},260)}
+});
+PL.addEventListener("mousemove",showCtl);PL.addEventListener("touchstart",showCtl,{passive:true});
+/* menus */
+var menu=$("#menu");
+function openMenu(items,cur,fn){
+  if(!menu.hidden&&menu._k===items.join("|")){menu.hidden=true;return}
+  menu.textContent="";menu._k=items.join("|");
+  items.forEach(function(it){var b=el("button",it.v===cur?"on":"",it.l);b.onclick=function(){fn(it.v);menu.hidden=true};menu.appendChild(b)});
+  menu.hidden=false;
+}
+$("#bSpd").onclick=function(){
+  var sp=[0.25,0.5,0.75,1,1.25,1.5,2,3,4].map(function(s){return {v:s,l:s+"x"}});
+  openMenu(sp,V.playbackRate,function(v){V.playbackRate=v;$("#bSpd").textContent=v+"x"});
+};
+$("#bQ").onclick=function(){
+  if(!hls||!hls.levels)return;
+  var it=[{v:-1,l:"Auto"}];
+  hls.levels.map(function(l,i){return {v:i,l:(l.height?l.height+"p":(Math.round(l.bitrate/1000)+"k")),h:l.height||0}}).sort(function(a,b){return b.h-a.h}).forEach(function(x){it.push(x)});
+  openMenu(it,hls.currentLevel,function(v){hls.currentLevel=v;var f=it.filter(function(x){return x.v===v})[0];$("#bQ").textContent=f?f.l:"Auto"});
+};
+$("#bPip").onclick=function(){try{if(document.pictureInPictureElement)document.exitPictureInPicture();else if(V.requestPictureInPicture)V.requestPictureInPicture();else toast("PiP supported nahi")}catch(e){toast("PiP supported nahi")}};
+function toggleTheater(){document.body.classList.toggle("theater")}
+$("#bTh").onclick=toggleTheater;
+function toggleFs(){
+  var d=document;
+  if(d.fullscreenElement||d.webkitFullscreenElement){(d.exitFullscreen||d.webkitExitFullscreen).call(d);return}
+  var f=PL.requestFullscreen||PL.webkitRequestFullscreen;
+  if(f)f.call(PL);else if(V.webkitEnterFullscreen)V.webkitEnterFullscreen();
+}
+$("#bFs").onclick=toggleFs;
+document.addEventListener("keydown",function(e){
+  if($("#watch").hidden)return;
+  var t=e.target,tn=t&&t.tagName;if(tn==="SELECT"||tn==="TEXTAREA"||(tn==="INPUT"&&t.type!=="range"&&t.type!=="checkbox"))return;
+  var k=e.key;
+  if(k===" "||k==="k"){e.preventDefault();togglePlay()}
+  else if(k==="ArrowRight"){skip(5,$("#ripR"))}else if(k==="ArrowLeft"){skip(-5,$("#ripL"))}
+  else if(k==="l"){skip(10,$("#ripR"))}else if(k==="j"){skip(-10,$("#ripL"))}
+  else if(k==="ArrowUp"){e.preventDefault();V.volume=Math.min(1,V.volume+.1)}else if(k==="ArrowDown"){e.preventDefault();V.volume=Math.max(0,V.volume-.1)}
+  else if(k==="m"){V.muted=!V.muted}else if(k==="f"){toggleFs()}else if(k==="t"){toggleTheater()}
+  else if(k==="n"){var n=nextItem(1);if(n)go(n)}else if(k==="p"){var p=nextItem(-1);if(p)go(p)}
+  else if(/^[0-9]$/.test(k)&&isFinite(V.duration)){V.currentTime=V.duration*(+k)/10}
+  if(k!==" ")showCtl();
+});
+/* media session */
+function setSession(it){
+  if(!("mediaSession" in navigator))return;
+  try{
+    navigator.mediaSession.metadata=new MediaMetadata({title:it.t||"Video",artist:domainOf(it.u),artwork:THUMBS[it.u]?[{src:THUMBS[it.u],sizes:"320x180",type:"image/jpeg"}]:(it.th?[{src:it.th}]:[])});
+    navigator.mediaSession.setActionHandler("play",function(){V.play()});
+    navigator.mediaSession.setActionHandler("pause",function(){V.pause()});
+    navigator.mediaSession.setActionHandler("seekbackward",function(){skip(-10)});
+    navigator.mediaSession.setActionHandler("seekforward",function(){skip(10)});
+    navigator.mediaSession.setActionHandler("nexttrack",function(){var n=nextItem(1);if(n)go(n)});
+    navigator.mediaSession.setActionHandler("previoustrack",function(){var p=nextItem(-1);if(p)go(p)});
+  }catch(e){}
+}
 
-        <div id="settingsMenu" class="settings-menu">
-            <div class="sm-item"><div class="sm-label">Speed</div>
-                <select class="sm-select" onchange="changeSpeed(this.value)">
-                    <option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="1.5">1.5x</option><option value="2">2x</option><option value="3">3x</option><option value="4">4x</option>
-                </select>
-            </div>
-            <div class="sm-item"><div class="sm-label">Quality</div>
-                <select class="sm-select" id="qualitySelect" onchange="changeQuality(this.value)"><option value="-1">Auto</option></select>
-            </div>
-            <div class="sm-item" style="border-top:1px solid #444; padding-top:10px; margin-top:5px;">
-                <button class="clean-btn" onclick="cleanAllData()">🗑️ Clean All Data</button>
-            </div>
-        </div>
+/* ---------- watch page ---------- */
+function actBtn(txt,fn,on){var b=el("button","act"+(on?" on":""),txt);b.onclick=fn;return b}
+function renderMeta(it){
+  $("#wt").textContent=it.t||"Video";document.title=(it.t||"Video")+" - "+CFG.title;
+  var a=$("#acts");a.textContent="";
+  var fb=actBtn(FAV[it.u]?"\u2665 Favorited":"\u2661 Favorite",function(){toggleFav(it);fb.className="act"+(FAV[it.u]?" on":"");fb.textContent=FAV[it.u]?"\u2665 Favorited":"\u2661 Favorite"},!!FAV[it.u]);a.appendChild(fb);
+  var lb=actBtn(LATER[it.u]?"\u23F1 Saved":"\u23F1 Watch later",function(){toggleLater(it);lb.className="act"+(LATER[it.u]?" on":"");lb.textContent=LATER[it.u]?"\u23F1 Saved":"\u23F1 Watch later"},!!LATER[it.u]);a.appendChild(lb);
+  a.appendChild(actBtn("\uD83D\uDCCB Copy link",function(){copy(it.u)}));
+  var dl=el("a","act",engineOf(it)==="native"?"\u2B07 Download":"\u2B07 Open stream");dl.href=it.u;dl.target="_blank";dl.rel="noopener noreferrer";if(engineOf(it)==="native")dl.setAttribute("download","");a.appendChild(dl);
+  extLinks(it.u).slice(0,2).forEach(function(x){if(x.n==="Open link")return;var e=el("a","act","\uD83D\uDCFA "+x.n);e.href=x.h;e.target="_blank";e.rel="noopener noreferrer";a.appendChild(e)});
+  if(it.p){var sp=el("a","act","\u2197 Source page");sp.href=it.p;sp.target="_blank";sp.rel="noopener noreferrer";a.appendChild(sp)}
+  var d=$("#desc");d.textContent="";
+  function row(k,v){var p=el("div");p.appendChild(el("b","",k+": "));p.appendChild(document.createTextNode(v));d.appendChild(p)}
+  row("Format",fmtOf(it)+" ("+engineOf(it)+")");row("Source",domainOf(it.u)||"-");
+  if(it.d||DUR[it.u])row("Duration",fmtTime(it.d||DUR[it.u]));
+  row("Stream",it.u);
+}
+function renderUpnext(it){
+  var box=$("#upn");box.textContent="";var l=upList(),i=l.indexOf(it),n=0;
+  for(var j=i+1;j<l.length&&n<40;j++,n++){
+    (function(x){
+      var r=el("div","up"),th=mkThumb(x),tx=el("div","tx");tx.appendChild(el("h3","ttl",x.t||"Video"));tx.appendChild(el("div","sub",domainOf(x.u)+" \u2022 "+fmtOf(x)));
+      r.appendChild(th);r.appendChild(tx);r.onclick=function(){go(x)};box.appendChild(r);
+    })(l[j]);
+  }
+  if(!n)box.appendChild(el("div","sub","Aur video nahi hai"));
+}
+function showWatch(i){
+  var it=ALL[i];if(!it){location.hash="#/";return}
+  CUR=it;LIST=LIST.length?LIST:computeList();
+  $("#home").hidden=true;chipsEl.hidden=true;$("#watch").hidden=false;
+  renderMeta(it);renderUpnext(it);loadItem(it);setSession(it);window.scrollTo(0,0);showCtl();
+}
+function showHome(){
+  if(!$("#watch").hidden){destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title}
+  $("#home").hidden=false;chipsEl.hidden=false;renderGrid();updChips();
+}
+function route(){var m=location.hash.match(/^#\/w\/(\d+)/);if(m)showWatch(+m[1]);else showHome()}
 
-        <div class="player-mid" id="gestureArea" onclick="if(document.body.classList.contains('minimized')) toggleMinimize()">
-            <div class="lock-icon" onclick="toggleLock(); event.stopPropagation();">🔓</div>
-            <video id="player" playsinline controls style="width:100%; max-height:100%;"></video>
-            <iframe id="pdfFrame" class="pdf-frame" style="display:none;"></iframe>
-            <img id="imgView" class="img-view" style="display:none;">
-        </div>
-
-        <div class="bottom-controls" id="extControls">
-            <button class="ctrl-btn" onclick="seek(-10)">⏪ 10s</button>
-            <button class="ctrl-btn" onclick="seek(10)">10s ⏩</button>
-            <button class="ctrl-btn" onclick="showToast('GIF Mode: ON')">GIF</button>
-            <button class="ctrl-btn" onclick="showToast('CC: Enabled')">CC</button>
-            <button class="ctrl-btn ctrl-next" onclick="playNext()">Next ⏭</button>
-            <button class="ctrl-btn" onclick="downloadCurrent()">⬇ DL</button>
-            <button class="ctrl-btn" onclick="toggleFav('pFavBtn')" id="pFavBtn">🤍 Fav</button>
-        </div>
-    </div>
-
-    <div id="toast">Alert</div>
-
-    <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-    <script>
-        function toggleMode() {{
-            const current = document.documentElement.getAttribute('data-theme');
-            const next = current === 'dark' ? 'light' : 'dark';
-            document.documentElement.setAttribute('data-theme', next);
-            localStorage.setItem('uTheme', next);
-        }}
-        function setTheme(color) {{
-            document.documentElement.setAttribute('data-color', color);
-            localStorage.setItem('uColor', color);
-        }}
-        document.documentElement.setAttribute('data-theme', localStorage.getItem('uTheme') || 'dark');
-        document.documentElement.setAttribute('data-color', localStorage.getItem('uColor') || 'blue');
-
-        function checkPass() {{
-            if(document.getElementById('passInput').value === "{SKY_PASSWORD}") {{
-                document.getElementById('login-screen').style.display = 'none';
-                document.getElementById('app-wrapper').style.display = 'block';
-            }} else document.getElementById('errMsg').innerText = "Incorrect Password!";
-        }}
-        {security_script}
-
-        const playlist = {playlist_json};
-        let currentIndex = -1;
-        let hls = new Hls();
-        let isLocked = false;
-
-        const player = new Plyr('#player', {{
-            controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'settings', 'fullscreen'],
-            hideControls: true, speed: {{ selected: 1, options: [0.5, 1, 1.5, 2, 3, 4] }}
-        }});
-
-        player.on('ended', () => playNext());
-
-        window.onload = function() {{
-            updateFavCount();
-            playlist.forEach((item, idx) => {{
-                if(localStorage.getItem('fav_' + item.url)) document.getElementById('list-fav-' + idx).style.display = 'inline';
-            }});
-        }};
-
-        function cleanAllData() {{
-            if(confirm("Clear all Watch History & Favorites?")) {{
-                localStorage.clear();
-                location.reload();
-            }}
-        }}
-
-        function openCinema(idx) {{
-            currentIndex = idx;
-            const item = playlist[idx];
-            document.getElementById('bgLayer').style.backgroundImage = `url('${{item.poster}}')`;
-            document.getElementById('cPoster').src = item.poster;
-            document.getElementById('cTitle').innerText = item.name;
-            document.getElementById('cType').innerText = item.type;
-            updateFavBtn('favBtn');
-            document.getElementById('cinemaModal').style.display = 'block';
-        }}
-
-        function closeCinema() {{ document.getElementById('cinemaModal').style.display = 'none'; }}
-
-        function startPlayer() {{
-            document.getElementById('cinemaModal').style.display = 'none';
-            document.getElementById('playerOverlay').style.display = 'flex';
-            document.getElementById('pTitle').innerText = playlist[currentIndex].name;
-            updateFavBtn('pFavBtn');
-
-            const item = playlist[currentIndex];
-            const v = document.getElementById('player');
-            const p = document.getElementById('pdfFrame');
-            const i = document.getElementById('imgView');
-            v.style.display='none'; p.style.display='none'; i.style.display='none';
-            document.getElementById('settingsMenu').style.display = 'none';
-
-            if(item.type === 'VIDEO' || item.type === 'AUDIO') {{
-                v.style.display='block';
-                if(Hls.isSupported() && item.url.includes('.m3u8')) {{
-                    hls.loadSource(item.url); hls.attachMedia(v);
-                    hls.on(Hls.Events.MANIFEST_PARSED, () => {{
-                        const qSel = document.getElementById('qualitySelect');
-                        qSel.innerHTML = '<option value="-1">Auto</option>';
-                        hls.levels.forEach((l, idx) => {{ qSel.innerHTML += `<option value="${{idx}}">${{l.height}}p</option>`; }});
-                    }});
-                }} else {{ v.src = item.url; }}
-                player.play();
-            }} else if(item.type === 'PDF') {{
-                p.style.display='block';
-                p.src = "https://docs.google.com/gview?embedded=true&url=" + encodeURIComponent(item.url);
-            }} else if(item.type === 'IMAGE') {{
-                i.style.display='block'; i.src = item.url;
-            }} else {{ window.open(item.url, '_blank'); closePlayer(); }}
-        }}
-
-        function closePlayer() {{
-            player.pause();
-            document.getElementById('playerOverlay').style.display = 'none';
-            document.body.classList.remove('minimized');
-        }}
-
-        let startY = 0;
-        const area = document.getElementById('gestureArea');
-        const redBar = document.getElementById('redBar');
-        const gVal = document.getElementById('gVal');
-
-        area.addEventListener('touchstart', (e) => {{ if(!isLocked) startY = e.touches[0].clientY; }});
-        area.addEventListener('touchmove', (e) => {{
-            if(isLocked) return;
-            e.preventDefault();
-            const delta = startY - e.touches[0].clientY;
-            redBar.style.opacity = '1';
-            let h = Math.abs(delta) * 0.5; if(h>100) h=100;
-            redBar.style.height = h + "%";
-            gVal.style.opacity = '1';
-            if(e.touches[0].clientX > window.innerWidth / 2) {{
-                let change = delta / 500;
-                let newVol = Math.min(Math.max(player.volume + change, 0), 1);
-                player.volume = newVol;
-                gVal.innerText = "Vol: " + Math.round(newVol * 100) + "%";
-            }}
-        }});
-        area.addEventListener('touchend', () => {{ redBar.style.opacity = '0'; gVal.style.opacity = '0'; }});
-
-        function toggleSettings() {{
-            const menu = document.getElementById('settingsMenu');
-            menu.style.display = (menu.style.display === 'flex') ? 'none' : 'flex';
-        }}
-        function changeSpeed(val) {{ player.speed = parseFloat(val); }}
-        function changeQuality(val) {{ hls.currentLevel = parseInt(val); }}
-        function seek(s) {{ player.currentTime += s; }}
-        function playNext() {{ if(currentIndex+1 < playlist.length) {{ currentIndex++; startPlayer(); }} }}
-        function downloadCurrent() {{ window.open(playlist[currentIndex].url, '_blank'); }}
-        function toggleLock() {{
-            isLocked = !isLocked;
-            document.querySelector('.lock-icon').innerText = isLocked ? '🔒' : '🔓';
-            document.getElementById('extControls').style.display = isLocked ? 'none' : 'flex';
-        }}
-        function toggleMinimize() {{ document.body.classList.toggle('minimized'); }}
-
-        function toggleFav(btnId) {{
-            const url = playlist[currentIndex].url;
-            if(localStorage.getItem('fav_'+url)) {{
-                localStorage.removeItem('fav_'+url);
-                document.getElementById('list-fav-' + currentIndex).style.display = 'none';
-            }} else {{
-                localStorage.setItem('fav_'+url, 'true');
-                document.getElementById('list-fav-' + currentIndex).style.display = 'inline';
-            }}
-            updateFavBtn(btnId);
-            updateFavCount();
-        }}
-        function updateFavBtn(btnId) {{
-            const url = playlist[currentIndex].url;
-            const btn = document.getElementById(btnId);
-            const isFav = localStorage.getItem('fav_'+url);
-            if(btnId === 'favBtn') btn.innerText = isFav ? "✓ Added" : "❤️ Add to Favorites";
-            else btn.innerText = isFav ? "❤️ Saved" : "🤍 Fav";
-        }}
-        function updateFavCount() {{
-            let c = 0;
-            playlist.forEach(i => {{ if(localStorage.getItem('fav_'+i.url)) c++; }});
-            document.getElementById('favCount').innerText = c;
-        }}
-        function filterList(t) {{
-            document.querySelectorAll('.list-item').forEach(e => {{
-                let show = false;
-                if(t === 'all') show = true;
-                else if(t === 'FAV') {{
-                    const idx = e.id.split('-')[1];
-                    if(localStorage.getItem('fav_' + playlist[idx].url)) show = true;
-                }}
-                else if(e.getAttribute('data-type') === t) show = true;
-                e.style.display = show ? 'flex' : 'none';
-            }});
-        }}
-        function searchList() {{
-            const v = document.getElementById('searchInput').value.toLowerCase();
-            document.querySelector('.clear-search').style.display = v ? 'block' : 'none';
-            document.querySelectorAll('.list-item').forEach(e => e.style.display = e.innerText.toLowerCase().includes(v) ? 'flex' : 'none');
-        }}
-        function clearSearch() {{
-            document.getElementById('searchInput').value = '';
-            searchList();
-        }}
-        function showToast(msg) {{
-            const t = document.getElementById('toast');
-            t.innerText = msg; t.style.display = 'block';
-            setTimeout(() => t.style.display = 'none', 2000);
-        }}
-    </script>
+/* ---------- init ---------- */
+function start(){
+  $("#lock").hidden=true;$("#app").hidden=false;
+  $("#siteT").textContent=CFG.title;$("#foot").textContent=CFG.owner?"Credits: "+CFG.owner:"";
+  var tg=$("#tgB");if(CFG.tg)tg.href=CFG.tg;else tg.hidden=true;
+  var th=LS.get("ytb_theme","dark");document.documentElement.setAttribute("data-theme",th);
+  $("#themeB").onclick=function(){var n=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",n);LS.set("ytb_theme",n)};
+  var q=$("#q"),qc=$("#qclr"),qt;
+  q.oninput=function(){qc.hidden=!q.value;clearTimeout(qt);qt=setTimeout(function(){VIEW.q=q.value;renderGrid()},180)};
+  qc.onclick=function(){q.value="";qc.hidden=true;VIEW.q="";renderGrid()};
+  $("#sort").onchange=function(){VIEW.sort=this.value;renderGrid()};
+  window.addEventListener("hashchange",route);
+  route();
+}
+function unlock(){
+  var v=$("#pw").value;
+  if(hashPw(v)===CFG.hash){SS.set("ytb_ok",CFG.hash);start()}
+  else $("#lerr").textContent="Incorrect password";
+}
+if(!CFG.hash||SS.get("ytb_ok")===CFG.hash){start()}
+else{
+  $("#lock").hidden=false;
+  $("#pwb").onclick=unlock;$("#pw").onkeydown=function(e){if(e.key==="Enter")unlock()};
+}
+window.__ytb={sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
+})();
+</script>
 </body>
 </html>
 """
-    return html_template
+
+
+def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web Player") -> str:
+    """Self-contained YouTube-style web player (password gate, auto thumbnails, favorites, history,
+    HLS/MP4/WebM/MKV/DASH/TS/FLV/audio, external-player fallback)."""
+    items = []
+    for it in results:
+        items.append({"t": it.get("title") or "Video", "u": it["download_link"], "k": it.get("type") or "VIDEO",
+                      "p": it.get("page_url") or "", "th": it.get("thumb") or "", "d": it.get("duration") or 0})
+
+    def js(o) -> str:
+        return (json.dumps(o, ensure_ascii=False).replace("</", "<\\/")
+                .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+    cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK,
+           "hash": hashlib.sha256(SKY_PASSWORD.encode("utf-8")).hexdigest() if SKY_PASSWORD else ""}
+    return (_PLAYER_TEMPLATE.replace("__TITLE__", _html.escape(title))
+            .replace("__CFG__", js(cfg)).replace("__DATA__", js(items)))
 
 # ==========================================================
 # TELEGRAM BOT HANDLERS
@@ -2003,7 +2352,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Full Web Player UI: Custom Video & Media Player interface in HTML.\n"
         "2. 4 Files Export: 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
         "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n\n"
-        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump"
+        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2508,7 +2857,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error processing document: {e}")
         await status_msg.edit_text(f"❌ File Process Error: {str(e)}")
 
-async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
+async def _run_scrape_chunk_impl(update_or_query, context, target_url: str, start_page: int, end_page: int):
     status_msg = await update_or_query.message.reply_text(f"⚡ Scraping Pages {start_page} to {end_page}...")
 
     try:
@@ -2521,7 +2870,8 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
             await status_msg.edit_text(f"⚡ Extracting {done}/{total} (Pages {start_page}-{end_page})...")
 
         results = await scrape_multi_pages_chunk(target_url, start_page=start_page,
-                                                 end_page=end_page, progress=progress)
+                                                 end_page=end_page, progress=progress,
+                                                 user_id=_uid_of(update_or_query))
 
         if not results:
             r = LAST_REPORT
@@ -2545,7 +2895,7 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
             txt_full_content += f"{idx}. Title: {item['title']}\n"
             txt_full_content += f"   Source Listing Page: {item['source_page']}\n"
             txt_full_content += f"   Permanent Video Page: {item['page_url']}\n"
-            txt_full_content += f"   Direct Stream Link: {item['download_link']}\n\n"
+            txt_full_content += f"   Direct Stream Link: {item['download_link']}\n" + exp_line(item) + "\n"
 
         txt_full_bytes = io.BytesIO(txt_full_content.encode('utf-8'))
         txt_full_bytes.name = f"scraped_p{start_page}_to_p{end_page}_full.txt"
@@ -2599,6 +2949,7 @@ a:hover {{ text-decoration: underline; }}
         await update_or_query.message.reply_document(document=txt_full_bytes, caption=f"📁 Pages {start_page}-{end_page} Full TXT File ({len(results)} Links)")
         await update_or_query.message.reply_document(document=txt_simple_bytes, caption=f"📁 Pages {start_page}-{end_page} Simple TXT File (Title: Direct Stream Link)")
         await update_or_query.message.reply_document(document=html_full_bytes, caption=f"🌐 Pages {start_page}-{end_page} Full Web App HTML File (Interactive Player UI)")
+        await _send_exports(update_or_query.message.reply_document, results, f"p{start_page}_to_p{end_page}")
         await update_or_query.message.reply_document(
             document=html_simple_bytes,
             caption=f"🌐 Pages {start_page}-{end_page} Simple HTML File\n\nAage ke pages ({next_start} to {next_end}) scrape karne ke liye button click karein:",
@@ -2881,7 +3232,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
 
     results: Dict[str, dict] = {}
     if url_to_source:
-        esem = asyncio.Semaphore(SCR_CONCURRENCY)
+        esem = AdaptiveLimiter(SCR_CONCURRENCY)
         total = len(url_to_source)
         state = {"done": 0, "last": 0.0}
 
@@ -2889,6 +3240,8 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
             if STOP_PROCESS.get(user_id):
                 return
             hit = _STREAM_CACHE.get(v)
+            if hit and hit.get("expires") and hit["expires"] < time.time() + 300:
+                hit = None                                   # link expire hone wala hai -> dobara nikalo
             if hit:
                 results[v] = hit
                 rep["cached"] += 1
@@ -2899,6 +3252,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
                             and not host_is_blocked(_root_host(urlparse(v).netloc))):
                         await asyncio.sleep(1)               # one quick retry
                         r = await guarded_extract(v, s)
+                    esem.feedback(v, bool(r))
                 if r:
                     if len(_STREAM_CACHE) > 5000:
                         _STREAM_CACHE.clear()
@@ -2948,6 +3302,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
             rep["links"] = max(rep["links"], 1)
 
     ordered, dropped = clean_results(ordered)
+    ordered = await verify_results(ordered, rep)
     rep["dropped"] = dropped
     rep["extracted"] = len(ordered)
     return ordered, rep
@@ -2959,7 +3314,7 @@ async def scr_send_files(chat, results: List[dict], start: int, end: int, domain
     simple = f"--- {domain} Simple Links (Pages {start}-{end} | {len(results)} Items) ---\n\n"
     for i, it in enumerate(results, 1):
         full += (f"{i}. Title: {it['title']}\n   Source Listing Page: {it['source_page']}\n"
-                 f"   Permanent Video Page: {it['page_url']}\n   Direct Stream Link: {it['download_link']}\n\n")
+                 f"   Permanent Video Page: {it['page_url']}\n   Direct Stream Link: {it['download_link']}\n" + exp_line(it) + "\n")
         simple += f"{it['title']}: {it['download_link']}\n"
 
     def mk(text: str, name: str):
@@ -2991,12 +3346,13 @@ async def scr_send_files(chat, results: List[dict], start: int, end: int, domain
     await chat.send_document(
         document=mk(generate_web_app_html(results, title=f"{domain} ({start}-{end})"), f"{tag}_full.html"),
         caption="🌐 Full Web App HTML (Player UI)")
+    await _send_exports(chat.send_document, results, tag)
     await chat.send_document(
         document=mk(simple_html, f"{tag}_simple.html"),
         caption=f"🌐 Simple HTML\n\nAage ke pages ({nxt}-{nxt + 9}) ke liye button dabao:", reply_markup=kb)
 
 
-async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
+async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: int):
     domain = normalize_domain(url)
     STOP_PROCESS[user_id] = False
     status = await chat.send_message(f"⚡ {domain} | Pages {start}-{end} ...")
@@ -3600,13 +3956,101 @@ def _cookie_dict(sess) -> dict:
             return {}
 
 
-def cookie_login_sync(base: str, user: str, pwd: str) -> dict:
+def _fill_template(o, u: str, p: str):
+    if isinstance(o, str):
+        return o.replace("{user}", u).replace("{pass}", p)
+    if isinstance(o, dict):
+        return {k: _fill_template(v, u, p) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_fill_template(v, u, p) for v in o]
+    return o
+
+
+def _redact(t: str, *secrets) -> str:
+    for sx in secrets:
+        if sx:
+            t = t.replace(sx, "***")
+    return t
+
+
+def _api_login(sess, base: str, user: str, pwd: str, api, proxies) -> dict:
+    """JSON API login (xhamster jaisi JS sites): common payloads try karta hai, har try ka result dikhata hai."""
+    url, template = api
+    log: List[str] = []
+    statuses: List[str] = []
+    csrf = None
+    try:
+        h0 = make_headers(base + "/")
+        h0.pop("Cookie", None)
+        r0 = sess.get(base + "/", headers=h0, timeout=20, proxies=proxies)
+        statuses.append(f"/:{r0.status_code}")
+        if r0.status_code == 200:
+            mm = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)', r0.text, re.I)
+            if mm:
+                csrf = mm.group(1)
+    except Exception:
+        statuses.append("/:error")
+    before = set(_cookie_dict(sess))
+
+    if template:
+        try:
+            variants = [("template", _fill_template(json.loads(template), user, pwd))]
+        except Exception:
+            return {"ok": False, "error": "payload template JSON galat hai", "statuses": statuses,
+                    "cookies": _cookie_dict(sess), "api_log": log}
+    else:
+        variants = [(k, {k: user, "password": pwd, "remember": True}) for k in ("username", "login", "email")]
+
+    for name, payload in variants:
+        h = make_headers(base + "/", base + "/")
+        h.pop("Cookie", None)
+        h.update({"Accept": "application/json, text/plain, */*", "Content-Type": "application/json",
+                  "X-Requested-With": "XMLHttpRequest", "Origin": base})
+        if csrf:
+            h["X-CSRF-Token"] = csrf
+        xs = _cookie_dict(sess).get("XSRF-TOKEN")
+        if xs:
+            h["X-XSRF-TOKEN"] = unquote(xs)
+        try:
+            r = sess.post(url, json=payload, headers=h, timeout=25, proxies=proxies)
+        except Exception as e:
+            log.append(f"{name}: error {_redact(str(e), user, pwd)[:60]}")
+            continue
+        body = (r.text or "")[:600]
+        statuses.append(f"API[{name}]:{r.status_code}")
+        log.append(f"{name}: HTTP {r.status_code} {_redact(re.sub(chr(92) + 's+', ' ', body), user, pwd)[:150]}")
+        try:
+            js = r.json()
+        except Exception:
+            js = None
+        errorlike = isinstance(js, dict) and bool(js.get("error") or js.get("errors") or js.get("success") is False)
+        cookies = _cookie_dict(sess)
+        new = sorted(set(cookies) - before)
+        ok = r.status_code < 400 and not errorlike and (isinstance(js, dict) or bool(new))
+        if ok:
+            return {"ok": True, "cookies": cookies, "new": new, "statuses": statuses, "api_log": log}
+        low = body.lower()
+        if re.search(r'captcha|recaptcha|turnstile', low):
+            log.append("⛔ Captcha maang raha hai: API se login nahi hoga, browser se cookie lo (/login).")
+            break
+        if r.status_code in (403, 503) and js is None:
+            log.append("⛔ 403/503: Cloudflare/IP block.")
+            break
+        if re.search(r'invalid (login|password|cred|user)|incorrect|wrong (pass|login|cred)|credentials|неверн', low):
+            break            # fields sahi the, password/ID galat -> aur try karke account lock mat karo
+    return {"ok": False, "error": "API login confirm nahi hua", "statuses": statuses,
+            "cookies": _cookie_dict(sess), "api_log": log}
+
+
+def cookie_login_sync(base: str, user: str, pwd: str, api=None) -> dict:
     """Generic form login: login page dhundo -> form bharo (hidden/csrf fields ke saath) -> POST -> cookies."""
     proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
     if cffi_requests:
         sess = cffi_requests.Session(impersonate="chrome124")
     else:
         sess = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+    if api:
+        return _api_login(sess, base, user, pwd, api, proxies)
     statuses: List[str] = []
 
     def hdrs(ref=None):
@@ -3707,6 +4151,9 @@ async def cookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "🍪 /cookie <website>\n\nExample:\n/cookie example.com\n\n"
+            "JS/API login wali site (jaise xhamster):\n"
+            "/cookie xhamster46.desi https://xhamster46.desi/api/front/user/login\n"
+            '(optional payload: ... {"username":"{user}","password":"{pass}","remember":true})\n\n'
             "Phir bot ID/email aur password maangega, login karke cookies bhej dega.\n"
             "Cancel karne ke liye: cancel")
         return
@@ -3714,6 +4161,17 @@ async def cookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not DOMAIN_RE.match(domain):
         await update.message.reply_text(f"❌ Invalid domain: {context.args[0]}")
         return
+    parts = (update.message.text or "").split(None, 3)
+    if len(parts) >= 3 and parts[2].lower().startswith("http"):      # /cookie <domain> <api_url> [payload json]
+        tmpl = parts[3].strip() if len(parts) > 3 else None
+        if tmpl:
+            try:
+                json.loads(tmpl)
+            except Exception:
+                await update.message.reply_text('❌ Payload JSON galat hai. Example: {"username":"{user}","password":"{pass}"}')
+                return
+        set_api_login(domain, parts[2].strip(), tmpl)
+        await update.message.reply_text(f"✅ API login saved: {parts[2].strip()}" + (" (custom payload)" if tmpl else " (auto payload)"))
     context.user_data['cookie_flow'] = {"domain": domain, "step": "id"}
     await update.message.reply_text(
         f"🍪 {domain}\n👤 Apna ID / email bhejo (cancel likhne par band):")
@@ -3740,7 +4198,8 @@ async def cookie_flow_step(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     status = await chat.send_message(f"⏳ {domain} par login ho raha hai...")
     try:
         res = await asyncio.wait_for(
-            asyncio.to_thread(cookie_login_sync, f"https://{domain}", user, pwd), timeout=120)
+            asyncio.to_thread(cookie_login_sync, f"https://{domain}", user, pwd, get_api_login(domain)),
+            timeout=120)
     except Exception as e:
         await status.edit_text(f"❌ Login error: {str(e)[:200]}")
         return
@@ -3748,6 +4207,8 @@ async def cookie_flow_step(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     cookies = res.get("cookies") or {}
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
     stat = ", ".join(res.get("statuses", []))
+    if res.get("api_log"):
+        stat += "\n🧪 API tries:\n" + "\n".join(res["api_log"])[:1200]
 
     if res.get("error"):
         hint = ""
@@ -3777,8 +4238,663 @@ async def cookie_flow_step(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         await chat.send_document(document=buf, caption=f"🍪 {domain} cookies (/login ke saath use karo)")
 
 
+# ==========================================================
+# POWER FEATURES
+#   yt-dlp fallback | packed-JS / base64 unpacker | filters | dead-link check
+#   settings | jobs | exports (m3u/json/csv) | backup/restore | watch (auto-monitor)
+#   adaptive speed limiter
+# ==========================================================
+import shutil
+import tempfile
+
+try:   # optional: pip install yt-dlp  (hazaaron sites ke liye fallback extractor)
+    import yt_dlp
+except Exception:
+    yt_dlp = None
+
+# ---------------- settings (DB me save, /settings se badlo) ----------------
+_SETTINGS: Dict[str, str] = {}
+_SETTING_DEFAULTS = {"verify": "0", "min_quality": "0", "include": "", "exclude": "",
+                     "export": "", "ytdlp": "1"}
+
+
+def load_settings():
+    _SETTINGS.clear()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM settings")
+        for k, v in cur.fetchall():
+            _SETTINGS[k] = v or ""
+        conn.close()
+    except Exception as e:
+        logger.error(f"load_settings error: {e}")
+
+
+def get_setting(key: str) -> str:
+    if key in _SETTINGS:
+        return _SETTINGS[key]
+    return os.getenv("SETTING_" + key.upper(), _SETTING_DEFAULTS.get(key, ""))
+
+
+def set_setting(key: str, value: str):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    conn.commit()
+    conn.close()
+    _SETTINGS[key] = value
+
+
+def reset_settings():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("DELETE FROM settings")
+    conn.commit()
+    conn.close()
+    _SETTINGS.clear()
+
+
+# ---------------- adaptive speed limiter ----------------
+class AdaptiveLimiter:
+    """Concurrency khud kam/zyada: 429/503 aaye to aadhi, sab theek ho to dheere badhti hai."""
+
+    def __init__(self, maxn: int):
+        self.max = max(1, maxn)
+        self.limit = self.max
+        self.active = 0
+        self.ok = 0
+        self.throttled = 0
+
+    async def __aenter__(self):
+        while self.active >= self.limit:
+            await asyncio.sleep(0.05)
+        self.active += 1
+
+    async def __aexit__(self, *a):
+        self.active -= 1
+
+    def feedback(self, url: str, ok: bool):
+        if LAST_STATUS.get(url) in (429, 503):
+            self.throttled += 1
+            self.limit = max(4, self.limit // 2)
+        elif ok:
+            self.ok += 1
+            if self.ok % 25 == 0 and self.limit < self.max:
+                self.limit = min(self.max, self.limit + 2)
+
+
+# ---------------- packed JS / base64 se chhupe links ----------------
+_B62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_PACKED_RX = re.compile(
+    r"\}\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:[^'\\]|\\.)*)'\s*\.split\(\s*'\|'\s*\)", re.S)
+
+
+def _unbase(s: str, base: int) -> Optional[int]:
+    n = 0
+    for ch in s:
+        v = _B62.find(ch)
+        if v < 0 or v >= base:
+            return None
+        n = n * base + v
+    return n
+
+
+def unpack_packed(text: str) -> List[str]:
+    """Dean Edwards p,a,c,k,e,d packer ko kholta hai."""
+    out = []
+    for m in _PACKED_RX.finditer(text):
+        payload, a, kw = m.group(1), int(m.group(2)), m.group(4)
+        words = kw.split('|')
+
+        def repl(mm):
+            i = _unbase(mm.group(0), a)
+            return words[i] if i is not None and i < len(words) and words[i] else mm.group(0)
+
+        res = re.sub(r'\b\w+\b', repl, payload)
+        out.append(res.replace("\\'", "'").replace("\\\\", "\\"))
+    return out
+
+
+def deobfuscate_extra(text: str) -> str:
+    """Packed JS + atob()/base64 URLs ko decode karke extra text (generic extractor ke liye)."""
+    import base64
+    parts: List[str] = []
+    try:
+        parts += unpack_packed(text)
+    except Exception:
+        pass
+    cands = re.findall(r'atob\(\s*["\']([A-Za-z0-9+/=_-]{16,})["\']', text)
+    cands += re.findall(r'["\'](aHR0c[A-Za-z0-9+/=]{12,})["\']', text)        # "aHR0c" = "http"
+    for c in dict.fromkeys(cands):
+        try:
+            raw = base64.b64decode(c + "=" * (-len(c) % 4), altchars=b"-_" if ('-' in c or '_' in c) else None)
+            dec = raw.decode('utf-8', errors='ignore')
+            if '.m3u8' in dec or '.mp4' in dec or dec.startswith('http'):
+                parts.append(dec)
+        except Exception:
+            continue
+    return "\n".join(parts)
+
+
+# ---------------- yt-dlp fallback ----------------
+_YTDLP_STATS: Dict[str, dict] = {}
+
+
+def ytdlp_allowed(url: str) -> bool:
+    if yt_dlp is None or get_setting("ytdlp") == "0":
+        return False
+    st = _YTDLP_STATS.get(_root_host(urlparse(url).netloc))
+    return not (st and st["ok"] == 0 and st["fail"] >= 6)
+
+
+def _ytdlp_pick(info: dict):
+    if info.get("entries"):
+        ents = [e for e in info["entries"] if e]
+        if ents:
+            info = ents[0]
+    title = info.get("title") or ""
+    best, best_score = None, -1
+    pool = list(info.get("formats") or [])
+    if info.get("url"):
+        pool.append(info)
+    for f in pool:
+        u = f.get("url")
+        if not u or f.get("vcodec") == "none" or f.get("ext") in ("mhtml", "jpg", "png", "webp"):
+            continue
+        proto = f.get("protocol") or ""
+        progressive = proto.startswith("http") and "m3u8" not in proto and "dash" not in proto
+        score = (f.get("height") or 0) + (100000 if progressive else 0)
+        if score > best_score:
+            best, best_score = u, score
+    if not best and info.get("manifest_url"):
+        best = info["manifest_url"]
+    return (title, best) if best else None
+
+
+def ytdlp_extract_sync(url: str, referer: Optional[str] = None):
+    headers = {"User-Agent": UA}
+    if referer:
+        headers["Referer"] = referer
+    cookie = get_cookie_for_url(url)
+    if cookie:
+        headers["Cookie"] = cookie
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+            "socket_timeout": 15, "http_headers": headers}
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return _ytdlp_pick(info) if info else None
+
+
+async def ytdlp_try(url: str, referer: Optional[str] = None):
+    st = _YTDLP_STATS.setdefault(_root_host(urlparse(url).netloc), {"ok": 0, "fail": 0})
+    try:
+        res = await asyncio.wait_for(asyncio.to_thread(ytdlp_extract_sync, url, referer), timeout=45)
+    except Exception as e:
+        logger.info(f"yt-dlp fail {url[:80]}: {str(e)[:80]}")
+        res = None
+    st["ok" if res else "fail"] += 1
+    return res
+
+
+# ---------------- filters / expiry / dead-link check ----------------
+def stream_quality(u: str) -> Optional[int]:
+    q = [int(x) for x in re.findall(r'(\d{3,4})p', u.lower())]
+    return max(q) if q else None
+
+
+def apply_filters(items: List[dict]) -> List[dict]:
+    try:
+        minq = int(get_setting("min_quality") or 0)
+    except ValueError:
+        minq = 0
+    inc = [w.strip().lower() for w in get_setting("include").split(",") if w.strip()]
+    exc = [w.strip().lower() for w in get_setting("exclude").split(",") if w.strip()]
+    if not (minq or inc or exc):
+        return items
+    out = []
+    for it in items:
+        t = (it.get("title") or "").lower()
+        q = stream_quality(it["download_link"])
+        if minq and q is not None and q < minq:
+            continue
+        if inc and not any(w in t for w in inc):
+            continue
+        if exc and any(w in t for w in exc):
+            continue
+        out.append(it)
+    return out
+
+
+def stream_expiry(u: str) -> Optional[int]:
+    m = (re.search(r'[,/=](1[5-9]\d{8})(?=[,/&?]|$)', u)
+         or re.search(r'[?&](?:expires?|exp|e|validto|valid_until)=(\d{10})', u, re.I))
+    if m:
+        ts = int(m.group(1))
+        if 1_500_000_000 < ts < 2_500_000_000:
+            return ts
+    return None
+
+
+def exp_line(it: dict) -> str:
+    ts = it.get("expires")
+    if not ts:
+        return ""
+    return "   Expires: " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts)) + "\n"
+
+
+def verify_stream_sync(url: str, referer: Optional[str] = None) -> Optional[bool]:
+    """True = chal raha | False = pakka dead (404/410/HTML/bad playlist) | None = pata nahi (rakho)."""
+    h = {"User-Agent": UA, "Accept": "*/*"}
+    if referer:
+        h["Referer"] = referer
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    try:
+        if '.m3u8' in url.lower():
+            r = requests.get(url, headers=h, timeout=(5, 10), proxies=proxies, stream=True)
+            try:
+                if r.status_code >= 400:
+                    return False if r.status_code in (404, 410) else None
+                chunk = next(r.iter_content(2048), b"")
+                return chunk.lstrip().startswith(b"#EXTM3U")
+            finally:
+                r.close()
+        h["Range"] = "bytes=0-1023"
+        r = requests.get(url, headers=h, timeout=(5, 10), proxies=proxies, stream=True)
+        try:
+            if r.status_code in (200, 206):
+                return not (r.headers.get("Content-Type") or "").lower().startswith("text/")
+            return False if r.status_code in (404, 410) else None
+        finally:
+            r.close()
+    except Exception:
+        return None
+
+
+async def verify_results(items: List[dict], rep: Optional[dict] = None) -> List[dict]:
+    if get_setting("verify") != "1" or not items:
+        return items
+    sem = asyncio.Semaphore(16)
+
+    async def one(it):
+        async with sem:
+            it["alive"] = await asyncio.to_thread(verify_stream_sync, it["download_link"], it.get("page_url"))
+
+    await asyncio.gather(*[one(i) for i in items])
+    alive = [i for i in items if i.get("alive") is not False]
+    if rep is not None:
+        rep["dead"] = len(items) - len(alive)
+    return alive
+
+
+# ---------------- exports ----------------
+def build_exports(results: List[dict], tag: str, fmts: set) -> List[tuple]:
+    import csv
+    out = []
+    if "m3u" in fmts:
+        lines = ["#EXTM3U"]
+        for it in results:
+            lines += [f"#EXTINF:-1,{(it.get('title') or 'Video').replace(chr(10), ' ')}", it["download_link"]]
+        out.append((f"{tag}.m3u", "\n".join(lines) + "\n", "🎵 M3U playlist (VLC/MX Player)"))
+    if "json" in fmts:
+        out.append((f"{tag}.json", json.dumps(results, ensure_ascii=False, indent=1), "🧾 JSON"))
+    if "csv" in fmts:
+        sio = io.StringIO()
+        w = csv.writer(sio)
+        w.writerow(["title", "type", "stream", "page", "expires"])
+        for it in results:
+            w.writerow([it.get("title"), it.get("type"), it["download_link"], it.get("page_url"), it.get("expires") or ""])
+        out.append((f"{tag}.csv", sio.getvalue(), "📊 CSV"))
+    return out
+
+
+async def _send_exports(send, results: List[dict], tag: str):
+    fmts = {x.strip().lower() for x in get_setting("export").split(",") if x.strip()}
+    for name, text, cap in build_exports(results, tag, fmts):
+        b = io.BytesIO(text.encode('utf-8'))
+        b.name = name
+        await send(document=b, caption=cap)
+
+
+# ---------------- jobs ----------------
+JOBS: Dict[int, dict] = {}
+_JOB_SEQ = [0]
+
+
+def _uid_of(x) -> int:
+    u = getattr(x, "effective_user", None) or getattr(x, "from_user", None)
+    return u.id if u else 0
+
+
+def job_start(uid: int, kind: str, url: str, a: int, b: int) -> int:
+    _JOB_SEQ[0] += 1
+    JOBS[_JOB_SEQ[0]] = {"user": uid, "kind": kind, "url": url, "pages": f"{a}-{b}", "t0": time.time()}
+    return _JOB_SEQ[0]
+
+
+def job_end(jid: int):
+    JOBS.pop(jid, None)
+
+
+async def run_scrape_chunk(update_or_query, context, target_url: str, start_page: int, end_page: int):
+    uid = _uid_of(update_or_query)
+    STOP_PROCESS[uid] = False
+    jid = job_start(uid, "scrape", target_url, start_page, end_page)
+    try:
+        await _run_scrape_chunk_impl(update_or_query, context, target_url, start_page, end_page)
+    finally:
+        job_end(jid)
+
+
+async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
+    jid = job_start(user_id, "scr", url, start, end)
+    try:
+        await _scr_run_impl(chat, context, user_id, url, start, end)
+    finally:
+        job_end(jid)
+
+
+async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    mine = {j: v for j, v in JOBS.items() if uid == ADMIN_ID or v["user"] == uid}
+    if not mine:
+        await update.message.reply_text("📭 Abhi koi job nahi chal raha.")
+        return
+    lines = ["🧵 Chalte hue jobs:"]
+    for j, v in mine.items():
+        lines.append(f"#{j} | {v['kind']} | pages {v['pages']} | {int(time.time() - v['t0'])}s | {normalize_domain(v['url'])}"
+                     + (f" | user {v['user']}" if uid == ADMIN_ID else ""))
+    lines.append("\nRokne ke liye: /cancel  (admin: /cancel all)")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    if uid == ADMIN_ID and context.args and context.args[0].lower() == "all":
+        for v in JOBS.values():
+            STOP_PROCESS[v["user"]] = True
+        await update.message.reply_text("🛑 Sabhi jobs ko stop request bhej di.")
+        return
+    STOP_PROCESS[uid] = True
+    await update.message.reply_text("🛑 Tumhare jobs ko stop request bhej di.")
+
+
+# ---------------- /settings ----------------
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args or []
+    if args and args[0].lower() == "reset":
+        reset_settings()
+        await update.message.reply_text("♻️ Settings default par aa gayi.")
+        return
+    if args:
+        key = args[0].lower()
+        val = " ".join(args[1:]).strip()
+        if key not in _SETTING_DEFAULTS:
+            await update.message.reply_text(f"❌ Unknown setting: {key}")
+            return
+        if val.lower() in ("off", "none", "clear", "-", "0") and key in ("include", "exclude", "export", "min_quality"):
+            val = "0" if key == "min_quality" else ""
+        elif key in ("verify", "ytdlp"):
+            val = "1" if val.lower() in ("on", "1", "yes", "true") else "0"
+        elif key == "min_quality":
+            if not val.isdigit():
+                await update.message.reply_text("❌ min_quality number do (jaise 720) ya off")
+                return
+        elif key == "export":
+            val = ",".join(x for x in re.split(r'[,\s]+', val.lower()) if x in ("m3u", "json", "csv"))
+        else:
+            val = val.lower()
+        set_setting(key, val)
+    show = lambda k: get_setting(k) or "-"
+    await update.message.reply_text(
+        "⚙️ Settings\n\n"
+        f"• verify (dead link check): {'ON' if get_setting('verify') == '1' else 'OFF'}\n"
+        f"• ytdlp (fallback extractor): {'ON' if get_setting('ytdlp') != '0' else 'OFF'}"
+        f"{'' if yt_dlp else '  (yt-dlp install nahi hai)'}\n"
+        f"• min_quality: {get_setting('min_quality')}\n"
+        f"• include (title me ye words): {show('include')}\n"
+        f"• exclude (title me ye words nahi): {show('exclude')}\n"
+        f"• export (extra files): {show('export')}\n\n"
+        "Badalne ke liye:\n"
+        "/settings verify on\n/settings ytdlp off\n/settings min_quality 720\n"
+        "/settings include mom,step   (comma se alag)\n/settings exclude gay\n"
+        "/settings export m3u,json,csv\n/settings include off   (clear)\n/settings reset")
+
+
+# ---------------- backup / restore ----------------
+def db_snapshot(path: str):
+    src = sqlite3.connect(DB_FILE)
+    dst = sqlite3.connect(path)
+    src.backup(dst)
+    dst.close()
+    src.close()
+
+
+async def _send_backup(bot, chat_id: int, caption: str):
+    tmp = os.path.join(tempfile.gettempdir(), f"bot_data_{int(time.time())}.db")
+    try:
+        db_snapshot(tmp)
+        with open(tmp, "rb") as f:
+            await bot.send_document(chat_id=chat_id, document=f, filename="bot_data.db", caption=caption)
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await _send_backup(context.bot, update.effective_chat.id,
+                       "💾 DB backup (cookies, rules, sites, watches).\nRestore: ye file bhejo, caption me: restore")
+
+
+async def restore_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if "restore" not in (update.message.caption or "").lower():
+        await update.message.reply_text("ℹ️ DB restore ke liye file ke saath caption me likho: restore")
+        return
+    doc = update.message.document
+    tmp = os.path.join(tempfile.gettempdir(), f"restore_{int(time.time())}.db")
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        await f.download_to_drive(tmp)
+        c = sqlite3.connect(tmp)
+        names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        c.close()
+        if not {"allowed_users", "site_cookies"} <= names:
+            raise ValueError("ye is bot ka DB nahi lagta")
+        src = sqlite3.connect(tmp)
+        dst = sqlite3.connect(DB_FILE)
+        src.backup(dst)
+        dst.close()
+        src.close()
+        init_db()
+        globals()["_RULES_CACHE"] = None
+        load_settings()
+        _FETCH_CACHE.clear()
+        await update.message.reply_text(
+            f"✅ Restore ho gaya.\n🍪 Cookies: {len(list_cookie_domains())} | 🧩 Rules: {len(list_rule_domains())} | "
+            f"👁 Watches: {len(watch_rows())}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Restore fail: {str(e)[:150]}")
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+async def _backup_loop(app):
+    try:
+        hrs = float(os.getenv("BACKUP_HOURS", "6"))
+    except ValueError:
+        hrs = 6
+    if hrs <= 0:
+        return
+    while True:
+        await asyncio.sleep(hrs * 3600)
+        try:
+            await _send_backup(app.bot, ADMIN_ID, "💾 Auto backup (restore: ye file bhejo, caption me: restore)")
+        except Exception as e:
+            logger.error(f"auto backup error: {e}")
+
+
+# ---------------- watch: auto-monitor ----------------
+def watch_add(uid: int, url: str, minutes: int) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO watches (user_id, url, minutes, last_run, baselined) VALUES (?, ?, ?, 0, 0)",
+                (uid, url, minutes))
+    wid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return wid
+
+
+def watch_rows(uid: Optional[int] = None) -> List[tuple]:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    if uid is None:
+        cur.execute("SELECT id, user_id, url, minutes, last_run, baselined FROM watches ORDER BY id")
+    else:
+        cur.execute("SELECT id, user_id, url, minutes, last_run, baselined FROM watches WHERE user_id=? ORDER BY id", (uid,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def watch_del(wid: int, uid: Optional[int] = None) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    if uid is None:
+        cur.execute("DELETE FROM watches WHERE id=?", (wid,))
+    else:
+        cur.execute("DELETE FROM watches WHERE id=? AND user_id=?", (wid, uid))
+    ok = cur.rowcount > 0
+    if ok:
+        cur.execute("DELETE FROM watch_seen WHERE watch_id=?", (wid,))
+    conn.commit()
+    conn.close()
+    return ok
+
+
+async def _watch_run(app, wid: int, uid: int, url: str, baselined: int):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("UPDATE watches SET last_run=? WHERE id=?", (time.time(), wid))
+    conn.commit()
+    conn.close()
+    results, rep = await scr_scrape(url, 1, 1, -abs(uid) - 1)      # pseudo user id: /stop se na ruke
+    if not results:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT page_url FROM watch_seen WHERE watch_id=?", (wid,))
+    seen = {r[0] for r in cur.fetchall()}
+    new = [r for r in results if r["page_url"] not in seen]
+    cur.executemany("INSERT OR IGNORE INTO watch_seen (watch_id, page_url) VALUES (?, ?)",
+                    [(wid, r["page_url"]) for r in results])
+    if not baselined:
+        cur.execute("UPDATE watches SET baselined=1 WHERE id=?", (wid,))
+    conn.commit()
+    conn.close()
+    if not baselined:
+        await app.bot.send_message(uid, f"👁 Watch #{wid} shuru: {len(results)} purane videos ignore kiye, "
+                                        f"naye aate hi bhejunga.\n{url}", disable_web_page_preview=True)
+        return
+    if not new:
+        return
+    head = f"🆕 Watch #{wid}: {len(new)} naye video\n{url}\n\n"
+    body = "".join(f"{it['title'][:80]}\n{it['download_link']}\n\n" for it in new[:8])
+    await app.bot.send_message(uid, (head + body)[:4000], disable_web_page_preview=True)
+    if len(new) > 8:
+        b = io.BytesIO("".join(f"{it['title']}: {it['download_link']}\n" for it in new).encode('utf-8'))
+        b.name = f"watch_{wid}_new.txt"
+        await app.bot.send_document(uid, document=b, caption=f"📁 Watch #{wid}: saare {len(new)} naye links")
+
+
+async def _watch_loop(app):
+    await asyncio.sleep(45)
+    while True:
+        try:
+            for wid, uid, url, minutes, last, baselined in watch_rows():
+                if time.time() - (last or 0) >= minutes * 60:
+                    try:
+                        await _watch_run(app, wid, uid, url, baselined)
+                    except Exception as e:
+                        logger.error(f"watch {wid} error: {e}")
+        except Exception as e:
+            logger.error(f"watch loop error: {e}")
+        await asyncio.sleep(60)
+
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/watch <listing url> [minutes]  -> naye videos aate hi bot khud bhej dega."""
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "👁 /watch <listing URL> [minutes]\nExample: /watch https://site.com/new 60\n"
+            "Page 1 har N minute me check hota hai (min 10), naye videos aap ko mil jaate hain.\n"
+            "/watchlist | /unwatch <id>")
+        return
+    m = re.search(r'https?://\S+', " ".join(args))
+    if not m:
+        await update.message.reply_text("❌ Valid URL do.")
+        return
+    url = m.group(0)
+    mins = 60
+    for a in args:
+        if a.isdigit():
+            mins = max(10, min(int(a), 1440))
+    limit = 20 if uid == ADMIN_ID else 5
+    if len(watch_rows(uid)) >= limit:
+        await update.message.reply_text(f"❌ Max {limit} watches.")
+        return
+    wid = watch_add(uid, url, mins)
+    await update.message.reply_text(f"✅ Watch #{wid} add: har {mins} min\n{url}\n(Pehli baar sirf baseline banega.)",
+                                    disable_web_page_preview=True)
+
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    rows = watch_rows(None if uid == ADMIN_ID else uid)
+    if not rows:
+        await update.message.reply_text("📭 Koi watch nahi hai. /watch <url>")
+        return
+    await update.message.reply_text("👁 Watches:\n" + "\n".join(
+        f"#{w} | har {mi} min | {normalize_domain(u)}" + (f" | user {us}" if uid == ADMIN_ID else "")
+        for w, us, u, mi, la, bl in rows), disable_web_page_preview=True)
+
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /unwatch <id>  (/watchlist se id dekho)")
+        return
+    ok = watch_del(int(context.args[0]), None if uid == ADMIN_ID else uid)
+    await update.message.reply_text("🗑 Watch hata di." if ok else "ℹ️ Aisi watch nahi mili.")
+
+
 async def _post_init(app):
     _ensure_fast_executor()
+    app.bot_data["tasks"] = [asyncio.create_task(_watch_loop(app)), asyncio.create_task(_backup_loop(app))]
 
 
 def main():
@@ -3786,6 +4902,7 @@ def main():
         raise SystemExit("❌ BOT_TOKEN environment variable set nahi hai. "
                          "Naya token BotFather se lo aur env me BOT_TOKEN=... rakho.")
     init_db()
+    load_settings()
     load_env_cookies()
     threading.Thread(target=run_dummy_server, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
@@ -3808,6 +4925,13 @@ def main():
     app.add_handler(CommandHandler("logout", logout_command))
     app.add_handler(CommandHandler("cookie", cookie_command))
     app.add_handler(CommandHandler("updatecookie", updatecookie_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("jobs", jobs_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("watch", watch_command))
+    app.add_handler(CommandHandler("watchlist", watchlist_command))
+    app.add_handler(CommandHandler("unwatch", unwatch_command))
 
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
@@ -3816,6 +4940,7 @@ def main():
     # /scr buttons MUST be registered before the generic callback handler
     app.add_handler(CallbackQueryHandler(scr_callback, pattern=r"^scr_"))
     app.add_handler(CallbackQueryHandler(button_callback_handler))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("db"), restore_document))
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
