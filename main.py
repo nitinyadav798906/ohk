@@ -173,7 +173,22 @@ def clean_cookie(raw: str) -> str:
     c = re.sub(r'^cookie:\s*', '', c, flags=re.I)
     return c.encode('ascii', errors='ignore').decode('ascii').strip()
 
+def parse_cookie_str(c: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for part in (c or "").split(';'):
+        if '=' in part:
+            k, v = part.split('=', 1)
+            k = k.strip()
+            if k:
+                out[k] = v.strip()
+    return out
+
+
 def set_cookie_db(domain: str, cookie: str):
+    try:                                   # nayi cookie ke baad purane (logged-out) cached pages hata do
+        globals().get("_FETCH_CACHE", {}).clear()
+    except Exception:
+        pass
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
@@ -476,6 +491,109 @@ async def xh_embed_try(video_url: str) -> Optional[str]:
     return None
 
 
+_JUNK_TITLE = re.compile(
+    r'(free online dating|adult personals|just a moment|attention required|access denied|'
+    r'^\s*(?:404|403|error|not found)\b|age verification|verify your age)', re.I)
+
+
+def _is_wall_redirect(url: str, final: str) -> bool:
+    """Requested page se login / dating / home page par redirect hua? (login wall)"""
+    a, b = urlparse(url), urlparse(final)
+    if a.path in ('', '/'):
+        return False
+    pa, pb = a.path.rstrip('/'), b.path.rstrip('/')
+    if pa == pb:
+        return False
+    return pb == '' or bool(re.search(r'^/(login|signin|sign-in|signup|register|dating|age|verify|gate|auth)(/|$)', pb, re.I))
+
+
+def best_title(text: str) -> str:
+    """og:title > h1 > <title>; HTML entities decode, site-name suffix hata do."""
+    t = ""
+    m = (re.search(r'<meta[^>]+property=["\']og:title["\'][^>]*content=["\']([^"\']+)', text, re.I)
+         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']og:title["\']', text, re.I))
+    if m:
+        t = m.group(1)
+    if not t:
+        m = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.I | re.S)
+        if m:
+            t = m.group(1)
+    if not t:
+        m = re.search(r'<title[^>]*>(.*?)</title>', text, re.I | re.S)
+        if m:
+            t = m.group(1)
+    t = _html.unescape(re.sub(r'<[^>]+>', '', t))
+    t = re.sub(r'\s+', ' ', t).strip()
+    t = re.sub(r'\s*[|\-–—]\s*(?:xhamster|[A-Za-z0-9.\- ]{3,30}\.(?:com|net|org|xxx|tv|desi|guru|me|to|pw|top|space|tube))\s*$',
+               '', t, flags=re.I).strip()
+    return t[:200] or "Video"
+
+
+def clean_results(items: List[dict]):
+    """Junk (landing/ad) title, ek hi stream 3+ pages par, duplicate page/stream hatao. -> (clean, dropped)"""
+    items = [i for i in items if i]
+    by_link: Dict[str, set] = {}
+    for it in items:
+        by_link.setdefault(it["download_link"], set()).add(it["page_url"])
+    out, seen_pages, seen_links = [], set(), set()
+    for it in items:
+        if _JUNK_TITLE.search(it.get("title") or ""):
+            continue
+        if len(by_link[it["download_link"]]) >= 3:
+            continue
+        if it["page_url"] in seen_pages or it["download_link"] in seen_links:
+            continue
+        seen_pages.add(it["page_url"])
+        seen_links.add(it["download_link"])
+        out.append(it)
+    return out, len(items) - len(out)
+
+
+def login_hint(url: str) -> str:
+    out = ""
+    fin = REDIRECTED.get(url)
+    if fin:
+        out += f"\n🔐 Page login/landing par redirect ho gaya ({fin[:80]}).\n"
+    path = urlparse(url).path.lower()
+    if re.search(r'/(my|account|favorites?|watch-?history|watch-?later|liked|subscriptions|profile)(/|$)', path):
+        has = bool(get_cookie_for_url(url))
+        out += ("\n🔐 Ye account page hai (login chahiye). Cookie: "
+                + ("saved ✅ (expire/galat ho sakti hai, /login dobara karo)" if has
+                   else "SAVED NAHI ❌ -> /login <domain> <cookie>")
+                + "\nℹ️ Render restart/redeploy par DB reset ho jata hai; permanent ke liye env me "
+                  "SITE_COOKIE_1 = domain|cookie rakho.\n")
+    return out
+
+
+def load_env_cookies():
+    """Env se login cookies: SITE_COOKIE_1="domain|cookie"  ya  SITE_COOKIES='{"domain":"cookie"}'"""
+    n = 0
+    for k, v in os.environ.items():
+        if not k.upper().startswith("SITE_COOKIE") or not (v or "").strip():
+            continue
+        v = v.strip()
+        pairs = []
+        if v.startswith("{"):
+            try:
+                pairs = list(json.loads(v).items())
+            except Exception as e:
+                logger.error(f"{k}: bad JSON ({e})")
+        elif "|" in v:
+            d, c = v.split("|", 1)
+            pairs = [(d, c)]
+        for d, c in pairs:
+            d, c = normalize_domain(d), clean_cookie(str(c))
+            if d and '=' in c:
+                set_cookie_db(d, c)
+                n += 1
+    if n:
+        logger.info(f"Env se {n} site cookie(s) load hui")
+
+
+def _xh_parse(text: str) -> Optional[str]:
+    return xh_best_stream(text) or (xh_from_initials(text) if 'initials' in text else None)
+
+
 def process_tpl_link(hls_link: str) -> str:
     try:
         if "_TPL_" not in hls_link:
@@ -524,6 +642,8 @@ JUNK = re.compile(
     r'blank\.mp4|teaser)', re.I)
 
 LAST_STATUS: Dict[str, int] = {}
+REDIRECTED: Dict[str, str] = {}          # url -> final url (login/landing par redirect hua)
+_VID_QUERY_KEYS = {'v', 'id', 'video', 'vid', 'viewkey', 'video_id', 'watch', 'view', 'clip', 'vi'}
 LAST_REPORT: dict = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0}
 
 
@@ -577,7 +697,7 @@ async def guarded_extract(v: str, s: str) -> Optional[dict]:
     if host_is_blocked(_root_host(urlparse(v).netloc)):
         return None
     try:
-        return await asyncio.wait_for(extract_video_link(v, source_page=s), timeout=40)
+        return await asyncio.wait_for(extract_video_link(v, source_page=s), timeout=60)
     except asyncio.TimeoutError:
         return None
 
@@ -590,8 +710,16 @@ def _cffi_sess():
     return s
 
 
-def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
+def _fetch_once(url: str, referer: Optional[str] = None, use_cookie: bool = True) -> Optional[str]:
     headers = make_headers(url, referer)
+    if not use_cookie:                       # saved login cookie hata do (without-login mode)
+        saved = get_cookie_for_url(url)
+        if saved and headers.get("Cookie"):
+            rest = headers["Cookie"].replace(saved, "").strip(" ;")
+            if rest:
+                headers["Cookie"] = rest
+            else:
+                headers.pop("Cookie", None)
     proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
     root = _root_host(urlparse(url).netloc)
     st = _HOST_STATS.get(root)
@@ -624,9 +752,15 @@ def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
                     detail.append(f"{name}:challenge")
                     logger.warning(f"fetch {url} -> bot challenge page ({name})")
                     continue
+                final = str(getattr(r, "url", "") or "")
+                if final and _is_wall_redirect(url, final):
+                    LAST_STATUS[url] = "200 (login/landing redirect)"
+                    REDIRECTED[url] = final
+                    detail.append(f"{name}:login-redirect")
+                    break
+                REDIRECTED.pop(url, None)
                 LAST_DETAIL[url] = ""
                 _BEST_ENGINE[root] = name
-                _HOST_STATS.setdefault(root, {"ok": 0, "fail": 0})["ok"] += 1
                 return r.text
             detail.append(f"{name}:{r.status_code}")
             logger.warning(f"fetch {url} -> HTTP {r.status_code} ({name})")
@@ -634,12 +768,26 @@ def fetch_sync(url: str, referer: Optional[str] = None) -> Optional[str]:
             detail.append(f"{name}:error")
             logger.warning(f"fetch {url} error ({name}): {e}")
     LAST_DETAIL[url] = ", ".join(detail)
-    _HOST_STATS.setdefault(root, {"ok": 0, "fail": 0})["fail"] += 1
     return None
 
 
-async def fetch(url: str, referer: Optional[str] = None) -> Optional[str]:
-    return await asyncio.to_thread(fetch_sync, url, referer)
+def fetch_sync(url: str, referer: Optional[str] = None, use_cookie: bool = True) -> Optional[str]:
+    """Login cookie saved ho to pehle usse, fail ho to bina login ke bhi try (dono mode kaam karein)."""
+    root = _root_host(urlparse(url).netloc)
+    has_cookie = bool(get_cookie_for_url(url))
+    html = _fetch_once(url, referer, use_cookie)
+    if html is None and has_cookie and use_cookie:
+        first = LAST_DETAIL.get(url, "")
+        html = _fetch_once(url, referer, False)
+        if html is None:
+            LAST_DETAIL[url] = f"with-login[{first}] | no-login[{LAST_DETAIL.get(url, '')}]"
+    st = _HOST_STATS.setdefault(root, {"ok": 0, "fail": 0})
+    st["ok" if html else "fail"] += 1
+    return html
+
+
+async def fetch(url: str, referer: Optional[str] = None, use_cookie: bool = True) -> Optional[str]:
+    return await asyncio.to_thread(fetch_sync, url, referer, use_cookie)
 
 
 def _shape(pu) -> str:
@@ -678,8 +826,11 @@ def find_video_links(html: str, page_url: str, use_rule: bool = True) -> List[st
             return
         if _root_host(pu.netloc) != root:
             return
-        if pu.path in ('', '/') or full.rstrip('/') == page_url.rstrip('/'):
+        if full.rstrip('/') == page_url.rstrip('/'):
             return
+        if pu.path in ('', '/'):      # /?v=ID jaise links (ruporn24): sirf video-id wali query allow
+            if not ({k.lower() for k in parse_qs(pu.query)} & _VID_QUERY_KEYS):
+                return
         if pu.path.lower().endswith(SKIP_EXT) or BAD_PATH.search(pu.path):
             return
         old = items.get(full)
@@ -745,11 +896,12 @@ def link_stats(html: str, page_url: str) -> str:
 
 
 def _looks_like_single_video(url: str) -> bool:
-    path = urlparse(url).path
+    pu_ = urlparse(url)
+    path = pu_.path
     if path in ('', '/'):
-        return False
+        return bool({k.lower() for k in parse_qs(pu_.query)} & _VID_QUERY_KEYS)
     return bool(re.search(
-        r'/video\.|/video\d+|/videos?/[^/]+-\d+|/videos?/[^/]+-xh[A-Za-z0-9]+/?$|'
+        r'/video\.|/video\d+|/videos?/[^/]+-\d+|/(?:videos?|shorts)/[^/]+-xh[A-Za-z0-9]+/?$|'
         r'/post/\d+|/watch/|/v/|/film/|/view_video|\.html?$', path))
 
 
@@ -776,8 +928,17 @@ async def build_page_urls(url: str, start: int, end: int) -> List[str]:
             if '{p}' in t:
                 templates.append(t)
 
+    if html1:
+        pm = re.search(r'href=["\']([^"\']*[?&](?:p|page|pg|paged|pagenum|pageno)=2(?:&[^"\']*)?)["\']', html1, re.I)
+        if pm:
+            href2 = urljoin(url, pm.group(1).replace('&amp;', '&'))
+            t2 = re.sub(r'([?&](?:p|page|pg|paged|pagenum|pageno)=)2(?=&|$)', r'\g<1>{p}', href2, count=1)
+            if '{p}' in t2 and t2 not in templates:
+                templates.insert(0, t2)
+
     if '?' in url:
         templates.append(url + "&page={p}")
+        templates.append(url + "&p={p}")
     else:
         templates += [base + "/page/{p}/", base + "/{p}/", base + "?page={p}",
                       base + "/page/{p}", base + "/{p}", base + "/?page={p}"]
@@ -865,7 +1026,7 @@ def _rank(u: str) -> float:
 
 
 async def generic_extract(html: str, page_url: str, depth: int = 0) -> Optional[str]:
-    cands = _collect_candidates(html, page_url)
+    cands = await asyncio.to_thread(_collect_candidates, html, page_url)
     if cands:
         return sorted(cands, key=_rank)[0]
 
@@ -973,6 +1134,33 @@ async def build_auto_rule(url: str, domain: str) -> dict:
 
     links = [l for l in find_video_links(html0, url, use_rule=False)
              if l.rstrip('/') != url.rstrip('/')]
+    how = "listing"
+    if len(links) < 4:                                   # age-gate / consent page?
+        try:
+            got = await scr_unlock_gate(url, html0)
+        except Exception:
+            got = None
+        if got:
+            html0, url = got
+            links = [l for l in find_video_links(html0, url, use_rule=False)
+                     if l.rstrip('/') != url.rstrip('/')]
+            how = "age-gate bypass"
+    if len(links) < 2:                                   # JS site: embedded JSON / API se video pages
+        try:
+            d = await scr_spa_discover(url, html0, light=True)
+            alt = [l for l in d["links"] if l.rstrip('/') != url.rstrip('/')]
+            if len(alt) > len(links):
+                links, how = alt, "JSON/API"
+        except Exception:
+            pass
+    if len(links) < 2:                                   # sitemap.xml
+        try:
+            sm = await scr_sitemap(url)
+            alt = sm["links"][:12]
+            if len(alt) > len(links):
+                links, how = alt, "sitemap"
+        except Exception:
+            pass
     shapes: List[str] = []
     for l in links:
         sh = _shape(urlparse(l))
@@ -993,9 +1181,12 @@ async def build_auto_rule(url: str, domain: str) -> dict:
             samples.append((l, h))
 
     if not samples:
+        fails = [f"{l[:70]} -> HTTP {LAST_STATUS.get(l, '?')}" for l, h in zip(pick, pages) if not h]
         return {"ok": False, "report":
                 "❌ Koi video page sample nahi mila.\n"
-                "Listing me links nahi mile ya video pages fetch nahi hue.\n"
+                f"🔗 Listing se links mile: {len(links)} ({how})\n"
+                + ("🚫 Video page fetch fail:\n" + "\n".join(fails[:3]) + "\n" if fails else "")
+                + "Listing me links nahi mile ya video pages fetch nahi hue.\n"
                 f"Tip: kisi ek video page ka URL do: /addscr <video page URL>\n"
                 f"Detail: /debug {url}"}
 
@@ -1063,19 +1254,21 @@ async def build_manual_rule(url: str, domain: str, rx_text: str) -> dict:
 
 
 async def extract_video_link(video_url: str, source_page: str = "") -> Optional[dict]:
+    """Login cookie ke saath try, na mile to bina login ke try (cookie expire/galat ho tab bhi chalega)."""
+    res = await _extract_video_link_impl(video_url, source_page, True)
+    if res is None and get_cookie_for_url(video_url):
+        res = await _extract_video_link_impl(video_url, source_page, False)
+    return res
+
+
+async def _extract_video_link_impl(video_url: str, source_page: str = "",
+                                   use_cookie: bool = True) -> Optional[dict]:
     try:
-        text = await fetch(video_url, referer=source_page or None)
+        text = await fetch(video_url, referer=source_page or None, use_cookie=use_cookie)
         if not text:
             return None
 
-        title = "Video"
-        title_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE | re.DOTALL)
-        if not title_match:
-            title_match = re.search(r'<title>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
-
-        if title_match:
-            title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-            title = re.sub(r'\s+', ' ', title)
+        title = best_title(text)
 
         stream_link = None
         file_type = "VIDEO"
@@ -1110,8 +1303,13 @@ async def extract_video_link(video_url: str, source_page: str = "") -> Optional[
                         re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
             if xhn_match: stream_link = xhn_match.group(1)
 
-        elif "xhamster" in domain:
-            xh_link = xh_best_stream(text) or xh_from_initials(text)
+        elif "xhamster" in domain or "xhaccess" in domain:   # xhaccess = xHamster mirror
+            xh_id = re.search(r'-((?:xh)?[A-Za-z0-9]{5,})/?$', urlparse(video_url).path)
+            if xh_id and xh_id.group(1) not in text:
+                EXTRACT_NOTE["v"] = (f"{video_url}\n⚠️ Page me video-id nahi mila "
+                                     f"(login wall / landing page / redirect)\n{page_diag(text)}")
+                return None
+            xh_link = await asyncio.to_thread(_xh_parse, text)
             if not xh_link:
                 xh_match = re.search(r'"m3u8":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
                            re.search(r'"mp4":\s*["\'](https?:[^\s"\']+?)["\']', text) or \
@@ -1317,6 +1515,8 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
 
     results = [r for r in await asyncio.gather(
         *[sem_extract(v, s) for v, s in url_to_source.items()]) if r]
+    results, dropped = clean_results(results)
+    rep["dropped"] = dropped
     rep["extracted"] = len(results)
     return results
 
@@ -1803,7 +2003,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Full Web Player UI: Custom Video & Media Player interface in HTML.\n"
         "2. 4 Files Export: 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
         "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n\n"
-        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /stop, /stats, /userlist, /debug, /dump"
+        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1869,8 +2069,15 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
              f"curl_cffi: {'YES' if cffi_requests else 'NO'})",
              link_stats(html, url)]
     if _looks_like_single_video(url):
-        item = await extract_video_link(url, source_page=url)
-        lines.append(f"▶ Extract (this video page): {item['download_link'] if item else 'FAILED'}")
+        if get_cookie_for_url(url):
+            a = await _extract_video_link_impl(url, url, True)
+            b = await _extract_video_link_impl(url, url, False)
+            lines.append(f"🔑 With login   : {a['download_link'] if a else 'FAILED'}")
+            lines.append(f"🔓 Without login: {b['download_link'] if b else 'FAILED'}")
+            item = a or b
+        else:
+            item = await extract_video_link(url, source_page=url)
+            lines.append(f"▶ Extract (this video page, no login saved): {item['download_link'] if item else 'FAILED'}")
         if not item:
             lines.append(page_diag(html))
         await update.message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
@@ -1907,7 +2114,7 @@ async def dump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf.name = "page_dump.html"
     await update.message.reply_document(document=buf, caption=f"Raw HTML ({len(html)} bytes) of {url}")
 
-async def save_cookie_flow(update: Update, domain: str, raw_cookie: str):
+async def save_cookie_flow(update: Update, domain: str, raw_cookie: str, merge: bool = False):
     """Saves cookie for a domain, deletes the user's message (it contains secrets) and tests the site."""
     cookie = clean_cookie(raw_cookie)
     try:
@@ -1917,7 +2124,22 @@ async def save_cookie_flow(update: Update, domain: str, raw_cookie: str):
     if not domain or '=' not in cookie:
         await update.effective_chat.send_message("❌ Invalid cookie. Format: name=value; name2=value2; ...")
         return
+    detail = ""
+    old = get_cookie_for_url(f"https://{domain}/") if merge else None
+    if merge and old:                      # purani cookie me merge: same naam replace, naye add
+        od, nd = parse_cookie_str(old), parse_cookie_str(cookie)
+        added = [k for k in nd if k not in od]
+        changed = [k for k in nd if k in od and od[k] != nd[k]]
+        same = len(nd) - len(added) - len(changed)
+        od.update(nd)
+        cookie = "; ".join(f"{k}={v}" for k, v in od.items())
+        detail = (f"➕ Naye: {', '.join(added[:8]) or '-'}\n"
+                  f"✏️ Badle: {', '.join(changed[:8]) or '-'}\n"
+                  f"＝ Same: {same}\n")
+    elif merge:
+        detail = "ℹ️ Pehle is site ki cookie saved nahi thi, nayi save ho gayi.\n"
     set_cookie_db(domain, cookie)
+    REDIRECTED.clear()
     n = len([c for c in cookie.split(';') if '=' in c])
     test_url = f"https://{domain}/"
     html = await fetch(test_url)
@@ -1928,8 +2150,10 @@ async def save_cookie_flow(update: Update, domain: str, raw_cookie: str):
                 f"({LAST_DETAIL.get(test_url, '')})\n"
                 "Cookie save ho gayi, par block/IP ki problem alag hai. /debug se check karo.")
     await update.effective_chat.send_message(
-        f"🔑 Signed in: {domain}\n🍪 Cookies saved: {n}\n{test}\n"
-        f"🧹 Cookie wala message delete kar diya gaya.")
+        f"{'🔄 Cookie updated' if merge and old else '🔑 Signed in'}: {domain}\n{detail}🍪 Cookies saved: {n}\n{test}\n"
+        f"🧹 Cookie wala message delete kar diya gaya.\n"
+        f"💾 Render restart par cookie hat sakti hai: permanent ke liye env me "
+        f"SITE_COOKIE_1 = domain|cookie rakho.")
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/login <domain> <cookie string>"""
@@ -1943,6 +2167,36 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ya /site -> Sign In button dabao.")
         return
     await save_cookie_flow(update, normalize_domain(parts[1]), parts[2])
+
+async def updatecookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/updatecookie <domain> [cookie]  -> saved cookie me nayi cookie merge (same naam replace, naye add)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    parts = (update.message.text or "").split(None, 2)
+    if len(parts) < 2:
+        saved = list_cookie_domains()
+        await update.message.reply_text(
+            "🔄 /updatecookie <domain> <cookie>\n"
+            "ya sirf /updatecookie <domain>  (phir cookie alag message me bhejo)\n\n"
+            "• Purani cookie me merge hoti hai: same naam wali replace, naye add, baaki purani rahengi.\n"
+            "• Poori badalni ho to: /login <domain> <cookie>\n"
+            "• /site me har signed-in site ke saath 🔄 Update button bhi hai.\n\n"
+            f"Signed-in sites: {', '.join(saved) if saved else 'none'}")
+        return
+    domain = normalize_domain(parts[1])
+    if not DOMAIN_RE.match(domain):
+        await update.message.reply_text(f"❌ Invalid domain: {parts[1]}")
+        return
+    if len(parts) >= 3:
+        await save_cookie_flow(update, domain, parts[2], merge=True)
+        return
+    context.user_data['await_cookie'] = domain
+    context.user_data['cookie_merge'] = True
+    await update.message.reply_text(
+        f"🔄 {domain} ki NAYI cookie ab bhejo (name=value; name2=value2; ...).\n"
+        "Purani me merge hogi. Cancel karne ke liye: cancel\n"
+        "Message save hote hi auto-delete ho jayega.")
+
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/logout <domain>  or  /logout all"""
@@ -2015,7 +2269,8 @@ async def site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if d != "xhamster46.desi":
                 keyboard.append([InlineKeyboardButton(f"🔑 Sign In {d}", callback_data=f"signin:{d}"[:64])])
         for d in sorted(saved):
-            keyboard.append([InlineKeyboardButton(f"🚪 Sign Out {d}", callback_data=f"signout:{d}"[:64])])
+            keyboard.append([InlineKeyboardButton(f"🔄 Update {d}", callback_data=f"cookieupd:{d}"[:64]),
+                             InlineKeyboardButton("🚪 Sign Out", callback_data=f"signout:{d}"[:64])])
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
@@ -2276,7 +2531,8 @@ async def run_scrape_chunk(update_or_query, context, target_url: str, start_page
                 f"🚫 Failed: {r['pages_fail'][:3]}\n"
                 f"🔗 Links found: {r['links']}\n"
                 f"✅ Extracted: {r['extracted']}\n"
-                f"{block_hint(target_url)}{note_hint()}\n"
+                f"🧹 Junk/duplicate hataye: {r.get('dropped', 0)}\n"
+                f"{block_hint(target_url)}{note_hint()}{login_hint(target_url)}\n"
                 f"Detail ke liye: /debug {target_url}\nRaw HTML ke liye: /dump {target_url}"
             )
             return
@@ -2364,10 +2620,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_domain = context.user_data.get('await_cookie')
     if pending_domain and user_id == ADMIN_ID:
         context.user_data.pop('await_cookie', None)
+        merge = context.user_data.pop('cookie_merge', False)
         if text.lower() == "cancel":
-            await update.message.reply_text("❎ Sign in cancel ho gaya.")
+            await update.message.reply_text("❎ Cancel ho gaya.")
             return
-        await save_cookie_flow(update, pending_domain, text)
+        await save_cookie_flow(update, pending_domain, text, merge=merge)
         return
 
     cf = context.user_data.get('cookie_flow')
@@ -2390,11 +2647,20 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if not is_user_allowed(query.from_user.id): return
 
-    if query.data.startswith("signin:") or query.data.startswith("signout:"):
+    if query.data.startswith(("signin:", "signout:", "cookieupd:")):
         if query.from_user.id != ADMIN_ID:
             return
         action, dom = query.data.split(":", 1)
-        if action == "signin":
+        if action == "cookieupd":
+            context.user_data['await_cookie'] = dom
+            context.user_data['cookie_merge'] = True
+            await query.message.reply_text(
+                f"🔄 {dom} ki NAYI cookie bhejo (name=value; name2=value2; ...).\n"
+                "Purani cookie me merge hogi: same naam wali replace, naye add.\n"
+                "Cancel karne ke liye: cancel\n"
+                "Message save hote hi auto-delete ho jayega.")
+        elif action == "signin":
+            context.user_data.pop('cookie_merge', None)
             context.user_data['await_cookie'] = dom
             await query.message.reply_text(
                 f"🔑 {dom} ke liye cookie string ab bhejo (name=value; name2=value2; ...).\n"
@@ -2427,8 +2693,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 # ==========================================================
 # /scr  ->  NEW-SITE FAST SCRAPER (auto domain-specific extractor)
 # ==========================================================
-SCR_CONCURRENCY = 24        # parallel video-page extractions (fast)
-SCR_PAGE_CONCURRENCY = 10   # parallel listing-page fetches
+SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "32"))        # parallel video-page extractions (fast)
+SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "12"))   # parallel listing-page fetches
 SCR_MAX_PAGES = 30          # max pages per single run
 _SCR_CACHE_TTL = 300        # seconds, html cache
 _FETCH_CACHE: Dict[str, tuple] = {}
@@ -2681,6 +2947,8 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
             ordered = [single]
             rep["links"] = max(rep["links"], 1)
 
+    ordered, dropped = clean_results(ordered)
+    rep["dropped"] = dropped
     rep["extracted"] = len(ordered)
     return ordered, rep
 
@@ -2779,7 +3047,8 @@ async def scr_run(chat, context, user_id: int, url: str, start: int, end: int):
                f"🔗 Links: {rep['links']} | ✅ Extracted: {rep['extracted']}\n")
         if rep.get("diag"):
             msg += f"\n🔍 Diagnosis:\n{rep['diag']}\n"
-        msg += block_hint(url) + note_hint()
+        msg += (f"🧹 Junk/duplicate hataye: {rep.get('dropped', 0)}\n"
+                + block_hint(url) + note_hint() + login_hint(url))
         msg += ("\n💡 Ye site JS se load hoti lagti hai. Browser DevTools -> Network -> XHR/Fetch me jo "
                 "videos-list API URL dikhe wo bhejo, ya /dump " + url + " ki HTML file bhejo.")
         await status.edit_text(msg[:4000], disable_web_page_preview=True)
@@ -3517,6 +3786,7 @@ def main():
         raise SystemExit("❌ BOT_TOKEN environment variable set nahi hai. "
                          "Naya token BotFather se lo aur env me BOT_TOKEN=... rakho.")
     init_db()
+    load_env_cookies()
     threading.Thread(target=run_dummy_server, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
@@ -3537,6 +3807,7 @@ def main():
     app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("logout", logout_command))
     app.add_handler(CommandHandler("cookie", cookie_command))
+    app.add_handler(CommandHandler("updatecookie", updatecookie_command))
 
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
