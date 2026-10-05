@@ -701,6 +701,9 @@ JUNK = re.compile(
 
 LAST_STATUS: Dict[str, int] = {}
 REDIRECTED: Dict[str, str] = {}          # url -> final url (login/landing par redirect hua)
+LAST_ERR: Dict[str, str] = {}            # url -> last exception (asli karan dikhane ke liye)
+_URL_FIX: Dict[str, tuple] = {}          # root host -> (scheme, www?)  (jo URL form asal me chalta hai)
+_ALT_TRIED: Dict[str, int] = {}
 _VID_QUERY_KEYS = {'v', 'id', 'video', 'vid', 'viewkey', 'video_id', 'watch', 'view', 'clip', 'vi'}
 LAST_REPORT: dict = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0}
 
@@ -825,21 +828,107 @@ def _fetch_once(url: str, referer: Optional[str] = None, use_cookie: bool = True
             logger.warning(f"fetch {url} -> HTTP {r.status_code} ({name})")
         except Exception as e:
             detail.append(f"{name}:error")
+            LAST_ERR[url] = f"{name}: {type(e).__name__}: {str(e)[:110]}"
             logger.warning(f"fetch {url} error ({name}): {e}")
     LAST_DETAIL[url] = ", ".join(detail)
     return None
+
+
+def fix_url(url: str) -> str:
+    """Seekha hua working form lagao (http/https, www/non-www) - sirf apex/www host par."""
+    try:
+        pu = urlparse(url)
+        if not pu.netloc or ':' in pu.netloc:
+            return url
+        root = _root_host(pu.netloc)
+        fx = _URL_FIX.get(root)
+        host = pu.netloc.lower()
+        if not fx or host not in (root, "www." + root):
+            return url
+        scheme, www = fx
+        return pu._replace(scheme=scheme, netloc=("www." + root) if www else root).geturl()
+    except Exception:
+        return url
+
+
+def _alt_urls(url: str) -> List[str]:
+    pu = urlparse(url)
+    if not pu.netloc or ':' in pu.netloc:
+        return []
+    host, root = pu.netloc.lower(), _root_host(pu.netloc)
+    if host not in (root, "www." + root):
+        return []
+    other_host = root if host.startswith("www.") else "www." + root
+    other_scheme = "http" if pu.scheme == "https" else "https"
+    combos = [(pu.scheme, other_host), (other_scheme, host), (other_scheme, other_host)]
+    return [pu._replace(scheme=sc, netloc=h).geturl() for sc, h in combos]
+
+
+def _conn_failed(url: str) -> bool:
+    """Saare engines exception se fail hue (koi HTTP status nahi) -> DNS/SSL/connection problem."""
+    d = LAST_DETAIL.get(url, "")
+    return bool(d) and "error" in d and not re.search(r':(?:\d{3}|challenge|login-redirect)\b', d)
+
+
+def _fetch_alias(url: str, referer: Optional[str] = None, use_cookie: bool = True) -> Optional[str]:
+    real = fix_url(url)
+    html = _fetch_once(real, referer, use_cookie)
+    if real != url:
+        for d in (LAST_STATUS, LAST_DETAIL, LAST_ERR, REDIRECTED):
+            if real in d:
+                d[url] = d[real]
+    return html
+
+
+def _try_alt_urls(url: str, referer: Optional[str], use_cookie: bool) -> Optional[str]:
+    """https<->http aur www<->non-www try karo; jo chale use yaad rakho (_URL_FIX)."""
+    root = _root_host(urlparse(url).netloc)
+    if root in _URL_FIX or _ALT_TRIED.get(root, 0) >= 3:
+        return None
+    alts = _alt_urls(url)
+    if not alts:
+        return None
+    _ALT_TRIED[root] = _ALT_TRIED.get(root, 0) + 1
+    for alt in alts:
+        html = _fetch_once(alt, referer, use_cookie)
+        if html:
+            ap = urlparse(alt)
+            _URL_FIX[root] = (ap.scheme, ap.netloc.lower().startswith("www."))
+            logger.info(f"URL fix learned: {root} -> {ap.scheme}://{ap.netloc}")
+            LAST_DETAIL[url] = ""
+            LAST_STATUS[url] = 200
+            LAST_ERR.pop(url, None)
+            return html
+    return None
+
+
+def err_hint(url: str) -> str:
+    e = (LAST_ERR.get(url) or "").lower()
+    if not e:
+        return ""
+    if re.search(r'resolve|name or service|getaddrinfo|dns|nodename|no address', e):
+        return "💡 DNS: domain resolve nahi ho raha. Spelling ya www ke saath (http://www.site.com/) try karo.\n"
+    if re.search(r'ssl|certificate|handshake|tls', e):
+        return "💡 SSL/https problem: site shayad sirf http:// par hai, http:// se try karo.\n"
+    if re.search(r'refused|reset', e):
+        return "💡 Connection refused/reset: ye scheme band hai ya IP block hai (https<->http try karo).\n"
+    if re.search(r'timed out|timeout', e):
+        return "💡 Timeout: site slow hai ya IP block ho sakti hai (PROXY_URL / ghar ka IP).\n"
+    return ""
 
 
 def fetch_sync(url: str, referer: Optional[str] = None, use_cookie: bool = True) -> Optional[str]:
     """Login cookie saved ho to pehle usse, fail ho to bina login ke bhi try (dono mode kaam karein)."""
     root = _root_host(urlparse(url).netloc)
     has_cookie = bool(get_cookie_for_url(url))
-    html = _fetch_once(url, referer, use_cookie)
+    html = _fetch_alias(url, referer, use_cookie)
     if html is None and has_cookie and use_cookie:
         first = LAST_DETAIL.get(url, "")
-        html = _fetch_once(url, referer, False)
+        html = _fetch_alias(url, referer, False)
         if html is None:
             LAST_DETAIL[url] = f"with-login[{first}] | no-login[{LAST_DETAIL.get(url, '')}]"
+    if html is None and _conn_failed(url):
+        html = _try_alt_urls(url, referer, use_cookie)
     st = _HOST_STATS.setdefault(root, {"ok": 0, "fail": 0})
     st["ok" if html else "fail"] += 1
     return html
@@ -879,7 +968,7 @@ def find_video_links(html: str, page_url: str, use_rule: bool = True) -> List[st
         href = href.strip().replace('&amp;', '&').replace('\\/', '/')
         if not href or href.startswith(('javascript:', '#', 'mailto:', 'tel:', 'data:')):
             return
-        full = urljoin(page_url, href).split('#')[0]
+        full = fix_url(urljoin(page_url, href).split('#')[0])
         pu = urlparse(full)
         if pu.scheme not in ('http', 'https'):
             return
@@ -1504,6 +1593,7 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
             elif any(ext in final_link.lower() for ext in ['.mp3', '.wav', '.m4a', '.aac']): file_type = "AUDIO"
             elif any(ext in final_link.lower() for ext in ['.jpg', '.png', '.jpeg', '.webp']): file_type = "IMAGE"
 
+            variants = await asyncio.to_thread(make_variants, final_link, text, video_url)
             return {
                 "title": title,
                 "type": file_type,
@@ -1512,7 +1602,8 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
                 "download_link": final_link,
                 "expires": stream_expiry(final_link),
                 "thumb": best_thumb(text, video_url),
-                "duration": best_duration(text)
+                "duration": best_duration(text),
+                "variants": variants
             }
     except Exception as e:
         logger.error(f"Extraction Error for {video_url}: {e}")
@@ -1555,7 +1646,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
             return [res]
         # extraction failed -> maybe it was actually a listing page, continue below
 
-    page_urls = await build_page_urls(url, start_page, end_page)
+    page_urls = [fix_url(x) for x in await build_page_urls(url, start_page, end_page)]
     url_to_source: Dict[str, str] = {}
 
     async def crawl(pu: str):
@@ -1645,6 +1736,39 @@ def best_duration(text: str) -> int:
     return 0
 
 
+_Q_FILE_RX = re.compile(r'^(?P<pre>[^?#]*/)(?P<q>\d{3,4}p|_TPL_)(?P<post>\.[^/?#]*)(?P<qs>[?#].*)?$')
+
+
+def make_variants(link: str, text: str = "", page_url: str = "") -> List[dict]:
+    """Quality options [{'q':1080,'u':url},...] (desc). xhamster 'multi=' list, <source label/res>, URL ke token se."""
+    found: Dict[int, str] = {}
+    fm = _Q_FILE_RX.match(link)
+    mm = re.search(r'multi=([^/]+)', unquote(link))
+    if mm and fm:
+        for lab in re.findall(r'(\d{3,4})p', mm.group(1)):
+            found[int(lab)] = fm.group('pre') + lab + 'p' + fm.group('post') + (fm.group('qs') or '')
+    if text and len(found) < 2:
+        for m in re.finditer(r'<source\b([^>]*)>', text[:400000], re.I):
+            attrs = m.group(1)
+            sm = re.search(r'\bsrc=["\']([^"\']+)["\']', attrs, re.I)
+            qm = re.search(r'\b(?:label|title|res|size|data-res|data-quality)=["\']?(\d{3,4})p?\b', attrs, re.I)
+            if sm and qm:
+                u = _clean(sm.group(1), page_url or link)
+                if _valid_stream_url(u):
+                    found.setdefault(int(qm.group(1)), u)
+    if found:
+        q0 = None
+        if fm and fm.group('q') != '_TPL_':
+            q0 = int(fm.group('q')[:-1])
+        else:
+            tm = re.search(r'(\d{3,4})p', link.split('?')[0].rsplit('/', 1)[-1])
+            q0 = int(tm.group(1)) if tm else None
+        if q0:
+            found.setdefault(q0, link)
+    out = [{"q": q, "u": u} for q, u in sorted(found.items(), reverse=True) if 100 <= q <= 4320]
+    return out if len(out) >= 2 else []
+
+
 _PLAYER_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -1689,6 +1813,7 @@ a{color:inherit}
 /* ---------- grid ---------- */
 .bar{display:flex;justify-content:space-between;align-items:center;padding:4px 16px 8px;color:var(--tx2);font-size:13px}
 .bar select{background:var(--chip);color:var(--tx);border:0;border-radius:8px;padding:6px 8px;font-size:13px}
+.clr{background:var(--chip);color:var(--tx);border-radius:8px;padding:6px 10px;font-size:13px;margin-right:8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:22px 16px;padding:8px 16px 40px}
 .card{cursor:pointer;min-width:0;outline:0}
 .thumb{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:linear-gradient(135deg,var(--g1,#333),var(--g2,#111))}
@@ -1786,11 +1911,11 @@ a{color:inherit}
 <header class="top">
   <a class="logo" href="#/"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><b id="siteT"></b></a>
   <div class="search"><input id="q" type="search" placeholder="Search" autocomplete="off"><button id="qclr" hidden>&#10005;</button></div>
-  <div class="tools"><button id="themeB" title="Theme">&#127763;</button><a id="tgB" target="_blank" rel="noopener" title="Telegram">&#9992;</a></div>
+  <div class="tools"><button id="setB" title="Menu (clear history / export)">&#9881;</button><button id="themeB" title="Theme">&#127763;</button><a id="tgB" target="_blank" rel="noopener" title="Telegram">&#9992;</a></div>
 </header>
 <nav class="chips" id="chips"></nav>
 <main id="home">
-  <div class="bar"><span id="count"></span><select id="sort"><option value="def">Default</option><option value="az">A &rarr; Z</option><option value="za">Z &rarr; A</option><option value="long">Longest</option><option value="short">Shortest</option></select></div>
+  <div class="bar"><span id="count"></span><span class="rt"><button class="clr" id="clr" hidden></button><select id="sort"><option value="def">Default</option><option value="az">A &rarr; Z</option><option value="za">Z &rarr; A</option><option value="long">Longest</option><option value="short">Shortest</option></select></span></div>
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" hidden></div>
   <div class="foot" id="foot"></div>
@@ -1915,7 +2040,7 @@ function extLinks(u){
 /* ---------- state ---------- */
 var FAV=LS.get("ytb_fav",{}),LATER=LS.get("ytb_later",{}),HIST=LS.get("ytb_hist",{});
 var ALL=DATA.slice(),BYURL={},DUR={},THUMBS={};
-function slim(it){return {t:it.t,u:it.u,k:it.k,p:it.p,th:it.th,d:it.d}}
+function slim(it){return {t:it.t,u:it.u,k:it.k,p:it.p,th:it.th,d:it.d,v:it.v}}
 ALL.forEach(function(it){BYURL[it.u]=it});
 [FAV,LATER].forEach(function(m){Object.keys(m).forEach(function(u){if(!BYURL[u]&&m[u]&&m[u].u){var o=m[u];o._x=1;BYURL[u]=o;ALL.push(o)}})});
 Object.keys(HIST).forEach(function(u){var h=HIST[u];if(!BYURL[u]&&h&&h.it&&h.it.u){h.it._x=1;BYURL[u]=h.it;ALL.push(h.it)}});
@@ -2035,19 +2160,55 @@ function updChips(){
     b.onclick=function(){VIEW.chip=d[0];updChips();renderGrid()};chipsEl.appendChild(b);
   });
 }
-function popMenu(anchor,it){
+function showPop(anchor,entries){
   closePop();
   var p=el("div","pop");p.id="pop";
-  function add(txt,fn){var b=el("button","",txt);b.onclick=function(e){e.stopPropagation();closePop();fn()};p.appendChild(b)}
-  add("\u25B6  Play",function(){go(it)});
-  add((FAV[it.u]?"\u2665  Remove favorite":"\u2661  Add to favorites"),function(){toggleFav(it);renderGrid()});
-  add((LATER[it.u]?"\u23F1  Remove from Watch later":"\u23F1  Watch later"),function(){toggleLater(it);if(VIEW.chip==="later")renderGrid()});
-  add("\uD83D\uDCCB  Copy link",function(){copy(it.u)});
-  extLinks(it.u).forEach(function(x){var a=el("a","","\uD83D\uDCFA  "+(x.n==="Open link"?"Open / Download":"Open in "+x.n));a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";p.appendChild(a)});
+  entries.forEach(function(en){
+    if(en.href){var a=el("a","",en.t);a.href=en.href;a.target="_blank";a.rel="noopener noreferrer";p.appendChild(a)}
+    else{var b=el("button","",en.t);b.onclick=function(e){e.stopPropagation();closePop();en.f()};p.appendChild(b)}
+  });
   document.body.appendChild(p);
-  var r=anchor.getBoundingClientRect(),w=p.offsetWidth||200,hh=p.offsetHeight||240;
+  var r=anchor.getBoundingClientRect(),w=p.offsetWidth||220,hh=p.offsetHeight||240;
   p.style.left=Math.max(8,Math.min(window.innerWidth-w-8,r.right-w))+"px";
   p.style.top=Math.max(8,Math.min(window.innerHeight-hh-8,r.bottom+4))+"px";
+}
+function popMenu(anchor,it){
+  var e=[
+    {t:"\u25B6  Play",f:function(){go(it)}},
+    {t:(FAV[it.u]?"\u2665  Remove favorite":"\u2661  Add to favorites"),f:function(){toggleFav(it);renderGrid()}},
+    {t:(LATER[it.u]?"\u23F1  Remove from Watch later":"\u23F1  Watch later"),f:function(){toggleLater(it);if(VIEW.chip==="later")renderGrid()}},
+    {t:"\uD83D\uDCCB  Copy link",f:function(){copy(it.u)}}
+  ];
+  if(HIST[it.u])e.push({t:"\uD83D\uDDD1  Remove from history",f:function(){delete HIST[it.u];LS.set("ytb_hist",HIST);toast("Removed from history");updChips();renderGrid()}});
+  extLinks(it.u).forEach(function(x){e.push({t:"\uD83D\uDCFA  "+(x.n==="Open link"?"Open / Download":"Open in "+x.n),href:x.h})});
+  showPop(anchor,e);
+}
+function clearList(kind){
+  var nm={hist:"history",fav:"favorites",later:"watch later"};
+  if(kind==="all"){
+    if(!confirm("Saara saved data (favorites, watch later, history) delete karna hai?"))return;
+    FAV={};LATER={};HIST={};LS.set("ytb_fav",FAV);LS.set("ytb_later",LATER);LS.set("ytb_hist",HIST);toast("Sab saaf ho gaya");
+  }else{
+    if(!confirm("Poori "+nm[kind]+" delete karni hai?"))return;
+    if(kind==="hist"){HIST={};LS.set("ytb_hist",HIST)}else if(kind==="fav"){FAV={};LS.set("ytb_fav",FAV)}else{LATER={};LS.set("ytb_later",LATER)}
+    toast(nm[kind]+" cleared");
+  }
+  updChips();renderGrid();
+}
+function exportFav(){
+  var l=Object.keys(FAV).map(function(u){return FAV[u]});
+  if(!l.length){toast("Favorites khali hain");return}
+  var txt="#EXTM3U\n"+l.map(function(i){return "#EXTINF:-1,"+(i.t||"Video").replace(/[\r\n]+/g," ")+"\n"+i.u}).join("\n")+"\n";
+  try{var b=new Blob([txt],{type:"audio/x-mpegurl"}),a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="favorites.m3u";document.body.appendChild(a);a.click();a.remove();toast("favorites.m3u download ho gayi")}catch(e){copy(txt)}
+}
+function gearMenu(anchor){
+  showPop(anchor,[
+    {t:"\uD83D\uDDD1  Clear history ("+Object.keys(HIST).length+")",f:function(){clearList("hist")}},
+    {t:"\uD83D\uDDD1  Clear favorites ("+Object.keys(FAV).length+")",f:function(){clearList("fav")}},
+    {t:"\uD83D\uDDD1  Clear watch later ("+Object.keys(LATER).length+")",f:function(){clearList("later")}},
+    {t:"\u26A0  Reset all saved data",f:function(){clearList("all")}},
+    {t:"\u2B07  Export favorites (M3U)",f:exportFav}
+  ]);
 }
 function closePop(){var p=$("#pop");if(p)p.remove()}
 document.addEventListener("click",closePop);
@@ -2072,6 +2233,9 @@ function renderGrid(){
   LIST=computeList();grid.textContent="";
   var frag=document.createDocumentFragment();LIST.forEach(function(it){frag.appendChild(mkCard(it))});grid.appendChild(frag);
   $("#count").textContent=LIST.length+" item"+(LIST.length===1?"":"s");
+  var clr=$("#clr"),cc=VIEW.chip;
+  if((cc==="hist"||cc==="fav"||cc==="later")&&LIST.length){clr.hidden=false;clr.textContent="\uD83D\uDDD1 Clear "+(cc==="hist"?"history":cc==="fav"?"favorites":"watch later");clr.onclick=function(){clearList(cc)}}
+  else clr.hidden=true;
   var em=$("#empty");em.hidden=LIST.length>0;
   if(!LIST.length)em.textContent=VIEW.chip==="fav"?"Koi favorite nahi. Kisi video par \u2661 dabao.":VIEW.chip==="later"?"Watch later khali hai.":VIEW.chip==="hist"?"Abhi koi video nahi dekha.":"Kuch nahi mila.";
 }
@@ -2079,6 +2243,7 @@ function go(it){location.hash="#/w/"+ALL.indexOf(it)}
 
 /* ---------- player ---------- */
 var V=$("#v"),PL=$("#pl"),hls=null,mp=null,dash=null,retries=0,hideT,lastSave=0,dragging=false,IMGV=$("#imgv");
+var CURQ="auto",SEEK_AT=0,CURURL="";
 var isTouch=false;try{isTouch=window.matchMedia&&matchMedia("(pointer:coarse)").matches}catch(e){}
 function destroyEngines(){
   try{if(hls){hls.destroy()}}catch(e){}hls=null;
@@ -2093,7 +2258,9 @@ function showErr(msg,it){
   e.textContent="";e.hidden=false;setLoading(false);
   e.appendChild(el("div","",msg));
   var box=el("div","eb");
-  var rt=el("button","","Retry");rt.onclick=function(){if(CUR)loadItem(CUR)};box.appendChild(rt);
+  var rt=el("button","","Retry");rt.onclick=function(){if(CUR)loadItem(CUR,{url:CURURL,keepQ:true,at:V.currentTime})};box.appendChild(rt);
+  var lv=lowerVariant();
+  if(lv){var lb=el("button","","Try "+lv[0]+"p");lb.onclick=function(){CURQ=lv[0];loadItem(CUR,{url:lv[1],keepQ:true,at:V.currentTime})};box.appendChild(lb)}
   if(it){
     extLinks(it.u).forEach(function(x){var a=el("a","",x.n==="Open link"?"Open / Download":x.n);a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";box.appendChild(a)});
     var cp=el("button","","Copy link");cp.onclick=function(){copy(it.u)};box.appendChild(cp);
@@ -2101,22 +2268,48 @@ function showErr(msg,it){
   e.appendChild(box);
 }
 function fail(it,why){showErr((why||"Ye stream browser me play nahi ho raha")+" ("+fmtOf(it)+"). Kisi external player me kholo:",it)}
-function buildQuality(){
-  var b=$("#bQ");if(!hls||!hls.levels||hls.levels.length<2){b.hidden=true;return}
-  b.hidden=false;b.textContent="Auto";
+function hasVariants(it){return !!(it&&it.v&&it.v.length>1)}
+function qLabel(q){return q+"p"+(q>=720?" HD":"")}
+function curQ(){
+  if(CURQ!=="auto")return CURQ;
+  var v=CUR&&CUR.v;if(v)for(var i=0;i<v.length;i++)if(v[i][1]===CUR.u)return v[i][0];
+  return null;
 }
-function loadItem(it){
+function lowerVariant(){
+  if(!hasVariants(CUR))return null;
+  var cq=curQ(),v=CUR.v;
+  for(var i=0;i<v.length;i++){if(cq==null||v[i][0]<cq)return v[i]}
+  return null;
+}
+function updQBtn(){
+  var b=$("#bQ"),hl=hls&&hls.levels&&hls.levels.length>1;
+  if(!hl&&!hasVariants(CUR)){b.hidden=true;return}
+  b.hidden=false;
+  if(hl){var lv=hls.levels[hls.currentLevel];b.textContent=(hls.currentLevel>=0&&lv&&lv.height)?lv.height+"p":"Auto"}
+  else{var q=curQ();b.textContent=q?q+"p":"Auto"}
+}
+function buildQuality(){updQBtn()}
+function setQuality(v){
+  var u=CUR.u;
+  if(v!=="auto"){for(var i=0;i<CUR.v.length;i++)if(CUR.v[i][0]===v)u=CUR.v[i][1]}
+  CURQ=v;loadItem(CUR,{url:u,at:V.currentTime,keepQ:true});
+}
+function loadItem(it,opt){
+  opt=opt||{};
   destroyEngines();showErr("");retries=0;V.hidden=true;IMGV.hidden=true;$("#aud").hidden=true;$("#menu").hidden=true;
-  if(it.k==="IMAGE"){IMGV.hidden=false;IMGV.referrerPolicy="no-referrer";IMGV.src=it.u;setLoading(false);return}
+  if(!opt.keepQ)CURQ="auto";
+  var u=opt.url||it.u;CURURL=u;SEEK_AT=opt.at||0;
+  if(it.k==="IMAGE"){IMGV.hidden=false;IMGV.referrerPolicy="no-referrer";IMGV.src=it.u;setLoading(false);updQBtn();return}
   if(it.k==="PDF"){showErr("PDF file hai.",it);return}
-  V.hidden=false;$("#aud").hidden=!isAudio(it);setLoading(true);
-  var eng=engineOf(it),u=it.u;
+  V.hidden=false;$("#aud").hidden=!isAudio(it);setLoading(true);updQBtn();
+  var eng=engineOf({u:u,k:it.k});
   var go2=function(){var p=V.play();if(p&&p.catch)p.catch(function(){})};
   if(eng==="hls"){
     loadScript(HLS_URL).then(function(){
       if(window.Hls&&Hls.isSupported()){
         hls=new Hls({enableWorker:true,maxBufferLength:40});
         hls.on(Hls.Events.MANIFEST_PARSED,function(){buildQuality();go2()});
+        hls.on(Hls.Events.LEVEL_SWITCHED,function(){updQBtn()});
         hls.on(Hls.Events.ERROR,function(e,d){
           if(!d.fatal)return;
           if(d.type===Hls.ErrorTypes.NETWORK_ERROR&&retries++<2){hls.startLoad()}
@@ -2163,6 +2356,7 @@ V.addEventListener("timeupdate",function(){
 });
 V.addEventListener("loadedmetadata",function(){
   updTime();if(CUR&&isFinite(V.duration))DUR[CUR.u]=V.duration;
+  if(SEEK_AT>1){try{V.currentTime=SEEK_AT}catch(e){}SEEK_AT=0;return}
   var h=CUR&&HIST[CUR.u];
   if(h&&h.pos>5&&isFinite(V.duration)&&h.pos<V.duration-8){V.currentTime=h.pos;toast("Resumed from "+fmtTime(h.pos))}
 });
@@ -2206,10 +2400,14 @@ $("#bSpd").onclick=function(){
   openMenu(sp,V.playbackRate,function(v){V.playbackRate=v;$("#bSpd").textContent=v+"x"});
 };
 $("#bQ").onclick=function(){
-  if(!hls||!hls.levels)return;
-  var it=[{v:-1,l:"Auto"}];
-  hls.levels.map(function(l,i){return {v:i,l:(l.height?l.height+"p":(Math.round(l.bitrate/1000)+"k")),h:l.height||0}}).sort(function(a,b){return b.h-a.h}).forEach(function(x){it.push(x)});
-  openMenu(it,hls.currentLevel,function(v){hls.currentLevel=v;var f=it.filter(function(x){return x.v===v})[0];$("#bQ").textContent=f?f.l:"Auto"});
+  if(hls&&hls.levels&&hls.levels.length>1){
+    var it=[{v:-1,l:"Auto"}];
+    hls.levels.map(function(l,i){return {v:i,l:(l.height?qLabel(l.height):(Math.round(l.bitrate/1000)+"k")),h:l.height||0}}).sort(function(a,b){return b.h-a.h}).forEach(function(x){it.push(x)});
+    openMenu(it,hls.currentLevel,function(v){hls.currentLevel=v;updQBtn()});
+  }else if(hasVariants(CUR)){
+    var items=[{v:"auto",l:"Auto"}].concat(CUR.v.map(function(p){return {v:p[0],l:qLabel(p[0])}}));
+    openMenu(items,CURQ,setQuality);
+  }
 };
 $("#bPip").onclick=function(){try{if(document.pictureInPictureElement)document.exitPictureInPicture();else if(V.requestPictureInPicture)V.requestPictureInPicture();else toast("PiP supported nahi")}catch(e){toast("PiP supported nahi")}};
 function toggleTheater(){document.body.classList.toggle("theater")}
@@ -2293,6 +2491,7 @@ function start(){
   $("#siteT").textContent=CFG.title;$("#foot").textContent=CFG.owner?"Credits: "+CFG.owner:"";
   var tg=$("#tgB");if(CFG.tg)tg.href=CFG.tg;else tg.hidden=true;
   var th=LS.get("ytb_theme","dark");document.documentElement.setAttribute("data-theme",th);
+  $("#setB").onclick=function(e){e.stopPropagation();gearMenu(this)};
   $("#themeB").onclick=function(){var n=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",n);LS.set("ytb_theme",n)};
   var q=$("#q"),qc=$("#qclr"),qt;
   q.oninput=function(){qc.hidden=!q.value;clearTimeout(qt);qt=setTimeout(function(){VIEW.q=q.value;renderGrid()},180)};
@@ -2311,7 +2510,7 @@ else{
   $("#lock").hidden=false;
   $("#pwb").onclick=unlock;$("#pw").onkeydown=function(e){if(e.key==="Enter")unlock()};
 }
-window.__ytb={sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
+window.__ytb={cur:function(){return {q:CURQ,u:CURURL}},sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
 })();
 </script>
 </body>
@@ -2325,7 +2524,8 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
     items = []
     for it in results:
         items.append({"t": it.get("title") or "Video", "u": it["download_link"], "k": it.get("type") or "VIDEO",
-                      "p": it.get("page_url") or "", "th": it.get("thumb") or "", "d": it.get("duration") or 0})
+                      "p": it.get("page_url") or "", "th": it.get("thumb") or "", "d": it.get("duration") or 0,
+                      "v": [[v["q"], v["u"]] for v in (it.get("variants") or [])]})
 
     def js(o) -> str:
         return (json.dumps(o, ensure_ascii=False).replace("</", "<\\/")
@@ -2408,12 +2608,15 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Fetch failed after {_dt:.1f}s. HTTP: {LAST_STATUS.get(url, '?')}\n"
             f"🔧 Engines: {LAST_DETAIL.get(url, '?')}\n"
+            f"🧯 Error: {LAST_ERR.get(url, '?')}\n{err_hint(url)}"
             f"curl_cffi installed: {'YES' if cffi_requests else 'NO'} | "
             f"Proxy set: {'YES' if PROXY_URL else 'NO'}\n\n"
             "403/503 = Cloudflare/IP block | 404 = wrong URL | ? = timeout/DNS")
         return
 
-    lines = [f"✅ Fetched {len(html)} bytes in {_dt:.1f}s "
+    _wk = fix_url(url)
+    lines = ([f"🔁 Working URL: {_wk}  (tumhara URL fail hua, ye chalta hai - bot ab isi ko use karega)"]
+             if _wk != url else []) + [f"✅ Fetched {len(html)} bytes in {_dt:.1f}s "
              f"(engine: {_BEST_ENGINE.get(_root_host(urlparse(url).netloc), '?')} | "
              f"curl_cffi: {'YES' if cffi_requests else 'NO'})",
              link_stats(html, url)]
@@ -3206,7 +3409,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
             rep.update(links=1, extracted=1)
             return [r], rep
 
-    page_urls = await build_page_urls(url, start, end)
+    page_urls = [fix_url(x) for x in await build_page_urls(url, start, end)]
     url_to_source: Dict[str, str] = {}
     psem = asyncio.Semaphore(SCR_PAGE_CONCURRENCY)
 
