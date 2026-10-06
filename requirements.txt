@@ -27,4 +27,4 @@ cloudscraper
 requests
 curl_cffi        # Cloudflare par behtar (real Chrome TLS)
 yt-dlp           # fallback extractor (hazaaron sites)
-# playwright     # optional: JS-heavy sites (pip install playwright && playwright install chromium)
+playwright     # optional: JS-heavy sites (pip install playwright && playwright install chromium)
