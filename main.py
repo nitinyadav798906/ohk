@@ -586,25 +586,74 @@ def best_title(text: str) -> str:
     return t[:200] or "Video"
 
 
+LAST_DROP: Dict[str, object] = {}
+
+
 def clean_results(items: List[dict]):
-    """Junk (landing/ad) title, ek hi stream 3+ pages par, duplicate page/stream hatao. -> (clean, dropped)"""
+    """Junk title / duplicate hatao. Ek hi stream 3+ pages par aaye (ad/promo) to har page ki apni
+    unique stream (page ke baaki candidates me se) chun kar REPAIR karo, na mile tabhi hatao.
+    -> (clean, dropped).  Reasons LAST_DROP me."""
     items = [i for i in items if i]
+    freq: Counter = Counter()
     by_link: Dict[str, set] = {}
     for it in items:
+        for c in set(it.get("_cands") or ()):
+            freq[c] += 1
         by_link.setdefault(it["download_link"], set()).add(it["page_url"])
+    reasons: Counter = Counter()
+    sample: Dict[str, str] = {}
     out, seen_pages, seen_links = [], set(), set()
     for it in items:
+        cands = it.get("_cands") or []
+        it = {k: v for k, v in it.items() if k != "_cands"}
         if _JUNK_TITLE.search(it.get("title") or ""):
+            reasons["junk_title"] += 1
+            sample.setdefault("title", it.get("title") or "")
             continue
-        if len(by_link[it["download_link"]]) >= 3:
-            continue
-        if it["page_url"] in seen_pages or it["download_link"] in seen_links:
+        link = it["download_link"]
+        if len(by_link[link]) >= 3:                        # shared stream: ad/promo ya galat pick
+            alt = [c for c in cands if freq[c] == 1 and c != link]
+            if alt:
+                best = sorted(alt, key=_rank)[0]
+                link = process_tpl_link(best) if ".m3u8" in best else best
+                it["download_link"] = link
+                it["variants"] = make_variants(link, "", it.get("page_url") or "")
+                it["expires"] = stream_expiry(link)
+                reasons["repaired"] += 1
+            else:
+                reasons["shared_stream"] += 1
+                sample.setdefault("shared", by_link and link)
+                continue
+        if it["page_url"] in seen_pages or link in seen_links:
+            reasons["duplicate"] += 1
             continue
         seen_pages.add(it["page_url"])
-        seen_links.add(it["download_link"])
+        seen_links.add(link)
         out.append(it)
+    before = len(out)
     out = apply_filters(out)
+    if before != len(out):
+        reasons["filters(/settings)"] += before - len(out)
+    LAST_DROP.clear()
+    LAST_DROP.update(dict(reasons))
+    LAST_DROP["sample"] = sample
     return out, len(items) - len(out)
+
+
+def drop_hint() -> str:
+    d = LAST_DROP
+    if not d:
+        return ""
+    parts = [f"{k}={v}" for k, v in d.items() if k != "sample" and v]
+    if not parts:
+        return ""
+    s_ = "🧹 Karan: " + ", ".join(parts) + "\n"
+    smp = d.get("sample") or {}
+    if smp.get("shared"):
+        s_ += f"   shared stream (sab pages par same): {str(smp['shared'])[:110]}\n"
+    if smp.get("title"):
+        s_ += f"   junk title: {str(smp['title'])[:60]}\n"
+    return s_
 
 
 def login_hint(url: str) -> str:
@@ -648,8 +697,55 @@ def load_env_cookies():
         logger.info(f"Env se {n} site cookie(s) load hui")
 
 
+def xh_player_hls(text: str) -> Optional[str]:
+    """xhamster: IS video ki apni player settings (xplayerSettings.sources.hls) - promo/related streams nahi."""
+    for m in re.finditer(r'"xplayerSettings"\s*:\s*(\{)', text):
+        blob = _balanced(text, m.start(1))
+        if not blob:
+            continue
+        urls: List[str] = []
+        try:
+            data = json.loads(blob)
+            hls = (data.get("sources") or {}).get("hls") or {}
+            if isinstance(hls, dict):
+                for codec in ("h264", "av1"):
+                    o = hls.get(codec)
+                    u = o.get("url") if isinstance(o, dict) else (o if isinstance(o, str) else None)
+                    if u:
+                        urls.append(u)
+                for o in hls.values():
+                    u = o.get("url") if isinstance(o, dict) else None
+                    if u and u not in urls:
+                        urls.append(u)
+        except Exception:
+            pass
+        if not urls:
+            urls = re.findall(r'"url"\s*:\s*"([^"]+\.m3u8[^"]*)"', blob)
+        for u in urls:
+            u = _clean(u, "https://x.invalid/")
+            if '.m3u8' in u.lower() and not JUNK.search(u.lower()):
+                return u
+    return None
+
+
+_QS_RX = re.compile(r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:m3u8|mp4)(?:\?[^\s"\'<>]*)?)')
+
+
+def _quick_streams(text: str, page_url: str, limit: int = 12) -> List[str]:
+    """Page me jitni valid stream URLs hain (ek hi pass) - shared/promo stream pakadne ke liye."""
+    out: List[str] = []
+    for m in _QS_RX.finditer(text):
+        u = _clean(m.group(1), page_url)
+        if _valid_stream_url(u) and u not in out:
+            out.append(u)
+            if len(out) >= limit:
+                break
+    return out
+
+
 def _xh_parse(text: str) -> Optional[str]:
-    return xh_best_stream(text) or (xh_from_initials(text) if 'initials' in text else None)
+    return (xh_player_hls(text) or xh_best_stream(text)
+            or (xh_from_initials(text) if 'initials' in text else None))
 
 
 def process_tpl_link(hls_link: str) -> str:
@@ -1594,6 +1690,9 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
             elif any(ext in final_link.lower() for ext in ['.jpg', '.png', '.jpeg', '.webp']): file_type = "IMAGE"
 
             variants = await asyncio.to_thread(make_variants, final_link, text, video_url)
+            cands = await asyncio.to_thread(_quick_streams, text, video_url)
+            if stream_link not in cands:
+                cands.insert(0, stream_link)
             return {
                 "title": title,
                 "type": file_type,
@@ -1603,7 +1702,8 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
                 "expires": stream_expiry(final_link),
                 "thumb": best_thumb(text, video_url),
                 "duration": best_duration(text),
-                "variants": variants
+                "variants": variants,
+                "_cands": cands
             }
     except Exception as e:
         logger.error(f"Extraction Error for {video_url}: {e}")
@@ -1776,7 +1876,9 @@ _PLAYER_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0f0f0f">
-<title>__TITLE__</title>
+<title>__TITLE__ | __OWNER__</title>
+<meta name="author" content="__OWNER__">
+<!-- Player by __OWNER__ -->
 <style>
 :root{--red:#f00;--bg:#0f0f0f;--bg2:#272727;--tx:#f1f1f1;--tx2:#aaa;--line:#303030;--chip:#272727;--chipA:#f1f1f1;--chipAt:#0f0f0f;--hh:56px}
 [data-theme=light]{--bg:#fff;--bg2:#f2f2f2;--tx:#0f0f0f;--tx2:#606060;--line:#e5e5e5;--chip:#f2f2f2;--chipA:#0f0f0f;--chipAt:#fff}
@@ -1797,6 +1899,11 @@ a{color:inherit}
 /* ---------- header ---------- */
 .top{position:sticky;top:0;z-index:60;height:var(--hh);display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--bg);border-bottom:1px solid var(--line)}
 .logo{display:flex;align-items:center;gap:8px;text-decoration:none;font-weight:700;font-size:17px;min-width:0}
+.ownt{font-size:12px;color:var(--tx2);text-decoration:none;white-space:nowrap;margin-left:2px}
+.ownt:hover{color:var(--tx)}
+.wm{position:absolute;top:10px;right:14px;z-index:2;color:rgba(255,255,255,.5);font-weight:700;font-size:14px;text-shadow:0 1px 5px #000;pointer-events:none}
+.own2{margin-top:14px;font-size:12px}.own2 a{color:var(--tx2);text-decoration:none}
+.foot a{color:var(--tx2)}
 .logo b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34vw}
 .search{flex:1;max-width:640px;margin:0 auto;display:flex;position:relative}
 .search input{width:100%;height:38px;border-radius:20px;border:1px solid var(--line);background:var(--bg);color:var(--tx);padding:0 38px 0 16px;outline:0;font-size:15px}
@@ -1906,10 +2013,10 @@ a{color:inherit}
 </style>
 </head>
 <body>
-<div id="lock" hidden><div class="lbox"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><h3>Protected</h3><input id="pw" type="password" placeholder="Password" autocomplete="off"><button id="pwb">Unlock</button><div id="lerr"></div></div></div>
+<div id="lock" hidden><div class="lbox"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><h3>Protected</h3><input id="pw" type="password" placeholder="Password" autocomplete="off"><button id="pwb">Unlock</button><div id="lerr"></div><div class="own2" id="lockOwn"></div></div></div>
 <div id="app" hidden>
 <header class="top">
-  <a class="logo" href="#/"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><b id="siteT"></b></a>
+  <a class="logo" href="#/"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><b id="siteT"></b></a><a class="ownt" id="ownT" target="_blank" rel="noopener" hidden></a>
   <div class="search"><input id="q" type="search" placeholder="Search" autocomplete="off"><button id="qclr" hidden>&#10005;</button></div>
   <div class="tools"><button id="setB" title="Menu (clear history / export)">&#9881;</button><button id="themeB" title="Theme">&#127763;</button><a id="tgB" target="_blank" rel="noopener" title="Telegram">&#9992;</a></div>
 </header>
@@ -1927,6 +2034,7 @@ a{color:inherit}
      <video id="v" playsinline preload="auto"></video>
      <img id="imgv" hidden alt="">
      <div class="aud" id="aud" hidden>&#9835;</div>
+     <div class="wm" id="wm"></div>
      <div class="ov" id="ov">
        <div class="spin" id="spin" hidden></div>
        <div class="rip l" id="ripL">&#9194; 10s</div><div class="rip r" id="ripR">10s &#9193;</div>
@@ -2208,7 +2316,7 @@ function gearMenu(anchor){
     {t:"\uD83D\uDDD1  Clear watch later ("+Object.keys(LATER).length+")",f:function(){clearList("later")}},
     {t:"\u26A0  Reset all saved data",f:function(){clearList("all")}},
     {t:"\u2B07  Export favorites (M3U)",f:exportFav}
-  ]);
+  ].concat(CFG.owner&&CFG.tg?[{t:"\u2708  "+CFG.owner,href:CFG.tg}]:[]));
 }
 function closePop(){var p=$("#pop");if(p)p.remove()}
 document.addEventListener("click",closePop);
@@ -2449,17 +2557,19 @@ function setSession(it){
 /* ---------- watch page ---------- */
 function actBtn(txt,fn,on){var b=el("button","act"+(on?" on":""),txt);b.onclick=fn;return b}
 function renderMeta(it){
-  $("#wt").textContent=it.t||"Video";document.title=(it.t||"Video")+" - "+CFG.title;
+  $("#wt").textContent=it.t||"Video";document.title=(it.t||"Video")+" - "+CFG.title+(CFG.owner?" | "+CFG.owner:"");
   var a=$("#acts");a.textContent="";
   var fb=actBtn(FAV[it.u]?"\u2665 Favorited":"\u2661 Favorite",function(){toggleFav(it);fb.className="act"+(FAV[it.u]?" on":"");fb.textContent=FAV[it.u]?"\u2665 Favorited":"\u2661 Favorite"},!!FAV[it.u]);a.appendChild(fb);
   var lb=actBtn(LATER[it.u]?"\u23F1 Saved":"\u23F1 Watch later",function(){toggleLater(it);lb.className="act"+(LATER[it.u]?" on":"");lb.textContent=LATER[it.u]?"\u23F1 Saved":"\u23F1 Watch later"},!!LATER[it.u]);a.appendChild(lb);
   a.appendChild(actBtn("\uD83D\uDCCB Copy link",function(){copy(it.u)}));
   var dl=el("a","act",engineOf(it)==="native"?"\u2B07 Download":"\u2B07 Open stream");dl.href=it.u;dl.target="_blank";dl.rel="noopener noreferrer";if(engineOf(it)==="native")dl.setAttribute("download","");a.appendChild(dl);
   extLinks(it.u).slice(0,2).forEach(function(x){if(x.n==="Open link")return;var e=el("a","act","\uD83D\uDCFA "+x.n);e.href=x.h;e.target="_blank";e.rel="noopener noreferrer";a.appendChild(e)});
+  if(CFG.owner&&CFG.tg){var ob=el("a","act","\u2708 "+CFG.owner);ob.href=CFG.tg;ob.target="_blank";ob.rel="noopener noreferrer";a.appendChild(ob)}
   if(it.p){var sp=el("a","act","\u2197 Source page");sp.href=it.p;sp.target="_blank";sp.rel="noopener noreferrer";a.appendChild(sp)}
   var d=$("#desc");d.textContent="";
   function row(k,v){var p=el("div");p.appendChild(el("b","",k+": "));p.appendChild(document.createTextNode(v));d.appendChild(p)}
   row("Format",fmtOf(it)+" ("+engineOf(it)+")");row("Source",domainOf(it.u)||"-");
+  if(CFG.owner){var cr=el("div");cr.appendChild(el("b","","Credits: "));var ca=el("a","",CFG.owner);ca.href=CFG.tg||"#";ca.target="_blank";ca.rel="noopener noreferrer";ca.style.color="inherit";cr.appendChild(ca);d.appendChild(cr)}
   if(it.d||DUR[it.u])row("Duration",fmtTime(it.d||DUR[it.u]));
   row("Stream",it.u);
 }
@@ -2480,7 +2590,7 @@ function showWatch(i){
   renderMeta(it);renderUpnext(it);loadItem(it);setSession(it);window.scrollTo(0,0);showCtl();
 }
 function showHome(){
-  if(!$("#watch").hidden){destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title}
+  if(!$("#watch").hidden){destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title+(CFG.owner?" | "+CFG.owner:"")}
   $("#home").hidden=false;chipsEl.hidden=false;renderGrid();updChips();
 }
 function route(){var m=location.hash.match(/^#\/w\/(\d+)/);if(m)showWatch(+m[1]);else showHome()}
@@ -2488,7 +2598,12 @@ function route(){var m=location.hash.match(/^#\/w\/(\d+)/);if(m)showWatch(+m[1])
 /* ---------- init ---------- */
 function start(){
   $("#lock").hidden=true;$("#app").hidden=false;
-  $("#siteT").textContent=CFG.title;$("#foot").textContent=CFG.owner?"Credits: "+CFG.owner:"";
+  $("#siteT").textContent=CFG.title;
+  if(CFG.owner){
+    var ow=$("#ownT");ow.textContent="by "+CFG.owner;ow.hidden=false;if(CFG.tg)ow.href=CFG.tg;
+    $("#wm").textContent=CFG.owner;
+    var ft=$("#foot");ft.textContent="Credits: ";var fa=el("a","",CFG.owner);fa.href=CFG.tg||"#";fa.target="_blank";fa.rel="noopener noreferrer";ft.appendChild(fa);
+  }
   var tg=$("#tgB");if(CFG.tg)tg.href=CFG.tg;else tg.hidden=true;
   var th=LS.get("ytb_theme","dark");document.documentElement.setAttribute("data-theme",th);
   $("#setB").onclick=function(e){e.stopPropagation();gearMenu(this)};
@@ -2508,6 +2623,7 @@ function unlock(){
 if(!CFG.hash||SS.get("ytb_ok")===CFG.hash){start()}
 else{
   $("#lock").hidden=false;
+  if(CFG.owner){var lo=$("#lockOwn"),la=el("a","","by "+CFG.owner);la.href=CFG.tg||"#";la.target="_blank";la.rel="noopener noreferrer";lo.appendChild(la)}
   $("#pwb").onclick=unlock;$("#pw").onkeydown=function(e){if(e.key==="Enter")unlock()};
 }
 window.__ytb={cur:function(){return {q:CURQ,u:CURURL}},sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
@@ -2533,7 +2649,8 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
 
     cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK,
            "hash": hashlib.sha256(SKY_PASSWORD.encode("utf-8")).hexdigest() if SKY_PASSWORD else ""}
-    return (_PLAYER_TEMPLATE.replace("__TITLE__", _html.escape(title))
+    return (_PLAYER_TEMPLATE.replace("__OWNER__", _html.escape(BOT_OWNER_NAME))
+            .replace("__TITLE__", _html.escape(title))
             .replace("__CFG__", js(cfg)).replace("__DATA__", js(items)))
 
 # ==========================================================
@@ -2552,7 +2669,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Full Web Player UI: Custom Video & Media Player interface in HTML.\n"
         "2. 4 Files Export: 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
         "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n\n"
-        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup"
+        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /sky, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2632,6 +2749,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"▶ Extract (this video page, no login saved): {item['download_link'] if item else 'FAILED'}")
         if not item:
             lines.append(page_diag(html))
+        qs = _quick_streams(html, url)
+        lines.append(f"🎞 Page me streams ({len(qs)}):")
+        lines += [f"   {x[:105]}" for x in qs[:4]]
         await update.message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
         return
     links = find_video_links(html, url)
@@ -2993,6 +3113,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Valid .txt file upload karein.")
         return
 
+    if sky_armed(context) or (update.message.caption or "").strip().lower().startswith("/sky"):
+        await sky_from_file(update, context, doc)        # /sky mode: HTML player banao, download nahi
+        return
+
     STOP_PROCESS[user_id] = False
     status_msg = await update.message.reply_text("📥 TXT file reading started...")
 
@@ -3084,7 +3208,7 @@ async def _run_scrape_chunk_impl(update_or_query, context, target_url: str, star
                 f"🚫 Failed: {r['pages_fail'][:3]}\n"
                 f"🔗 Links found: {r['links']}\n"
                 f"✅ Extracted: {r['extracted']}\n"
-                f"🧹 Junk/duplicate hataye: {r.get('dropped', 0)}\n"
+                f"🧹 Junk/duplicate hataye: {r.get('dropped', 0)}\n{drop_hint()}"
                 f"{block_hint(target_url)}{note_hint()}{login_hint(target_url)}\n"
                 f"Detail ke liye: /debug {target_url}\nRaw HTML ke liye: /dump {target_url}"
             )
@@ -3606,7 +3730,7 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
                f"🔗 Links: {rep['links']} | ✅ Extracted: {rep['extracted']}\n")
         if rep.get("diag"):
             msg += f"\n🔍 Diagnosis:\n{rep['diag']}\n"
-        msg += (f"🧹 Junk/duplicate hataye: {rep.get('dropped', 0)}\n"
+        msg += (f"🧹 Junk/duplicate hataye: {rep.get('dropped', 0)}\n{drop_hint()}"
                 + block_hint(url) + note_hint() + login_hint(url))
         msg += ("\n💡 Ye site JS se load hoti lagti hai. Browser DevTools -> Network -> XHR/Fetch me jo "
                 "videos-list API URL dikhe wo bhejo, ya /dump " + url + " ki HTML file bhejo.")
@@ -4109,6 +4233,167 @@ async def scr_spa_fallback(url: str, html: str, page_url: str, start: int, end: 
             merged.append(it)
     info.append(f"✅ SPA mode result: {len(merged)} items")
     return merged, "\n".join(info)
+
+
+# ==========================================================
+# /sky : TXT / M3U file -> YouTube-style HTML player
+# ==========================================================
+_URL_LINE_RX = re.compile(r'(https?://[^\s<>"\']+)', re.I)
+_SKY_LABELS = re.compile(r'^(source listing page|permanent video page|direct stream link)\b', re.I)
+
+
+def _kind_of(url: str) -> str:
+    if '.m3u8' in url.lower():
+        return "VIDEO"
+    last = urlparse(url).path.lower().rsplit('/', 1)[-1]
+    ext = last.rsplit('.', 1)[-1] if '.' in last else ''
+    if ext in ("mp3", "m4a", "aac", "wav", "ogg", "oga", "opus", "flac", "wma"):
+        return "AUDIO"
+    if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
+        return "IMAGE"
+    if ext == "pdf":
+        return "PDF"
+    return "VIDEO"
+
+
+def _title_from_url(url: str, n: int) -> str:
+    pu = urlparse(url)
+    name = unquote(pu.path.rstrip('/').rsplit('/', 1)[-1])
+    name = re.sub(r'(?:\.(?:mp4|mkv|webm|mov|avi|flv|ts|mpd|mp3|m4a|m3u8|ogg|wav|flac|aac|jpe?g|png|gif|webp|bmp|pdf))+$', '', name, flags=re.I)
+    name = re.sub(r'[-_.]+', ' ', name).strip()
+    if len(name) < 4 or re.match(r'^\d{3,4}p\b', name):
+        return f"{pu.netloc.replace('www.', '')} #{n}"
+    return name[:120]
+
+
+def parse_links_txt(text: str, limit: int = 3000) -> List[dict]:
+    """TXT/M3U se items: 'Title: URL', sirf URL, bot ka full format (Title/Direct Stream Link), #EXTINF."""
+    items: List[dict] = []
+    seen = set()
+    pend_title, pend_page = None, ""
+
+    def add(url: str, title: Optional[str], page: str = ""):
+        url = url.rstrip('.,;)]}>')
+        if url in seen or len(items) >= limit:
+            return
+        seen.add(url)
+        t_ = re.sub(r'\s+', ' ', _html.unescape(title or "")).strip()
+        items.append({"title": t_[:200] or _title_from_url(url, len(items) + 1), "type": _kind_of(url),
+                      "page_url": page, "source_page": page, "download_link": url,
+                      "variants": make_variants(url)})
+
+    for raw in text.splitlines():
+        ln = raw.strip().lstrip('\ufeff')
+        if not ln:
+            continue
+        if ln.upper().startswith('#EXTINF'):
+            pend_title = ln.split(',', 1)[1].strip() if ',' in ln else None
+            continue
+        if ln.startswith('#'):
+            continue
+        m = _URL_LINE_RX.search(ln)
+        if not m:
+            mt = (re.match(r'^\d+\s*[\.\)]\s*Title\s*:\s*(.+)$', ln, re.I)
+                  or re.match(r'^Title\s*:\s*(.+)$', ln, re.I))
+            if mt:
+                pend_title = mt.group(1).strip()
+            continue
+        url = m.group(1)
+        label = re.sub(r'^\d+\s*[\.\)]\s*', '', ln[:m.start()].strip())
+        label = re.sub(r'[\s:\-|\u2013\u2014>]+$', '', label).strip()
+        lm = _SKY_LABELS.match(label)
+        if lm:
+            k = lm.group(1).lower()
+            if k.startswith('permanent'):
+                pend_page = url
+            elif k.startswith('direct'):
+                add(url, pend_title, pend_page)
+                pend_title, pend_page = None, ""
+            continue
+        label = re.sub(r'^Title\s*:\s*', '', label, flags=re.I)
+        add(url, label or pend_title)
+        pend_title, pend_page = None, ""
+    return items
+
+
+def sky_armed(context) -> bool:
+    return context.user_data.get('sky_until', 0) > time.time()
+
+
+async def sky_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sky [title]  -> agli TXT/M3U file se YouTube-style HTML player banake bhejo.  /sky off -> band."""
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    args = context.args or []
+    if args and args[0].lower() == "off":
+        context.user_data.pop('sky_until', None)
+        context.user_data.pop('sky_title', None)
+        await update.message.reply_text("❎ /sky band. Ab TXT file bhejne par normal download chalega.")
+        return
+    context.user_data['sky_until'] = time.time() + 600
+    context.user_data['sky_title'] = " ".join(args).strip()
+    await update.message.reply_text(
+        "🎬 Sky mode ON (10 minute)\n\n"
+        "Ab apni .txt (ya .m3u) file bhejo, usme jo links hongi unse YouTube-style HTML player bana ke dunga:\n"
+        "• thumbnail auto, favorites, history, quality menu\n"
+        "• formats: mp4, m3u8, mkv, webm, mp3 aur baaki\n\n"
+        "Accept: `Title: URL`, sirf URL, bot ki full/simple TXT, M3U playlist.\n"
+        "Title dene ke liye: /sky My Playlist\n"
+        "Ya file ke caption me /sky likh ke bhejo. Band: /sky off".replace("`", ""))
+
+
+async def sky_from_file(update: Update, context: ContextTypes.DEFAULT_TYPE, doc):
+    chat = update.effective_chat
+    status = await update.message.reply_text("🎬 Player ban raha hai...")
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await f.download_to_memory(buf)
+        raw = buf.getvalue()
+        try:
+            text = raw.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            text = raw.decode('latin-1', errors='ignore')
+        items = parse_links_txt(text)
+        if not items:
+            await status.edit_text("❌ File me koi valid http/https link nahi mila.\n"
+                                   "Format: `Title: URL` ya har line me ek URL.".replace("`", ""))
+            return
+        cap = (update.message.caption or "").strip()
+        cap_title = re.sub(r'^/sky\b', '', cap, flags=re.I).strip()
+        stem = re.sub(r'\.[A-Za-z0-9]+$', '', doc.file_name or "playlist")
+        title = (cap_title or context.user_data.get('sky_title') or stem.replace('_', ' ')).strip()[:60] or "Sky Player"
+        html = await asyncio.to_thread(generate_web_app_html, items, title)
+        out = io.BytesIO(html.encode('utf-8'))
+        safe = re.sub(r'[^A-Za-z0-9._-]+', '_', stem)[:40].strip('_') or "playlist"
+        out.name = f"{safe}_player.html"
+        kinds = Counter(i["type"] for i in items)
+        await chat.send_document(
+            document=out,
+            caption=(f"🎬 {title}\n📦 {len(items)} items "
+                     f"({', '.join(f'{k} {v}' for k, v in kinds.items())})\n"
+                     f"🔒 Password: SKY_PASSWORD wala\n"
+                     f"👑 {BOT_OWNER_NAME}\n\nChrome me kholo (Telegram ke in-app browser se behtar)."))
+        context.user_data['sky_until'] = time.time() + 600       # agli file ke liye bhi chalu
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"sky error: {e}")
+        await status.edit_text(f"❌ Player nahi ban paya: {str(e)[:150]}")
+
+
+async def sky_only_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """.m3u files: sirf /sky mode ya caption '/sky' par."""
+    if not is_user_allowed(update.effective_user.id):
+        return
+    doc = update.message.document
+    if sky_armed(context) or (update.message.caption or "").strip().lower().startswith("/sky"):
+        await sky_from_file(update, context, doc)
+    else:
+        await update.message.reply_text("ℹ️ Is file se HTML player banana hai? Pehle /sky bhejo, phir file.")
 
 
 # ==========================================================
@@ -5095,15 +5380,136 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Watch hata di." if ok else "ℹ️ Aisi watch nahi mili.")
 
 
+# ---------------- Supabase Storage sync: Render restart par bhi cookies/rules/settings bache rahein ----------------
+SB_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SB_KEY = os.getenv("SUPABASE_KEY", "").strip()                 # service_role key (secret!)
+SB_BUCKET = os.getenv("SUPABASE_BUCKET", "bot-backup").strip()
+SB_OBJECT = os.getenv("SUPABASE_OBJECT", "bot_data.db").strip()
+_SB_LAST = {"hash": None, "ok": None}
+
+
+def sb_enabled() -> bool:
+    return bool(SB_URL and SB_KEY)
+
+
+def _sb_headers(extra: Optional[dict] = None) -> dict:
+    h = {"Authorization": f"Bearer {SB_KEY}", "apikey": SB_KEY}
+    h.update(extra or {})
+    return h
+
+
+def sb_upload_db() -> str:
+    """DB ka consistent snapshot Supabase Storage me upload (upsert). -> 'ok' ya error text."""
+    tmp = os.path.join(tempfile.gettempdir(), f"sb_up_{int(time.time())}.db")
+    try:
+        db_snapshot(tmp)
+        data = open(tmp, "rb").read()
+        h = hashlib.md5(data).hexdigest()
+        if h == _SB_LAST["hash"]:
+            return "unchanged"
+        r = requests.post(f"{SB_URL}/storage/v1/object/{SB_BUCKET}/{SB_OBJECT}", data=data, timeout=60,
+                          headers=_sb_headers({"Content-Type": "application/octet-stream", "x-upsert": "true"}))
+        if r.status_code in (200, 201):
+            _SB_LAST["hash"] = h
+            _SB_LAST["ok"] = time.time()
+            return "ok"
+        return f"HTTP {r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return f"error: {str(e)[:120]}"
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+def sb_download_db() -> str:
+    """Supabase se DB laakar local DB_FILE me daalo (valid SQLite ho tabhi). -> 'ok' ya error text."""
+    tmp = os.path.join(tempfile.gettempdir(), f"sb_down_{int(time.time())}.db")
+    try:
+        r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{SB_BUCKET}/{SB_OBJECT}",
+                         headers=_sb_headers(), timeout=60)
+        if r.status_code != 200:
+            return f"HTTP {r.status_code}"
+        open(tmp, "wb").write(r.content)
+        c = sqlite3.connect(tmp)
+        names = {x[0] for x in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        c.close()
+        if not {"allowed_users", "site_cookies"} <= names:
+            return "downloaded file is not this bot's DB"
+        src = sqlite3.connect(tmp)
+        dst = sqlite3.connect(DB_FILE)
+        src.backup(dst)
+        dst.close()
+        src.close()
+        _SB_LAST["hash"] = hashlib.md5(r.content).hexdigest()
+        return "ok"
+    except Exception as e:
+        return f"error: {str(e)[:120]}"
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+async def _sb_loop(app):
+    if not sb_enabled():
+        return
+    try:
+        mins = max(1.0, float(os.getenv("SB_SYNC_MINUTES", "3")))
+    except ValueError:
+        mins = 3.0
+    while True:
+        await asyncio.sleep(mins * 60)
+        res = await asyncio.to_thread(sb_upload_db)
+        if res not in ("ok", "unchanged"):
+            logger.error(f"Supabase sync fail: {res}")
+
+
+async def sbsync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sbsync -> abhi upload.   /sbrestore -> Supabase se DB wapas lo."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not sb_enabled():
+        await update.message.reply_text("ℹ️ Supabase set nahi hai. Env: SUPABASE_URL, SUPABASE_KEY, SUPABASE_BUCKET")
+        return
+    _SB_LAST["hash"] = None
+    res = await asyncio.to_thread(sb_upload_db)
+    await update.message.reply_text(f"☁️ Supabase upload: {res}")
+
+
+async def sbrestore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not sb_enabled():
+        await update.message.reply_text("ℹ️ Supabase set nahi hai.")
+        return
+    res = await asyncio.to_thread(sb_download_db)
+    if res == "ok":
+        init_db()
+        globals()["_RULES_CACHE"] = None
+        load_settings()
+        _FETCH_CACHE.clear()
+        await update.message.reply_text(f"☁️ Restore ho gaya. 🍪 {len(list_cookie_domains())} cookies | "
+                                        f"🧩 {len(list_rule_domains())} rules | 👁 {len(watch_rows())} watches")
+    else:
+        await update.message.reply_text(f"❌ Supabase restore fail: {res}")
+
+
 async def _post_init(app):
     _ensure_fast_executor()
-    app.bot_data["tasks"] = [asyncio.create_task(_watch_loop(app)), asyncio.create_task(_backup_loop(app))]
+    app.bot_data["tasks"] = [asyncio.create_task(_watch_loop(app)), asyncio.create_task(_backup_loop(app)),
+                             asyncio.create_task(_sb_loop(app))]
 
 
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN environment variable set nahi hai. "
                          "Naya token BotFather se lo aur env me BOT_TOKEN=... rakho.")
+    if sb_enabled() and (not os.path.exists(DB_FILE) or os.getenv("SB_FORCE_RESTORE") == "1"):
+        _r = sb_download_db()                       # Render restart ke baad DB wapas
+        logger.info(f"Supabase restore at startup: {_r}")
     init_db()
     load_settings()
     load_env_cookies()
@@ -5128,6 +5534,9 @@ def main():
     app.add_handler(CommandHandler("logout", logout_command))
     app.add_handler(CommandHandler("cookie", cookie_command))
     app.add_handler(CommandHandler("updatecookie", updatecookie_command))
+    app.add_handler(CommandHandler("sky", sky_command))
+    app.add_handler(CommandHandler("sbsync", sbsync_command))
+    app.add_handler(CommandHandler("sbrestore", sbrestore_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
@@ -5144,6 +5553,7 @@ def main():
     app.add_handler(CallbackQueryHandler(scr_callback, pattern=r"^scr_"))
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.Document.FileExtension("db"), restore_document))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("m3u"), sky_only_document))
     app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
