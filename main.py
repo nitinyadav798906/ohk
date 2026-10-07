@@ -4478,7 +4478,8 @@ async def scr_sitemap(page_url: str) -> dict:
 
 
 # ---------------- optional real browser (Playwright) ----------------
-async def pw_render(url: str, wait: float = 4.0, scroll: bool = False, play: bool = False):
+async def pw_render(url: str, wait: float = 4.0, scroll: bool = False, play: bool = False,
+                    netlog: Optional[list] = None):
     """-> (rendered_html, [stream urls seen in network traffic]). Needs: pip install playwright && playwright install chromium"""
     global _PW_SEM
     if not async_playwright:
@@ -4495,6 +4496,19 @@ async def pw_render(url: str, wait: float = 4.0, scroll: bool = False, play: boo
             ctx = await _PW["browser"].new_context(user_agent=UA, viewport={"width": 1280, "height": 800})
             page = await ctx.new_page()
             page.on("request", lambda r: streams.append(r.url) if _valid_stream_url(r.url) else None)
+
+            def _on_resp(resp):
+                try:
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    rt = resp.request.resource_type
+                    if netlog is not None and (rt in ("xhr", "fetch", "media", "document") or "video" in ct or "mpegurl" in ct):
+                        netlog.append((rt, resp.status, ct.split(";")[0], resp.url))
+                    if ("video/" in ct or "mpegurl" in ct) and resp.url not in streams and not JUNK.search(resp.url.lower()):
+                        streams.append(resp.url)          # URL me extension na ho tab bhi content-type se pakdo
+                except Exception:
+                    pass
+
+            page.on("response", _on_resp)
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(int(wait * 1000))
             if scroll:
@@ -4509,8 +4523,17 @@ async def pw_render(url: str, wait: float = 4.0, scroll: bool = False, play: boo
                     await page.wait_for_timeout(1500)
                 except Exception:
                     pass
+            if play:                                            # player aksar iframe ke andar hota hai
+                for fr in list(page.frames)[1:4]:
+                    for sel in ("video", ".play", "[class*=play]", "button"):
+                        try:
+                            await fr.click(sel, timeout=800)
+                            await page.wait_for_timeout(1200)
+                            break
+                        except Exception:
+                            pass
             html = await page.content()
-            return html, streams
+            return html, list(dict.fromkeys(streams))
         except Exception as e:
             logger.error(f"pw_render error {url}: {e}")
             return None, streams
@@ -5915,8 +5938,73 @@ def _fmt_stream(u: str, size: Optional[int], page_url: str) -> str:
     return f"[{sz}{' ' + ','.join(tag) if tag else ''}] {u[:105]}"
 
 
+def page_census(html: str, page_url: str) -> List[str]:
+    """Page ke andar kya-kya hai: hosts, video tags, JS variables, endpoints, prefer-host ka pata."""
+    t = html.replace('\\/', '/')
+    low = t.lower()
+    out: List[str] = []
+    hosts = Counter(urlparse(u).netloc.lower() for u in re.findall(r'https?://[^\s"\'<>\\)]+', t))
+    if hosts:
+        out.append("🌍 Hosts: " + ", ".join(f"{h}×{c}" for h, c in hosts.most_common(8)))
+    tags = {k: low.count("<" + k) for k in ("video", "source", "iframe", "embed", "object", "audio")}
+    out.append("🏷 Tags: " + (", ".join(f"{k}={v}" for k, v in tags.items() if v) or "koi video/iframe tag nahi"))
+    vals = []
+    for m in re.finditer(r'<(video|source|iframe|embed)\b([^>]*)>', t, re.I):
+        for am in re.finditer(r'\b(src|data-src|data-lazy-src|data-video|data-url|poster)=["\']([^"\']+)["\']', m.group(2), re.I):
+            vals.append(f"  <{m.group(1).lower()} {am.group(1)}> {am.group(2)[:85]}")
+    out += vals[:6]
+    seen, n = set(), 0
+    for m in re.finditer(r'["\']?([\w\-]*(?:video|player|source|stream|file|src|url|mp4|hls|embed)[\w\-]*)["\']?\s*[:=]\s*["\']([^"\']{12,300})["\']', t, re.I):
+        name, val = m.group(1), m.group(2)
+        if _ASSET_RX.search(val) or val in seen or val.startswith("data:"):
+            continue
+        if not (val.startswith(("http", "/")) or len(val) > 24):
+            continue
+        seen.add(val)
+        out.append(f"  var {name[:22]} = {val[:80]}")
+        n += 1
+        if n >= 6:
+            break
+    eps: List[str] = []
+    for m in re.finditer(r'["\']((?:https?:)?//[^"\'\s<>]+|/[A-Za-z0-9_\-./]+(?:\?[^"\'\s<>]{0,60})?)["\']', t):
+        v = m.group(1)
+        if _ASSET_RX.search(v) or v in eps:
+            continue
+        if re.search(r'(ajax|/api/|player|embed|get_?video|source|stream|/play|\.php|\.json|token|sign)', v, re.I):
+            eps.append(v)
+    if eps:
+        out.append("🔌 Endpoints (page me):")
+        out += [f"  {e[:100]}" for e in eps[:8]]
+    das = []
+    for m in re.finditer(r'\b(data-[\w-]*(?:video|src|url|file|embed|player|stream|mp4|hls|sign|token)[\w-]*)=["\']([^"\']{8,200})["\']', t, re.I):
+        das.append(f"  {m.group(1)}={m.group(2)[:70]}")
+    out += list(dict.fromkeys(das))[:5]
+    for h in (_PREFER.get(_root_host(urlparse(page_url).netloc)) or []):
+        c = low.count(h)
+        if c:
+            i = low.find(h)
+            out.append(f"⭐ '{h}' page me {c} baar, e.g.: ...{t[max(0, i - 50):i + 90]}...")
+        else:
+            out.append(f"⭐ '{h}' page ke HTML me KAHIN NAHI -> JS/XHR/click ke baad aata hoga (browser log neeche dekho)")
+    return out
+
+
+async def _send_report(update: Update, st, lines: List[str]):
+    text = "\n".join(lines)
+    if len(text) <= 3900:
+        await st.edit_text(text, disable_web_page_preview=True)
+        return
+    await st.edit_text(text[:3500] + "\n... (poori report file me bhej raha hoon)", disable_web_page_preview=True)
+    chat = getattr(update, "effective_chat", None)
+    if chat:
+        b = io.BytesIO(text.encode("utf-8"))
+        b.name = "sniff_report.txt"
+        await chat.send_document(document=b, caption="🔬 Poori /sniff report")
+
+
 async def sniff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/sniff <video page URL> -> page me stream kahan-kahan hai (static/packed/iframe/api/yt-dlp/browser) + final pick."""
+    """/sniff <page URL> -> page me stream kahan-kahan hai (static/packed/iframe/api/yt-dlp/browser) + final pick.
+    Listing page di to pehla video page khud kholta hai."""
     if update.effective_user.id != ADMIN_ID:
         return
     if not context.args:
@@ -5928,20 +6016,45 @@ async def sniff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not html:
         await st.edit_text(f"❌ Page fetch fail: HTTP {LAST_STATUS.get(url, '?')} | {LAST_ERR.get(url, '?')}\n{err_hint(url)}")
         return
-    lines = [f"📄 {len(html)} bytes | {domainOf_safe(url)}"]
+    lines: List[str] = []
     static = await asyncio.to_thread(_quick_streams, html, url, 12)
+    sus = [u for u in static if _PREVIEW_PATH_RX.search(urlparse(u).path.lower())]
+    links = find_video_links(html, url)
+    if (not _looks_like_single_video(url) and len(links) >= 6 and len(static) >= 4 and len(sus) >= 0.8 * len(static)):
+        lines.append(f"📋 Ye LISTING page hai ({len(static)} preview clips, {len(links)} video links). "
+                     f"Pehla video page sniff kar raha hoon:\n   {links[0]}")
+        listing = url
+        url = links[0]
+        html = await fetch(url, referer=listing)
+        if not html:
+            lines.append(f"❌ Video page fetch fail: HTTP {LAST_STATUS.get(url, '?')} | {LAST_ERR.get(url, '?')}")
+            await _send_report(update, st, lines)
+            return
+        static = await asyncio.to_thread(_quick_streams, html, url, 12)
+    lines.append(f"📄 {len(html)} bytes | {url[:100]}")
     sizes = dict(zip(static[:6], await asyncio.gather(*[asyncio.to_thread(probe_size_sync, u, url) for u in static[:6]])))
     lines.append(f"🎞 Static streams ({len(static)}):")
     lines += [f"  {_fmt_stream(u, sizes.get(u), url)}" for u in static[:6]]
+    lines += page_census(html, url)
     for name, fn in _DIG_STAGES:
+        urls, note, log = [], "", []
         try:
-            urls, note = await asyncio.wait_for(fn(html, url), timeout=50)
+            if name == "browser" and async_playwright:
+                h2, bs = await asyncio.wait_for(pw_render(url, wait=4, play=True, netlog=log), timeout=55)
+                urls = list(bs) + (_quick_streams(h2, url) if h2 else [])
+                urls = list(dict.fromkeys(urls))
+                note = f"browser: {len(urls)} stream(s), {len(log)} network entries"
+            else:
+                urls, note = await asyncio.wait_for(fn(html, url), timeout=50)
         except Exception as e:
-            urls, note = [], f"error {str(e)[:50]}"
+            note = f"error {str(e)[:50]}"
         lines.append(f"▶ {name}: {note}")
         top = [u for u in urls if u not in static][:3]
         szs = await asyncio.gather(*[asyncio.to_thread(probe_size_sync, u, url) for u in top])
         lines += [f"  {_fmt_stream(u, z, url)}" for u, z in zip(top, szs)]
+        if log:
+            lines.append("🌐 Browser network (xhr/media/iframe):")
+            lines += [f"  [{rt} {stt} {ct or '-'}] {u[:92]}" for rt, stt, ct, u in log[:14]]
     pref = _PREFER.get(_root_host(urlparse(url).netloc))
     lines.append(f"⭐ Prefer hosts: {', '.join(pref) if pref else '-'}")
     _STREAM_CACHE.pop(url, None)
@@ -5951,7 +6064,7 @@ async def sniff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("⚠️ Status: sirf preview mili" if item.get("preview_only") else "👍 Status: asli video lagti hai")
     else:
         lines.append("❌ FINAL: kuch nahi mila")
-    await st.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+    await _send_report(update, st, lines)
 
 
 def domainOf_safe(u: str) -> str:
