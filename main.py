@@ -787,9 +787,11 @@ SKIP_EXT = ('.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
 # listing / navigation paths that are NOT video pages
 BAD_PATH = re.compile(
     r'/(login|signin|register|signup|search|tags?|categories|category|cats?|'
-    r'channels?|pornstars?|models?|actors?|studios?|sites?|dmca|contact|terms|'
+    r'channels?|pornstars?|creators?|playlists?|collections?|models?|actors?|studios?|sites?|dmca|contact|terms|'
     r'privacy|2257|upload|premium|history|favorites|page|blog|about|faq)(/|$)',
     re.I)
+
+LISTING_END = re.compile(r'/(?:newest|best|trending|popular|latest|weekly|monthly|daily|alltime|top-rated)(?:/\d+)?/?$', re.I)
 
 JUNK = re.compile(
     r'(preview|trailer|thumb|poster|sprite|\.vtt|logo|banner|/ads?/|adserver|'
@@ -1075,7 +1077,7 @@ def find_video_links(html: str, page_url: str, use_rule: bool = True) -> List[st
         if pu.path in ('', '/'):      # /?v=ID jaise links (ruporn24): sirf video-id wali query allow
             if not ({k.lower() for k in parse_qs(pu.query)} & _VID_QUERY_KEYS):
                 return
-        if pu.path.lower().endswith(SKIP_EXT) or BAD_PATH.search(pu.path):
+        if pu.path.lower().endswith(SKIP_EXT) or BAD_PATH.search(pu.path) or LISTING_END.search(pu.path):
             return
         old = items.get(full)
         items[full] = (_shape(pu), thumb or (old[1] if old else False))
@@ -1158,8 +1160,10 @@ async def build_page_urls(url: str, start: int, end: int) -> List[str]:
         return [url if p == 1 else tmpl.replace('{p}', str(p - 1))
                 for p in range(start, end + 1)]
 
-    if "xhamster" in host and '?' not in url:   # pages: /, /2, /3 ... (no probing needed)
-        return [url if p == 1 else f"{base}/{p}" for p in range(start, end + 1)]
+    if ("xhamster" in host or "xhaccess" in host) and '?' not in url:   # pages: /, /2, /3 ... (no probing)
+        base2 = re.sub(r'/\d+$', '', base)
+        first = url if base2 == base else base2
+        return [first if p == 1 else f"{base2}/{p}" for p in range(start, end + 1)]
 
     html1 = await fast_fetch(url)
     templates = []
@@ -1255,10 +1259,20 @@ def _collect_candidates(html: str, page_url: str) -> List[str]:
     return out
 
 
+_PREVIEW_PATH_RX = re.compile(
+    r'(preview|prevu|prevju|trailer|trejler|teaser|tizer|thumb|poster|sprite|snippet|hover|sample|promo|'
+    r'kartink|/gifs?/|/img/|/images?/|/screens?/|/fotos?/|/photos?/)', re.I)
+_SIGNED_RX = re.compile(r'[?&](?:sig|signature|token|exp|expires?|hash|md5|key|st|e)=', re.I)
+
+
 def _rank(u: str) -> float:
     s = 0.0
     low = u.lower()
     path = low.split('?')[0]
+    if _PREVIEW_PATH_RX.search(path):        # preview/teaser clip (0.5s) ko neeche karo
+        s -= 5
+    if _SIGNED_RX.search(low):               # signed/expiring link aksar asli video hota hai
+        s += 1.5
     if '.m3u8' in path:                      # .mp4.m3u8 ab sahi se HLS count hoga
         s += 3 if 'xhcdn' in low else 1      # xhamster CDN par HLS hi chalta hai
     elif '.mp4' in path or 'get_file' in low:
@@ -1267,6 +1281,137 @@ def _rank(u: str) -> float:
     if q:
         s += int(q.group(1)) / 10000
     return -s
+
+
+def probe_size_sync(url: str, referer: Optional[str] = None) -> Optional[int]:
+    """File ka total size (Range 0-0). 0 = HTML/dead, None = pata nahi."""
+    h = {"User-Agent": UA, "Accept": "*/*", "Range": "bytes=0-0"}
+    if referer:
+        h["Referer"] = referer
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    try:
+        r = requests.get(url, headers=h, timeout=(5, 8), stream=True, proxies=proxies)
+        try:
+            if (r.headers.get("Content-Type") or "").lower().startswith("text/"):
+                return 0
+            m = re.search(r'/(\d+)\s*$', r.headers.get("Content-Range") or "")
+            if m:
+                return int(m.group(1))
+            if r.status_code == 200:
+                cl = r.headers.get("Content-Length")
+                return int(cl) if cl and cl.isdigit() else None
+            return 0 if r.status_code in (404, 410) else None
+        finally:
+            r.close()
+    except Exception:
+        return None
+
+
+def stream_score(u: str, page_url: str = "") -> float:
+    low = u.lower()
+    pu = urlparse(u)
+    path = pu.path.lower()
+    s_ = 0.0
+    if '.m3u8' in path:
+        s_ += 6
+    elif re.search(r'\.(?:mp4|webm|mkv|mov|m4v|flv)(?:$|\?)', low) or 'get_file' in low:
+        s_ += 4
+    if _SIGNED_RX.search(low):
+        s_ += 3
+    try:
+        if page_url and _root_host(pu.netloc) != _root_host(urlparse(page_url).netloc):
+            s_ += 1                                     # alag CDN host (ebacdn.net jaisa)
+    except Exception:
+        pass
+    if _PREVIEW_PATH_RX.search(path):
+        s_ -= 6
+    q = stream_quality(u)
+    if q:
+        s_ += min(q, 2160) / 1000
+    return s_
+
+
+def stream_iplock(u: str) -> str:
+    m = re.search(r'[?&]ip=(\d{1,3}(?:\.\d{1,3}){3})', u)
+    return m.group(1) if m else ""
+
+
+def iplock_hint(results: List[dict]) -> str:
+    ips = sorted({r["iplock"] for r in results if r.get("iplock")})
+    if not ips:
+        return ""
+    n = sum(1 for r in results if r.get("iplock"))
+    return (f"\n⚠️ {n} link IP-locked hain ({', '.join(ips)}): ye sirf usi IP/network se chalengi jahan bot chal raha hai. "
+            "Player usi network se kholo, ya bot ko apne ghar ke IP par chalao.")
+
+
+def _page_meta(text: str, link: str, page_url: str):
+    return make_variants(link, text, page_url), best_thumb(text, page_url), best_duration(text)
+
+
+async def refine_stream(stream_link: str, cands: List[str], text: str, video_url: str) -> str:
+    """Chuni hui stream agar preview/0.5s clip lage to asli video dhundo: score + size probe +
+    (zaroorat ho to) packed JS / iframe me khoj. Theek ho to jaisa tha waisa hi wapas."""
+    def suspicious(u: str) -> bool:
+        return bool(_PREVIEW_PATH_RX.search(urlparse(u).path.lower()))
+
+    if '.m3u8' in stream_link.lower() and not suspicious(stream_link):
+        return stream_link
+    pool = list(dict.fromkeys([stream_link] + list(cands)))
+    sizes: Dict[str, Optional[int]] = {}
+
+    async def probe(urls: List[str]):
+        todo = [u for u in urls if u not in sizes]
+        res = await asyncio.gather(*[asyncio.to_thread(probe_size_sync, u, video_url) for u in todo])
+        sizes.update(dict(zip(todo, res)))
+
+    def top_prog() -> List[str]:
+        prog = [u for u in pool if '.m3u8' not in u.lower()]
+        return sorted(prog, key=lambda u: -stream_score(u, video_url))[:4]
+
+    if not suspicious(stream_link):
+        if len(pool) < 2:
+            return stream_link
+        await probe([stream_link])
+        sz = sizes.get(stream_link)
+        if sz is None or sz >= 1_200_000:
+            return stream_link                      # theek lag raha hai (ya size pata nahi) -> chhedo mat
+    await probe(top_prog())
+    extra: List[str] = []                           # clip hi mila -> page ke andar aur gehra dekho
+    dec = await asyncio.to_thread(deobfuscate_extra, text)
+    if dec:
+        extra += _quick_streams(dec, video_url)
+    n_if = 0
+    for m in re.finditer(r'<iframe[^>]+?src=["\']([^"\']+)["\']', text, re.I):
+        src = _clean(m.group(1), video_url)
+        if not src.startswith('http') or re.search(r'(doubleclick|banner|facebook|twitter|/ads?/)', src, re.I):
+            continue
+        n_if += 1
+        h = await fetch(src, referer=video_url)
+        if h:
+            extra += await asyncio.to_thread(_quick_streams, h, src)
+            d2 = await asyncio.to_thread(deobfuscate_extra, h)
+            if d2:
+                extra += _quick_streams(d2, src)
+        if n_if >= 3:
+            break
+    new = [u for u in dict.fromkeys(extra) if u not in pool]
+    if new:
+        pool += new
+        await probe(top_prog())
+    good = [u for u in pool if sizes.get(u) != 0 and not suspicious(u)]
+    bigs = [u for u in good if '.m3u8' not in u.lower() and (sizes.get(u) or 0) >= 1_500_000]
+    if bigs:
+        return max(bigs, key=lambda u: (stream_score(u, video_url), sizes[u] or 0))
+    hls = [u for u in good if '.m3u8' in u.lower()]
+    if hls:
+        return max(hls, key=lambda u: stream_score(u, video_url))
+    unknown = [u for u in good if sizes.get(u) is None and u != stream_link]
+    if unknown:
+        best = max(unknown, key=lambda u: stream_score(u, video_url))
+        if stream_score(best, video_url) > stream_score(stream_link, video_url):
+            return best
+    return stream_link
 
 
 async def generic_extract(html: str, page_url: str, depth: int = 0) -> Optional[str]:
@@ -1683,16 +1828,19 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
             EXTRACT_NOTE["v"] = f"{video_url}\n{page_diag(text)}"
 
         if stream_link:
+            cands = await asyncio.to_thread(_quick_streams, text, video_url)
+            if stream_link not in cands:
+                cands.insert(0, stream_link)
+            stream_link = await refine_stream(stream_link, cands, text, video_url)   # preview clip -> asli video
+            if stream_link not in cands:
+                cands.insert(0, stream_link)
             final_link = process_tpl_link(stream_link) if ".m3u8" in stream_link else stream_link
 
             if ".pdf" in final_link.lower(): file_type = "PDF"
             elif any(ext in final_link.lower() for ext in ['.mp3', '.wav', '.m4a', '.aac']): file_type = "AUDIO"
             elif any(ext in final_link.lower() for ext in ['.jpg', '.png', '.jpeg', '.webp']): file_type = "IMAGE"
 
-            variants = await asyncio.to_thread(make_variants, final_link, text, video_url)
-            cands = await asyncio.to_thread(_quick_streams, text, video_url)
-            if stream_link not in cands:
-                cands.insert(0, stream_link)
+            variants, thumb, duration = await asyncio.to_thread(_page_meta, text, final_link, video_url)
             return {
                 "title": title,
                 "type": file_type,
@@ -1700,8 +1848,9 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
                 "source_page": source_page or video_url,
                 "download_link": final_link,
                 "expires": stream_expiry(final_link),
-                "thumb": best_thumb(text, video_url),
-                "duration": best_duration(text),
+                "thumb": thumb,
+                "duration": duration,
+                "iplock": stream_iplock(final_link),
                 "variants": variants,
                 "_cands": cands
             }
@@ -2571,6 +2720,7 @@ function renderMeta(it){
   row("Format",fmtOf(it)+" ("+engineOf(it)+")");row("Source",domainOf(it.u)||"-");
   if(CFG.owner){var cr=el("div");cr.appendChild(el("b","","Credits: "));var ca=el("a","",CFG.owner);ca.href=CFG.tg||"#";ca.target="_blank";ca.rel="noopener noreferrer";ca.style.color="inherit";cr.appendChild(ca);d.appendChild(cr)}
   if(it.d||DUR[it.u])row("Duration",fmtTime(it.d||DUR[it.u]));
+  if(it.ip)row("\u26A0 IP-locked",it.ip+" (link sirf usi network se chalegi)");
   row("Stream",it.u);
 }
 function renderUpnext(it){
@@ -2641,7 +2791,8 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
     for it in results:
         items.append({"t": it.get("title") or "Video", "u": it["download_link"], "k": it.get("type") or "VIDEO",
                       "p": it.get("page_url") or "", "th": it.get("thumb") or "", "d": it.get("duration") or 0,
-                      "v": [[v["q"], v["u"]] for v in (it.get("variants") or [])]})
+                      "v": [[v["q"], v["u"]] for v in (it.get("variants") or [])],
+                      "ip": it.get("iplock") or ""})
 
     def js(o) -> str:
         return (json.dumps(o, ensure_ascii=False).replace("</", "<\\/")
@@ -3214,7 +3365,7 @@ async def _run_scrape_chunk_impl(update_or_query, context, target_url: str, star
             )
             return
 
-        await status_msg.edit_text(f"✅ Total {len(results)} Videos Extracted! 2 TXT aur 2 HTML files generate ho rahi hain...")
+        await status_msg.edit_text(f"✅ Total {len(results)} Videos Extracted!{iplock_hint(results)}\n2 TXT aur 2 HTML files generate ho rahi hain...")
 
         # FILE 1: FULL DETAILS TXT
         txt_full_content = f"--- Scraped Video Links Full (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
@@ -3317,6 +3468,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target_url = url_match.group(1)
+    if re.search(r'\ball\b', text.replace(target_url, " "), re.I):       # "<url> all" -> saare pages
+        context.user_data['scr_all'] = True
+        await scr_run(update.effective_chat, context, user_id, target_url, 1, SCR_ALL_MAX)
+        return
     await run_scrape_chunk(update, context, target_url, start_page=1, end_page=10)
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3374,6 +3529,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "32"))        # parallel video-page extractions (fast)
 SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "12"))   # parallel listing-page fetches
 SCR_MAX_PAGES = 30          # max pages per single run
+SCR_ALL_MAX = int(os.getenv("SCR_ALL_MAX", "300"))   # /scr <url> all : itne pages tak (jaise hi naye links band, ruk jata hai)
 _SCR_CACHE_TTL = 300        # seconds, html cache
 _FETCH_CACHE: Dict[str, tuple] = {}
 _STREAM_CACHE: Dict[str, dict] = {}   # video page url -> extracted result (instant re-runs)
@@ -3518,7 +3674,7 @@ def _scr_diag(html: str, page_url: str, links: List[str]) -> str:
     return "\n".join(out)
 
 
-async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None):
+async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None, auto_end: bool = False):
     """Fast scraper: parallel pages + parallel extraction + cache + retry + self-heal."""
     _ensure_fast_executor()
     reset_host_stats(url)
@@ -3554,7 +3710,19 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
         for l in links:
             url_to_source.setdefault(l, pu)
 
-    await asyncio.gather(*[crawl(p) for p in page_urls])
+    if auto_end:        # "all" mode: pages ki waves, jis wave me naye links na aayein wahin ruk jao
+        wave = max(4, SCR_PAGE_CONCURRENCY)
+        for i in range(0, len(page_urls), wave):
+            if STOP_PROCESS.get(user_id):
+                break
+            before, fails0 = len(url_to_source), len(rep["pages_fail"])
+            await asyncio.gather(*[crawl(p) for p in page_urls[i:i + wave]])
+            if len(url_to_source) == before:                      # koi naya link nahi
+                break
+            if len(rep["pages_fail"]) - fails0 >= max(2, wave // 2):   # aadhe se zyada pages 404/fail = last page paar
+                break
+    else:
+        await asyncio.gather(*[crawl(p) for p in page_urls])
     rep["links"] = len(url_to_source)
 
     results: Dict[str, dict] = {}
@@ -3635,7 +3803,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
     return ordered, rep
 
 
-async def scr_send_files(chat, results: List[dict], start: int, end: int, domain: str, url: str):
+async def scr_send_files(chat, results: List[dict], start: int, end: int, domain: str, url: str, show_next: bool = True):
     tag = f"{domain}_p{start}_to_p{end}"
     full = f"--- {domain} | Pages {start}-{end} | {len(results)} Items ---\n\n"
     simple = f"--- {domain} Simple Links (Pages {start}-{end} | {len(results)} Items) ---\n\n"
@@ -3676,7 +3844,9 @@ async def scr_send_files(chat, results: List[dict], start: int, end: int, domain
     await _send_exports(chat.send_document, results, tag)
     await chat.send_document(
         document=mk(simple_html, f"{tag}_simple.html"),
-        caption=f"🌐 Simple HTML\n\nAage ke pages ({nxt}-{nxt + 9}) ke liye button dabao:", reply_markup=kb)
+        caption=(f"🌐 Simple HTML\n\nAage ke pages ({nxt}-{nxt + 9}) ke liye button dabao:" if show_next
+                 else "🌐 Simple HTML (saare pages ho gaye)"),
+        reply_markup=kb if show_next else None)
 
 
 async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: int):
@@ -3718,7 +3888,8 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
         await status.edit_text(f"{learn}⚡ Extracting {done}/{total} ...")
 
     try:
-        results, rep = await scr_scrape(url, start, end, user_id, progress)
+        all_mode = context.user_data.pop('scr_all', False)
+        results, rep = await scr_scrape(url, start, end, user_id, progress, auto_end=all_mode)
     except Exception as e:
         logger.error(f"/scr error: {e}")
         await status.edit_text(f"❌ Scraping error: {e}")
@@ -3739,10 +3910,11 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
 
     heal = " | 🩹 extractor auto-healed" if rep["healed"] else ""
     await status.edit_text(
-        f"{learn}✅ {len(results)}/{rep['links']} extracted (cache: {rep['cached']}){heal}\nFiles bhej raha hoon...")
+        f"{learn}✅ {len(results)}/{rep['links']} extracted (cache: {rep['cached']}){heal}{iplock_hint(results)}\nFiles bhej raha hoon...")
     context.user_data['scr_url'] = url
     context.user_data['scr_next'] = end + 1
-    await scr_send_files(chat, results, start, end, domain, url)
+    shown_end = max(start, start + rep['pages_ok'] - 1) if all_mode else end
+    await scr_send_files(chat, results, start, shown_end, domain, url, show_next=not all_mode)
     try:
         await status.delete()
     except Exception:
@@ -3761,7 +3933,8 @@ async def scr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚡ /scr - nayi site ki fast scraping\n\n"
             "/scr <url>          -> pages 1-10\n"
             "/scr <url> 5        -> pages 1-5\n"
-            "/scr <url> 3-8      -> pages 3-8\n\n"
+            "/scr <url> 3-8      -> pages 3-8\n"
+            "/scr <url> all      -> SAARE pages (jab tak naye videos aate hain), login/without login dono\n\n"
             "• Site main.py me nahi hai to auto domain-specific extractor banta hai\n"
             "• Site apne aap /site list me add ho jaati hai\n"
             "• Age-gate (18+) page auto bypass, parallel fast scraping, cache, auto-retry, auto-heal\n"
@@ -3788,6 +3961,9 @@ async def scr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
     start = max(1, start)
     end = max(start, min(end, start + SCR_MAX_PAGES - 1))
+    if any(a.lower() == "all" for a in args):
+        start, end = 1, SCR_ALL_MAX
+        context.user_data['scr_all'] = True
 
     await scr_run(chat, context, user_id, url, start, end)
 
@@ -4967,10 +5143,13 @@ def stream_expiry(u: str) -> Optional[int]:
 
 
 def exp_line(it: dict) -> str:
+    out = ""
     ts = it.get("expires")
-    if not ts:
-        return ""
-    return "   Expires: " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts)) + "\n"
+    if ts:
+        out += "   Expires: " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts)) + "\n"
+    if it.get("iplock"):
+        out += f"   IP-locked: {it['iplock']} (sirf usi IP/network se chalegi)\n"
+    return out
 
 
 def verify_stream_sync(url: str, referer: Optional[str] = None) -> Optional[bool]:
@@ -5381,10 +5560,20 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------- Supabase Storage sync: Render restart par bhi cookies/rules/settings bache rahein ----------------
-SB_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
-SB_KEY = os.getenv("SUPABASE_KEY", "").strip()                 # service_role key (secret!)
-SB_BUCKET = os.getenv("SUPABASE_BUCKET", "bot-backup").strip()
-SB_OBJECT = os.getenv("SUPABASE_OBJECT", "bot_data.db").strip()
+def _sb_env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip().strip('"\'').strip()
+
+
+def _sb_base(u: str) -> str:
+    """https://xxxx.supabase.co/rest/v1/ jaisa kuch bhi paste ho to sirf https://xxxx.supabase.co rakho."""
+    pu = urlparse(u)
+    return f"{pu.scheme}://{pu.netloc}" if pu.scheme and pu.netloc else u.rstrip("/")
+
+
+SB_URL = _sb_base(_sb_env("SUPABASE_URL"))
+SB_KEY = _sb_env("SUPABASE_KEY")                              # service_role key (secret!)
+SB_BUCKET = _sb_env("SUPABASE_BUCKET", "bot-backup")
+SB_OBJECT = _sb_env("SUPABASE_OBJECT", "bot_data.db")
 _SB_LAST = {"hash": None, "ok": None}
 
 
@@ -5398,6 +5587,25 @@ def _sb_headers(extra: Optional[dict] = None) -> dict:
     return h
 
 
+def sb_create_bucket() -> str:
+    """Bucket na ho to private bucket bana do (service_role key chahiye). -> 'ok' ya error text."""
+    try:
+        r = requests.post(f"{SB_URL}/storage/v1/bucket", timeout=30, headers=_sb_headers(),
+                          json={"id": SB_BUCKET, "name": SB_BUCKET, "public": False})
+        if r.status_code in (200, 201) or r.status_code == 409 or "already exists" in r.text.lower():
+            return "ok"
+        return f"HTTP {r.status_code}: {r.text[:110]}"
+    except Exception as e:
+        return f"error: {str(e)[:100]}"
+
+
+def _sb_bucket_hint(why: str) -> str:
+    return (f"Bucket '{SB_BUCKET}' nahi mila aur bot ban bhi nahi paya ({why}).\n"
+            f"Fix: Supabase -> Storage -> New bucket -> naam bilkul '{SB_BUCKET}' (Private) banao, "
+            f"ya SUPABASE_BUCKET me apne bucket ka sahi naam do.\n"
+            f"SUPABASE_KEY 'service_role' key honi chahiye (anon key se bucket nahi banta).")
+
+
 def sb_upload_db() -> str:
     """DB ka consistent snapshot Supabase Storage me upload (upsert). -> 'ok' ya error text."""
     tmp = os.path.join(tempfile.gettempdir(), f"sb_up_{int(time.time())}.db")
@@ -5407,8 +5615,14 @@ def sb_upload_db() -> str:
         h = hashlib.md5(data).hexdigest()
         if h == _SB_LAST["hash"]:
             return "unchanged"
-        r = requests.post(f"{SB_URL}/storage/v1/object/{SB_BUCKET}/{SB_OBJECT}", data=data, timeout=60,
-                          headers=_sb_headers({"Content-Type": "application/octet-stream", "x-upsert": "true"}))
+        up = f"{SB_URL}/storage/v1/object/{SB_BUCKET}/{SB_OBJECT}"
+        hd = _sb_headers({"Content-Type": "application/octet-stream", "x-upsert": "true"})
+        r = requests.post(up, data=data, timeout=60, headers=hd)
+        if "bucket not found" in r.text.lower():            # bucket nahi hai -> khud banao, phir ek baar retry
+            cr = sb_create_bucket()
+            if cr != "ok":
+                return _sb_bucket_hint(cr)
+            r = requests.post(up, data=data, timeout=60, headers=hd)
         if r.status_code in (200, 201):
             _SB_LAST["hash"] = h
             _SB_LAST["ok"] = time.time()
@@ -5430,7 +5644,12 @@ def sb_download_db() -> str:
         r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{SB_BUCKET}/{SB_OBJECT}",
                          headers=_sb_headers(), timeout=60)
         if r.status_code != 200:
-            return f"HTTP {r.status_code}"
+            low = r.text.lower()
+            if "bucket not found" in low:
+                return f"bucket '{SB_BUCKET}' nahi mila (pehle /sbsync chalao, wo bana dega)"
+            if "not found" in low or r.status_code == 404:
+                return "abhi tak koi backup upload nahi hua"
+            return f"HTTP {r.status_code}: {r.text[:100]}"
         open(tmp, "wb").write(r.content)
         c = sqlite3.connect(tmp)
         names = {x[0] for x in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -5476,7 +5695,8 @@ async def sbsync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _SB_LAST["hash"] = None
     res = await asyncio.to_thread(sb_upload_db)
-    await update.message.reply_text(f"☁️ Supabase upload: {res}")
+    await update.message.reply_text(f"☁️ Supabase upload: {res}\n"
+                                    f"📦 {SB_URL} | bucket: {SB_BUCKET} | file: {SB_OBJECT}")
 
 
 async def sbrestore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
