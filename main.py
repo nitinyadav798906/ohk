@@ -116,6 +116,12 @@ def init_db():
         )
     """)
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS prefer_hosts (
+            domain TEXT PRIMARY KEY,
+            hosts TEXT
+        )
+    """)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -610,6 +616,10 @@ def clean_results(items: List[dict]):
             reasons["junk_title"] += 1
             sample.setdefault("title", it.get("title") or "")
             continue
+        if it.get("preview_only") and get_setting("keep_preview") != "1":
+            reasons["preview_only"] += 1               # sirf 0.5s preview clip mili, asli video nahi
+            sample.setdefault("preview", it.get("page_url") or "")
+            continue
         link = it["download_link"]
         if len(by_link[link]) >= 3:                        # shared stream: ad/promo ya galat pick
             alt = [c for c in cands if freq[c] == 1 and c != link]
@@ -653,6 +663,9 @@ def drop_hint() -> str:
         s_ += f"   shared stream (sab pages par same): {str(smp['shared'])[:110]}\n"
     if smp.get("title"):
         s_ += f"   junk title: {str(smp['title'])[:60]}\n"
+    if smp.get("preview"):
+        s_ += (f"   preview_only: sirf 0.5s clip mili, asli link page me nahi dikhi\n"
+               f"   -> /sniff {str(smp['preview'])[:90]}  (report mujhe bhejo)\n")
     return s_
 
 
@@ -728,7 +741,7 @@ def xh_player_hls(text: str) -> Optional[str]:
     return None
 
 
-_QS_RX = re.compile(r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:m3u8|mp4)(?:\?[^\s"\'<>]*)?)')
+_QS_RX = re.compile(r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:mp4\.m3u8|m3u8|mp4)(?:\?[^\s"\'<>]*)?)')
 
 
 def _quick_streams(text: str, page_url: str, limit: int = 12) -> List[str]:
@@ -857,7 +870,7 @@ async def guarded_extract(v: str, s: str) -> Optional[dict]:
     if host_is_blocked(_root_host(urlparse(v).netloc)):
         return None
     try:
-        return await asyncio.wait_for(extract_video_link(v, source_page=s), timeout=60)
+        return await asyncio.wait_for(extract_video_link(v, source_page=s), timeout=100)
     except asyncio.TimeoutError:
         return None
 
@@ -1225,7 +1238,7 @@ VIDEO_PATTERNS = [
     r'(?:file|src|source|stream_url|videoUrl|hls|mp4|m3u8)["\']?\s*[:=]\s*'
     r'["\']([^"\']+\.(?:m3u8|mp4)[^"\']*)["\']',
     r'data-(?:src|video|file)=["\']([^"\']+\.(?:m3u8|mp4)[^"\']*)',
-    r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:m3u8|mp4)(?:\?[^\s"\'<>]*)?)',
+    r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:mp4\.m3u8|m3u8|mp4)(?:\?[^\s"\'<>]*)?)',
 ]
 
 
@@ -1325,6 +1338,8 @@ def stream_score(u: str, page_url: str = "") -> float:
         pass
     if _PREVIEW_PATH_RX.search(path):
         s_ -= 6
+    if is_preferred(u, page_url):
+        s_ += 10
     q = stream_quality(u)
     if q:
         s_ += min(q, 2160) / 1000
@@ -1349,16 +1364,166 @@ def _page_meta(text: str, link: str, page_url: str):
     return make_variants(link, text, page_url), best_thumb(text, page_url), best_duration(text)
 
 
-async def refine_stream(stream_link: str, cands: List[str], text: str, video_url: str) -> str:
-    """Chuni hui stream agar preview/0.5s clip lage to asli video dhundo: score + size probe +
-    (zaroorat ho to) packed JS / iframe me khoj. Theek ho to jaisa tha waisa hi wapas."""
+# ---- "prefer host": user batata hai asli video kis host par hoti hai (/prefer) ----
+_PREFER: Dict[str, List[str]] = {}
+
+
+def load_prefers():
+    _PREFER.clear()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        for dom, hosts in conn.execute("SELECT domain, hosts FROM prefer_hosts"):
+            try:
+                _PREFER[_root_host(dom)] = list(json.loads(hosts or "[]"))
+            except Exception:
+                pass
+        conn.close()
+    except Exception as e:
+        logger.error(f"load_prefers error: {e}")
+
+
+def save_prefer(domain: str, hosts: List[str]):
+    conn = sqlite3.connect(DB_FILE)
+    if hosts:
+        conn.execute("INSERT INTO prefer_hosts (domain, hosts) VALUES (?, ?) "
+                     "ON CONFLICT(domain) DO UPDATE SET hosts=excluded.hosts", (domain, json.dumps(hosts)))
+    else:
+        conn.execute("DELETE FROM prefer_hosts WHERE domain=?", (domain,))
+    conn.commit()
+    conn.close()
+    load_prefers()
+
+
+def is_preferred(u: str, page_url: str = "") -> bool:
+    if not _PREFER or not page_url:
+        return False
+    hosts = _PREFER.get(_root_host(urlparse(page_url).netloc))
+    if not hosts:
+        return False
+    h = urlparse(u).netloc.lower().split(':')[0]
+    return any(h == x or h.endswith('.' + x) for x in hosts)
+
+
+# ---- dig stages: jab sirf preview mile to asli link ke liye aur kahan dekhein ----
+_IFRAME_RX = re.compile(r'<(?:iframe|embed)\b[^>]*?\b(?:src|data-src|data-lazy-src|data-url)=["\']([^"\']+)["\']', re.I)
+_AD_RX = re.compile(r'(doubleclick|banner|facebook|twitter|/ads?/|googlesyndication|adserver)', re.I)
+_ASSET_RX = re.compile(r'\.(?:js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|map)(?:\?|$)', re.I)
+_DIG_STATS: Dict[str, Dict[str, list]] = {}      # root -> stage -> [ok, fail]
+
+
+async def _stage_decode(text: str, video_url: str):
+    dec = await asyncio.to_thread(deobfuscate_extra, text)
+    urls = _quick_streams(dec, video_url) if dec else []
+    return urls, f"decoded {len(dec or '')} chars -> {len(urls)} stream(s)"
+
+
+async def _stage_iframes(text: str, video_url: str):
+    srcs: List[str] = []
+    for m in _IFRAME_RX.finditer(text):
+        src = _clean(m.group(1), video_url)
+        if src.startswith('http') and not _AD_RX.search(src) and src not in srcs:
+            srcs.append(src)
+    urls: List[str] = []
+    opened = 0
+    for src in srcs[:4]:
+        h = await fetch(src, referer=video_url)
+        if not h:
+            continue
+        opened += 1
+        urls += await asyncio.to_thread(_quick_streams, h, src)
+        d2 = await asyncio.to_thread(deobfuscate_extra, h)
+        if d2:
+            urls += _quick_streams(d2, src)
+        if not urls:                                   # iframe ke andar iframe (1 level)
+            for m2 in list(_IFRAME_RX.finditer(h))[:2]:
+                s2 = _clean(m2.group(1), src)
+                if s2.startswith('http') and not _AD_RX.search(s2):
+                    h2 = await fetch(s2, referer=src)
+                    if h2:
+                        urls += await asyncio.to_thread(_quick_streams, h2, s2)
+    urls = list(dict.fromkeys(urls))
+    return urls, f"{len(srcs)} iframe, {opened} khule -> {len(urls)} stream(s)"
+
+
+async def _stage_api(text: str, video_url: str):
+    urls: List[str] = []
+    notes: List[str] = []
+    try:
+        d = await scr_spa_discover(video_url, text, light=True)
+        urls += [x["download_link"] for x in d["streams"]]
+        notes.append(f"json/api {len(d['streams'])}")
+    except Exception as e:
+        notes.append(f"json/api error {str(e)[:40]}")
+    pu = urlparse(video_url)
+    ids = set(re.findall(r'[0-9a-fA-F]{8,}|\d{3,}', pu.path + " " + pu.query))
+    eps: List[str] = []
+    if ids:                                            # page ke script me wo URLs jinme video-id hai
+        for m in re.finditer(r'["\']((?:https?:)?//[^"\'\s<>]+|/[A-Za-z0-9_\-./?=&%:]+)["\']', text):
+            raw = m.group(1)
+            if _ASSET_RX.search(raw) or not any(i in raw for i in ids):
+                continue
+            ep = urljoin(video_url, ('https:' + raw) if raw.startswith('//') else raw)
+            if ep.rstrip('/') != video_url.rstrip('/') and ep not in eps:
+                eps.append(ep)
+    got = 0
+    for ep in eps[:8]:
+        body = await asyncio.to_thread(_raw_fetch_sync, ep, video_url, "application/json, text/html, */*")
+        if not body:
+            continue
+        st = _quick_streams(body, ep)
+        d3 = await asyncio.to_thread(deobfuscate_extra, body)
+        if d3:
+            st += _quick_streams(d3, ep)
+        try:
+            js, _pg = scr_json_harvest([json.loads(body.strip())], ep)
+            st += [x["download_link"] for x in js]
+        except Exception:
+            pass
+        got += len(st)
+        urls += st
+    notes.append(f"id-endpoints {len(eps)} -> {got} stream(s)")
+    return list(dict.fromkeys(urls)), ", ".join(notes)
+
+
+async def _stage_ytdlp(text: str, video_url: str):
+    if not ytdlp_allowed(video_url):
+        return [], "yt-dlp off/band"
+    try:
+        y = await asyncio.wait_for(ytdlp_try(video_url, video_url), timeout=30)
+    except asyncio.TimeoutError:
+        return [], "yt-dlp timeout"
+    return ([y[1]] if y else []), ("yt-dlp mila" if y else "yt-dlp: kuch nahi")
+
+
+async def _stage_browser(text: str, video_url: str):
+    if not async_playwright:
+        return [], "browser: playwright install nahi (pip install playwright && playwright install chromium)"
+    try:
+        html, streams = await asyncio.wait_for(pw_render(video_url, wait=4, play=True), timeout=45)
+    except asyncio.TimeoutError:
+        return [], "browser timeout"
+    urls = list(streams)
+    if html:
+        urls += _quick_streams(html, video_url)
+    urls = list(dict.fromkeys(urls))
+    return urls, f"browser network: {len(urls)} stream(s)"
+
+
+_DIG_STAGES = [("decode", _stage_decode), ("iframe", _stage_iframes), ("api", _stage_api),
+               ("ytdlp", _stage_ytdlp), ("browser", _stage_browser)]
+
+
+async def refine_stream(stream_link: str, cands: List[str], text: str, video_url: str):
+    """Chuni hui stream agar preview/0.5s clip lage to asli video dhundo.
+    -> (link, status)  status: 'ok' (jaisa tha) | 'fixed' (asli mili) | 'preview_only' (asli nahi mili)."""
     def suspicious(u: str) -> bool:
         return bool(_PREVIEW_PATH_RX.search(urlparse(u).path.lower()))
 
     if '.m3u8' in stream_link.lower() and not suspicious(stream_link):
-        return stream_link
+        return stream_link, "ok"
     pool = list(dict.fromkeys([stream_link] + list(cands)))
     sizes: Dict[str, Optional[int]] = {}
+    root = _root_host(urlparse(video_url).netloc)
 
     async def probe(urls: List[str]):
         todo = [u for u in urls if u not in sizes]
@@ -1369,49 +1534,66 @@ async def refine_stream(stream_link: str, cands: List[str], text: str, video_url
         prog = [u for u in pool if '.m3u8' not in u.lower()]
         return sorted(prog, key=lambda u: -stream_score(u, video_url))[:4]
 
+    def small(u: str) -> bool:
+        return sizes.get(u) is not None and sizes[u] < 1_200_000
+
+    def pick_real() -> Optional[str]:
+        good = [u for u in pool if sizes.get(u) != 0 and not suspicious(u) and not small(u)]
+        pref = [u for u in good if is_preferred(u, video_url)]
+        if pref:
+            return max(pref, key=lambda u: stream_score(u, video_url))
+        bigs = [u for u in good if '.m3u8' not in u.lower() and (sizes.get(u) or 0) >= 1_500_000]
+        if bigs:
+            return max(bigs, key=lambda u: (stream_score(u, video_url), sizes[u] or 0))
+        hls = [u for u in good if '.m3u8' in u.lower()]
+        if hls:
+            return max(hls, key=lambda u: stream_score(u, video_url))
+        unknown = [u for u in good if sizes.get(u) is None and u != stream_link]
+        if unknown:
+            best = max(unknown, key=lambda u: stream_score(u, video_url))
+            if stream_score(best, video_url) > stream_score(stream_link, video_url):
+                return best
+        return None
+
+    pp = [u for u in pool if is_preferred(u, video_url)]
+    if pp:                                              # /prefer host wali link page me hai -> wahi
+        best = max(pp, key=lambda u: stream_score(u, video_url))
+        return best, ("ok" if best == stream_link else "fixed")
     if not suspicious(stream_link):
         if len(pool) < 2:
-            return stream_link
+            return stream_link, "ok"
         await probe([stream_link])
-        sz = sizes.get(stream_link)
-        if sz is None or sz >= 1_200_000:
-            return stream_link                      # theek lag raha hai (ya size pata nahi) -> chhedo mat
+        if not small(stream_link):
+            return stream_link, "ok"                    # theek lag raha hai (ya size pata nahi)
     await probe(top_prog())
-    extra: List[str] = []                           # clip hi mila -> page ke andar aur gehra dekho
-    dec = await asyncio.to_thread(deobfuscate_extra, text)
-    if dec:
-        extra += _quick_streams(dec, video_url)
-    n_if = 0
-    for m in re.finditer(r'<iframe[^>]+?src=["\']([^"\']+)["\']', text, re.I):
-        src = _clean(m.group(1), video_url)
-        if not src.startswith('http') or re.search(r'(doubleclick|banner|facebook|twitter|/ads?/)', src, re.I):
+    real = pick_real()
+    if real and real != stream_link:
+        return real, "fixed"
+    # ---- sirf preview/clip mili: page ke andar gehra dekho (stage by stage, host-wise seekhte hue) ----
+    deadline = time.time() + 55
+    stats = _DIG_STATS.setdefault(root, {})
+    order = sorted(_DIG_STAGES, key=lambda st: -stats.get(st[0], [0, 0])[0])
+    for name, fn in order:
+        st = stats.setdefault(name, [0, 0])
+        if st[0] == 0 and st[1] >= 4:                  # is host par ye stage kabhi kaam nahi aaya -> skip
             continue
-        n_if += 1
-        h = await fetch(src, referer=video_url)
-        if h:
-            extra += await asyncio.to_thread(_quick_streams, h, src)
-            d2 = await asyncio.to_thread(deobfuscate_extra, h)
-            if d2:
-                extra += _quick_streams(d2, src)
-        if n_if >= 3:
+        left = deadline - time.time()
+        if left < 6:
             break
-    new = [u for u in dict.fromkeys(extra) if u not in pool]
-    if new:
-        pool += new
-        await probe(top_prog())
-    good = [u for u in pool if sizes.get(u) != 0 and not suspicious(u)]
-    bigs = [u for u in good if '.m3u8' not in u.lower() and (sizes.get(u) or 0) >= 1_500_000]
-    if bigs:
-        return max(bigs, key=lambda u: (stream_score(u, video_url), sizes[u] or 0))
-    hls = [u for u in good if '.m3u8' in u.lower()]
-    if hls:
-        return max(hls, key=lambda u: stream_score(u, video_url))
-    unknown = [u for u in good if sizes.get(u) is None and u != stream_link]
-    if unknown:
-        best = max(unknown, key=lambda u: stream_score(u, video_url))
-        if stream_score(best, video_url) > stream_score(stream_link, video_url):
-            return best
-    return stream_link
+        try:
+            urls, _note = await asyncio.wait_for(fn(text, video_url), timeout=left)
+        except Exception:
+            urls = []
+        new = [u for u in dict.fromkeys(urls) if u not in pool]
+        if new:
+            pool += new
+            await probe(top_prog())
+        real = pick_real()
+        if real and real != stream_link:
+            st[0] += 1
+            return real, "fixed"
+        st[1] += 1
+    return stream_link, ("preview_only" if (suspicious(stream_link) or small(stream_link)) else "ok")
 
 
 async def generic_extract(html: str, page_url: str, depth: int = 0) -> Optional[str]:
@@ -1831,7 +2013,7 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
             cands = await asyncio.to_thread(_quick_streams, text, video_url)
             if stream_link not in cands:
                 cands.insert(0, stream_link)
-            stream_link = await refine_stream(stream_link, cands, text, video_url)   # preview clip -> asli video
+            stream_link, rstatus = await refine_stream(stream_link, cands, text, video_url)   # preview clip -> asli video
             if stream_link not in cands:
                 cands.insert(0, stream_link)
             final_link = process_tpl_link(stream_link) if ".m3u8" in stream_link else stream_link
@@ -1851,6 +2033,7 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
                 "thumb": thumb,
                 "duration": duration,
                 "iplock": stream_iplock(final_link),
+                "preview_only": rstatus == "preview_only",
                 "variants": variants,
                 "_cands": cands
             }
@@ -2820,7 +3003,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Full Web Player UI: Custom Video & Media Player interface in HTML.\n"
         "2. 4 Files Export: 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
         "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n\n"
-        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /sky, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup"
+        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /sniff, /prefer, /sky, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup"
     )
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4295,7 +4478,7 @@ async def scr_sitemap(page_url: str) -> dict:
 
 
 # ---------------- optional real browser (Playwright) ----------------
-async def pw_render(url: str, wait: float = 4.0, scroll: bool = False):
+async def pw_render(url: str, wait: float = 4.0, scroll: bool = False, play: bool = False):
     """-> (rendered_html, [stream urls seen in network traffic]). Needs: pip install playwright && playwright install chromium"""
     global _PW_SEM
     if not async_playwright:
@@ -4319,7 +4502,7 @@ async def pw_render(url: str, wait: float = 4.0, scroll: bool = False):
                     await page.mouse.wheel(0, 4000)
                     await page.wait_for_timeout(700)
             for sel in ("video", ".play", "[class*=play]", "button"):     # nudge lazy players
-                if streams:
+                if streams and not play:
                     break
                 try:
                     await page.click(sel, timeout=1200)
@@ -4919,7 +5102,7 @@ except Exception:
 # ---------------- settings (DB me save, /settings se badlo) ----------------
 _SETTINGS: Dict[str, str] = {}
 _SETTING_DEFAULTS = {"verify": "0", "min_quality": "0", "include": "", "exclude": "",
-                     "export": "", "ytdlp": "1"}
+                     "export": "", "ytdlp": "1", "keep_preview": "0"}
 
 
 def load_settings():
@@ -4933,6 +5116,7 @@ def load_settings():
         conn.close()
     except Exception as e:
         logger.error(f"load_settings error: {e}")
+    load_prefers()
 
 
 def get_setting(key: str) -> str:
@@ -5309,7 +5493,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if val.lower() in ("off", "none", "clear", "-", "0") and key in ("include", "exclude", "export", "min_quality"):
             val = "0" if key == "min_quality" else ""
-        elif key in ("verify", "ytdlp"):
+        elif key in ("verify", "ytdlp", "keep_preview"):
             val = "1" if val.lower() in ("on", "1", "yes", "true") else "0"
         elif key == "min_quality":
             if not val.isdigit():
@@ -5326,6 +5510,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• verify (dead link check): {'ON' if get_setting('verify') == '1' else 'OFF'}\n"
         f"• ytdlp (fallback extractor): {'ON' if get_setting('ytdlp') != '0' else 'OFF'}"
         f"{'' if yt_dlp else '  (yt-dlp install nahi hai)'}\n"
+        f"• keep_preview (sirf 0.5s clip wale items bhi rakho): {'ON' if get_setting('keep_preview') == '1' else 'OFF'}\n"
         f"• min_quality: {get_setting('min_quality')}\n"
         f"• include (title me ye words): {show('include')}\n"
         f"• exclude (title me ye words nahi): {show('exclude')}\n"
@@ -5717,6 +5902,100 @@ async def sbrestore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Supabase restore fail: {res}")
 
 
+# ---------------- /sniff (diagnosis) aur /prefer (asli video host batao) ----------------
+def _fmt_stream(u: str, size: Optional[int], page_url: str) -> str:
+    tag = []
+    if _PREVIEW_PATH_RX.search(urlparse(u).path.lower()):
+        tag.append("PREVIEW?")
+    if is_preferred(u, page_url):
+        tag.append("PREFER")
+    if stream_iplock(u):
+        tag.append("IP-lock")
+    sz = "?" if size is None else ("DEAD/HTML" if size == 0 else f"{size / 1_048_576:.1f}MB")
+    return f"[{sz}{' ' + ','.join(tag) if tag else ''}] {u[:105]}"
+
+
+async def sniff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sniff <video page URL> -> page me stream kahan-kahan hai (static/packed/iframe/api/yt-dlp/browser) + final pick."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("🔬 /sniff <video page URL>\nBatata hai asli video link kahan milti hai (ya kyun nahi milti).")
+        return
+    url = context.args[0]
+    st = await update.message.reply_text("🔬 Sniff chal raha hai (kuch sec)...")
+    html = await fetch(url)
+    if not html:
+        await st.edit_text(f"❌ Page fetch fail: HTTP {LAST_STATUS.get(url, '?')} | {LAST_ERR.get(url, '?')}\n{err_hint(url)}")
+        return
+    lines = [f"📄 {len(html)} bytes | {domainOf_safe(url)}"]
+    static = await asyncio.to_thread(_quick_streams, html, url, 12)
+    sizes = dict(zip(static[:6], await asyncio.gather(*[asyncio.to_thread(probe_size_sync, u, url) for u in static[:6]])))
+    lines.append(f"🎞 Static streams ({len(static)}):")
+    lines += [f"  {_fmt_stream(u, sizes.get(u), url)}" for u in static[:6]]
+    for name, fn in _DIG_STAGES:
+        try:
+            urls, note = await asyncio.wait_for(fn(html, url), timeout=50)
+        except Exception as e:
+            urls, note = [], f"error {str(e)[:50]}"
+        lines.append(f"▶ {name}: {note}")
+        top = [u for u in urls if u not in static][:3]
+        szs = await asyncio.gather(*[asyncio.to_thread(probe_size_sync, u, url) for u in top])
+        lines += [f"  {_fmt_stream(u, z, url)}" for u, z in zip(top, szs)]
+    pref = _PREFER.get(_root_host(urlparse(url).netloc))
+    lines.append(f"⭐ Prefer hosts: {', '.join(pref) if pref else '-'}")
+    _STREAM_CACHE.pop(url, None)
+    item = await extract_video_link(url, source_page=url)
+    if item:
+        lines.append(f"✅ FINAL: {_fmt_stream(item['download_link'], None, url)}")
+        lines.append("⚠️ Status: sirf preview mili" if item.get("preview_only") else "👍 Status: asli video lagti hai")
+    else:
+        lines.append("❌ FINAL: kuch nahi mila")
+    await st.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+
+def domainOf_safe(u: str) -> str:
+    try:
+        return urlparse(u).netloc
+    except Exception:
+        return ""
+
+
+async def prefer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/prefer <site> <asli video link ya host>  |  /prefer <site> off  |  /prefer (list)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args or []
+    if not args:
+        rows = sorted(_PREFER.items())
+        await update.message.reply_text(
+            "⭐ /prefer <site> <asli video ki link ya host>\n"
+            "Example: /prefer rusvideos.love https://ebacdn.net/videos_ssd3/pornhub/x/y.mp4?...\n"
+            "Us site ke pages me us host ki link ko hamesha upar rakha jata hai.\n"
+            "Hatane ke liye: /prefer <site> off\n\nAbhi: " + ("\n".join(f"• {d}: {', '.join(h)}" for d, h in rows) if rows else "koi nahi"))
+        return
+    dom = _root_host(normalize_domain(args[0]))
+    cur = list(_PREFER.get(dom, []))
+    if len(args) == 1:
+        await update.message.reply_text(f"⭐ {dom}: {', '.join(cur) if cur else 'koi prefer host nahi'}")
+        return
+    if args[1].lower() in ("off", "clear", "none", "-"):
+        save_prefer(dom, [])
+        await update.message.reply_text(f"🗑 {dom} ka prefer host hata diya.")
+        return
+    raw = args[1]
+    host = (urlparse(raw).netloc if "://" in raw else raw).lower().split(':')[0].strip()
+    if host.startswith("www."):
+        host = host[4:]
+    if not DOMAIN_RE.match(host):
+        await update.message.reply_text(f"❌ Valid host/link nahi: {raw[:60]}")
+        return
+    if host not in cur:
+        cur.append(host)
+    save_prefer(dom, cur)
+    await update.message.reply_text(f"⭐ {dom}: ab {', '.join(cur)} wali links ko priority milegi.\nTest: /sniff <video page URL>")
+
+
 async def _post_init(app):
     _ensure_fast_executor()
     app.bot_data["tasks"] = [asyncio.create_task(_watch_loop(app)), asyncio.create_task(_backup_loop(app)),
@@ -5755,6 +6034,8 @@ def main():
     app.add_handler(CommandHandler("cookie", cookie_command))
     app.add_handler(CommandHandler("updatecookie", updatecookie_command))
     app.add_handler(CommandHandler("sky", sky_command))
+    app.add_handler(CommandHandler("sniff", sniff_command))
+    app.add_handler(CommandHandler("prefer", prefer_command))
     app.add_handler(CommandHandler("sbsync", sbsync_command))
     app.add_handler(CommandHandler("sbrestore", sbrestore_command))
     app.add_handler(CommandHandler("settings", settings_command))
