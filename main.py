@@ -13,7 +13,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor as _TPE
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, List, Dict
-from urllib.parse import unquote, urljoin, urlparse, parse_qs
+from urllib.parse import unquote, urljoin, urlparse, urlunparse, parse_qs
 
 import cloudscraper
 import requests
@@ -248,6 +248,7 @@ def parse_cookie_str(c: str) -> Dict[str, str]:
 
 
 def set_cookie_db(domain: str, cookie: str):
+    globals()["_COOKIE_CACHE"] = None
     try:                                   # nayi cookie ke baad purane (logged-out) cached pages hata do
         globals().get("_FETCH_CACHE", {}).clear()
     except Exception:
@@ -262,6 +263,7 @@ def set_cookie_db(domain: str, cookie: str):
     conn.close()
 
 def delete_cookie_db(domain: str) -> bool:
+    globals()["_COOKIE_CACHE"] = None
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM site_cookies WHERE domain = ?", (domain,))
@@ -278,18 +280,25 @@ def list_cookie_domains() -> List[str]:
     conn.close()
     return rows
 
+_COOKIE_CACHE: Optional[list] = None
+
+
 def get_cookie_for_url(url: str) -> Optional[str]:
+    global _COOKIE_CACHE
     host = normalize_domain(url)
     if not host:
         return None
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT domain, cookie FROM site_cookies")
-        rows = cursor.fetchall()
-        conn.close()
-    except Exception:
-        return None
+    rows = _COOKIE_CACHE
+    if rows is None:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("SELECT domain, cookie FROM site_cookies")
+            rows = cursor.fetchall()
+            conn.close()
+            _COOKIE_CACHE = rows
+        except Exception:
+            return None
     for d, c in rows:
         if host == d or host.endswith('.' + d):
             return c
@@ -875,6 +884,26 @@ async def guarded_extract(v: str, s: str) -> Optional[dict]:
         return None
 
 
+def _cs_sess():
+    s_ = getattr(_TL, "cs", None)
+    if s_ is None:
+        s_ = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+        _TL.cs = s_
+    return s_
+
+
+def _rq_sess():
+    s_ = getattr(_TL, "rq", None)
+    if s_ is None:
+        s_ = requests.Session()
+        ad = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16)
+        s_.mount("http://", ad)
+        s_.mount("https://", ad)
+        _TL.rq = s_
+    s_.cookies.clear()                       # sites ke beech cookie-pollution na ho
+    return s_
+
+
 def _cffi_sess():
     s = getattr(_TL, "cffi", None)
     if s is None:
@@ -902,8 +931,8 @@ def _fetch_once(url: str, referer: Optional[str] = None, use_cookie: bool = True
     engines = {}
     if cffi_requests:  # best against Cloudflare (real Chrome TLS fingerprint)
         engines["curl_cffi"] = lambda: _cffi_sess().get(url, headers=headers, timeout=tmo[1] + 3, proxies=proxies)
-    engines["cloudscraper"] = lambda: scraper.get(url, headers=headers, timeout=tmo, proxies=proxies)
-    engines["requests"] = lambda: requests.get(url, headers=headers, timeout=tmo, proxies=proxies)
+    engines["cloudscraper"] = lambda: _cs_sess().get(url, headers=headers, timeout=tmo, proxies=proxies)
+    engines["requests"] = lambda: _rq_sess().get(url, headers=headers, timeout=tmo, proxies=proxies)
 
     order = list(engines)
     pref = _BEST_ENGINE.get(root)
@@ -1045,8 +1074,47 @@ def fetch_sync(url: str, referer: Optional[str] = None, use_cookie: bool = True)
     return html
 
 
+_BF_STATS: Dict[str, list] = {}      # root -> [ok, fail, last_fail_ts]  (browser se page fetch)
+
+
+def _browser_fetch_allowed(url: str) -> bool:
+    if not async_playwright or os.getenv("BROWSER_FETCH", "1") == "0":
+        return False
+    if not re.search(r':(?:403|503|429|challenge)\b', LAST_DETAIL.get(url, "")):
+        return False
+    st = _BF_STATS.get(_root_host(urlparse(url).netloc))
+    return not (st and st[0] == 0 and st[1] >= 3 and time.time() - st[2] < 600)
+
+
+async def _browser_fetch(url: str) -> Optional[str]:
+    root = _root_host(urlparse(url).netloc)
+    st = _BF_STATS.setdefault(root, [0, 0, 0.0])
+    ck: Dict[str, str] = {}
+    try:
+        html, _s = await asyncio.wait_for(pw_render(url, wait=3, cookies_out=ck), timeout=50)
+    except Exception:
+        html = None
+    ok = bool(html) and len(html) > 500 and not re.search(
+        r'<title>\s*(Just a moment|Attention Required|Access denied|Verifying|Are you a robot|DDoS)', html, re.I)
+    if not ok:
+        st[1] += 1
+        st[2] = time.time()
+        return None
+    st[0] += 1
+    if ck.get("cf_clearance"):                         # ab normal fast engines bhi isi cookie se chalenge
+        _SCR_EXTRA_COOKIES[root] = "; ".join(f"{k}={v}" for k, v in ck.items())
+    LAST_STATUS[url] = 200
+    hs = _HOST_STATS.setdefault(root, {"ok": 0, "fail": 0})
+    hs["ok"] += 1
+    hs["fail"] = max(0, hs["fail"] - 1)
+    return html
+
+
 async def fetch(url: str, referer: Optional[str] = None, use_cookie: bool = True) -> Optional[str]:
-    return await asyncio.to_thread(fetch_sync, url, referer, use_cookie)
+    html = await asyncio.to_thread(fetch_sync, url, referer, use_cookie)
+    if html is None and _browser_fetch_allowed(url):
+        html = await _browser_fetch(url)
+    return html
 
 
 def _shape(pu) -> str:
@@ -1164,6 +1232,20 @@ def _looks_like_single_video(url: str) -> bool:
         r'/post/\d+|/watch/|/v/|/film/|/view_video|\.html?$', path))
 
 
+def _path_page_template(html: str, url: str) -> Optional[str]:
+    """Page me '/same-path/2/', '/same-path/page/2/', '/same-path-2.html' jaisa link mile to {p} template banao."""
+    pu = urlparse(url)
+    base_path = pu.path.rstrip('/')
+    for m in re.finditer(r'href=["\']([^"\']+)["\']', html, re.I):
+        fp = urlparse(urljoin(url, m.group(1).replace('&amp;', '&')).split('#')[0])
+        if fp.netloc.lower() != pu.netloc.lower() or not fp.path.startswith(base_path) or fp.query:
+            continue
+        rest = fp.path[len(base_path):]
+        if re.fullmatch(r'[/_-]?(?:(?:page|p|pg)[/_-]?)?2(?:/|\.html?)?', rest, re.I):
+            return urlunparse((pu.scheme, pu.netloc, base_path + rest.replace('2', '{p}', 1), '', '', ''))
+    return None
+
+
 async def build_page_urls(url: str, start: int, end: int) -> List[str]:
     host = urlparse(url).netloc.lower()
     base = url.rstrip('/')
@@ -1196,6 +1278,11 @@ async def build_page_urls(url: str, start: int, end: int) -> List[str]:
             t2 = re.sub(r'([?&](?:p|page|pg|paged|pagenum|pageno)=)2(?=&|$)', r'\g<1>{p}', href2, count=1)
             if '{p}' in t2 and t2 not in templates:
                 templates.insert(0, t2)
+
+    if html1:
+        t3 = _path_page_template(html1, url)
+        if t3 and t3 not in templates:
+            templates.insert(0, t3)
 
     if '?' in url:
         templates.append(url + "&page={p}")
@@ -1409,6 +1496,16 @@ _IFRAME_RX = re.compile(r'<(?:iframe|embed)\b[^>]*?\b(?:src|data-src|data-lazy-s
 _AD_RX = re.compile(r'(doubleclick|banner|facebook|twitter|/ads?/|googlesyndication|adserver)', re.I)
 _ASSET_RX = re.compile(r'\.(?:js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|map)(?:\?|$)', re.I)
 _DIG_STATS: Dict[str, Dict[str, list]] = {}      # root -> stage -> [ok, fail]
+_PROBE_OK: Dict[str, int] = {}
+_DIG_FAILS: Dict[str, int] = {}
+_DIG_DEAD: Dict[str, float] = {}
+_DIG_SEM_: list = [None]
+
+
+def _dig_sem():
+    if _DIG_SEM_[0] is None:
+        _DIG_SEM_[0] = asyncio.Semaphore(6)
+    return _DIG_SEM_[0]
 
 
 async def _stage_decode(text: str, video_url: str):
@@ -1513,6 +1610,39 @@ _DIG_STAGES = [("decode", _stage_decode), ("iframe", _stage_iframes), ("api", _s
                ("ytdlp", _stage_ytdlp), ("browser", _stage_browser)]
 
 
+async def dig_stream(text: str, video_url: str) -> Optional[str]:
+    """Static HTML me kuch nahi mila: iframe (lazy bhi) / API-JSON / browser network se dhundo (host-wise seekhta hai)."""
+    root = _root_host(urlparse(video_url).netloc)
+    if _DIG_DEAD.get("n:" + root, 0) > time.time():
+        return None
+    stats = _DIG_STATS.setdefault(root, {})
+    deadline = time.time() + 40
+    async with _dig_sem():
+        for name, fn in _DIG_STAGES:
+            if name in ("decode", "ytdlp"):             # ye pehle hi try ho chuke
+                continue
+            st = stats.setdefault("n:" + name, [0, 0])
+            if st[0] == 0 and st[1] >= 4:
+                continue
+            left = deadline - time.time()
+            if left < 6:
+                break
+            try:
+                urls, _n = await asyncio.wait_for(fn(text, video_url), timeout=left)
+            except Exception:
+                urls = []
+            urls = [u for u in dict.fromkeys(urls) if _valid_stream_url(u)]
+            if urls:
+                st[0] += 1
+                _DIG_FAILS["n:" + root] = 0
+                return max(urls, key=lambda u: stream_score(u, video_url))
+            st[1] += 1
+    _DIG_FAILS["n:" + root] = _DIG_FAILS.get("n:" + root, 0) + 1
+    if _DIG_FAILS["n:" + root] >= 5:
+        _DIG_DEAD["n:" + root] = time.time() + 600
+    return None
+
+
 async def refine_stream(stream_link: str, cands: List[str], text: str, video_url: str):
     """Chuni hui stream agar preview/0.5s clip lage to asli video dhundo.
     -> (link, status)  status: 'ok' (jaisa tha) | 'fixed' (asli mili) | 'preview_only' (asli nahi mili)."""
@@ -1560,40 +1690,52 @@ async def refine_stream(stream_link: str, cands: List[str], text: str, video_url
         best = max(pp, key=lambda u: stream_score(u, video_url))
         return best, ("ok" if best == stream_link else "fixed")
     if not suspicious(stream_link):
-        if len(pool) < 2:
-            return stream_link, "ok"
+        others = [u for u in pool if u != stream_link and not suspicious(u)]
+        if not others or _PROBE_OK.get(root, 0) >= 4:
+            return stream_link, "ok"                    # behtar vikalp nahi / is host par hamesha theek niklaa
         await probe([stream_link])
         if not small(stream_link):
+            _PROBE_OK[root] = _PROBE_OK.get(root, 0) + 1
             return stream_link, "ok"                    # theek lag raha hai (ya size pata nahi)
     await probe(top_prog())
     real = pick_real()
     if real and real != stream_link:
         return real, "fixed"
     # ---- sirf preview/clip mili: page ke andar gehra dekho (stage by stage, host-wise seekhte hue) ----
-    deadline = time.time() + 55
-    stats = _DIG_STATS.setdefault(root, {})
-    order = sorted(_DIG_STAGES, key=lambda st: -stats.get(st[0], [0, 0])[0])
-    for name, fn in order:
-        st = stats.setdefault(name, [0, 0])
-        if st[0] == 0 and st[1] >= 4:                  # is host par ye stage kabhi kaam nahi aaya -> skip
-            continue
-        left = deadline - time.time()
-        if left < 6:
-            break
-        try:
-            urls, _note = await asyncio.wait_for(fn(text, video_url), timeout=left)
-        except Exception:
-            urls = []
-        new = [u for u in dict.fromkeys(urls) if u not in pool]
-        if new:
-            pool += new
-            await probe(top_prog())
-        real = pick_real()
-        if real and real != stream_link:
-            st[0] += 1
-            return real, "fixed"
-        st[1] += 1
-    return stream_link, ("preview_only" if (suspicious(stream_link) or small(stream_link)) else "ok")
+    def _bad():
+        return stream_link, ("preview_only" if (suspicious(stream_link) or small(stream_link)) else "ok")
+
+    if _DIG_DEAD.get(root, 0) > time.time():           # is host par dig lagataar fail -> 10 min skip (tez)
+        return _bad()
+    async with _dig_sem():
+        deadline = time.time() + 30
+        stats = _DIG_STATS.setdefault(root, {})
+        order = sorted(_DIG_STAGES, key=lambda st: -stats.get(st[0], [0, 0])[0])
+        for name, fn in order:
+            st = stats.setdefault(name, [0, 0])
+            if st[0] == 0 and st[1] >= 4:              # is host par ye stage kabhi kaam nahi aaya -> skip
+                continue
+            left = deadline - time.time()
+            if left < 6:
+                break
+            try:
+                urls, _note = await asyncio.wait_for(fn(text, video_url), timeout=left)
+            except Exception:
+                urls = []
+            new = [u for u in dict.fromkeys(urls) if u not in pool]
+            if new:
+                pool += new
+                await probe(top_prog())
+            real = pick_real()
+            if real and real != stream_link:
+                st[0] += 1
+                _DIG_FAILS[root] = 0
+                return real, "fixed"
+            st[1] += 1
+    _DIG_FAILS[root] = _DIG_FAILS.get(root, 0) + 1
+    if _DIG_FAILS[root] >= 3:
+        _DIG_DEAD[root] = time.time() + 600
+    return _bad()
 
 
 async def generic_extract(html: str, page_url: str, depth: int = 0) -> Optional[str]:
@@ -2006,6 +2148,9 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
                 if y[0] and title in ("Video", ""):
                     title = y[0]
 
+        if not stream_link:                      # kuch nahi mila -> iframe/API/browser se gehra dhundo
+            stream_link = await dig_stream(text, video_url)
+
         if not stream_link:
             EXTRACT_NOTE["v"] = f"{video_url}\n{page_diag(text)}"
 
@@ -2280,12 +2425,20 @@ a{color:inherit}
 /* ---------- watch ---------- */
 .wl{display:grid;grid-template-columns:minmax(0,1fr) 400px;gap:24px;padding:20px 24px 40px;max-width:1800px;margin:0 auto}
 .theater .wl{grid-template-columns:1fr}
-.theater .player{border-radius:0;max-height:80vh}
+.theater .player{max-height:80vh}.theater .pin{border-radius:0}
 .theater .wmain{margin:0 -24px}
 .theater .wmain>*:not(.player){margin-left:24px;margin-right:24px}
-.player{position:relative;background:#000;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);border-radius:12px;overflow:hidden;user-select:none}
+.wmain{position:relative;z-index:0}
+.player{position:relative;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);user-select:none}
+.pin{position:absolute;inset:0;overflow:hidden;background:#000;border-radius:12px}
+.ambc{position:absolute;z-index:-1;pointer-events:none;transition:opacity .4s}
+body.amb-on{overflow-x:hidden}
+html:has(body.amb-on){scrollbar-width:none}
+html:has(body.amb-on)::-webkit-scrollbar{display:none}
+.amb-on .top{box-shadow:var(--hsh,none)}
+.amb-on .desc,.amb-on .act{background:color-mix(in srgb,var(--bg2) 75%,transparent)}
 .player video,.player #imgv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
-.player:fullscreen{max-height:none;border-radius:0}
+.player:fullscreen{max-height:none;background:#000}.player:fullscreen .pin{border-radius:0}.player:fullscreen .ambc{display:none}
 .aud{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:90px;color:#555}
 .ov{position:absolute;inset:0 0 54px 0;z-index:3}
 .big{position:absolute;left:50%;top:50%;width:68px;height:68px;margin:-34px;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;font-size:30px;display:flex;align-items:center;justify-content:center;opacity:0;transition:.2s;pointer-events:none}
@@ -2335,7 +2488,38 @@ a{color:inherit}
 .up .thumb{width:168px;flex:none;border-radius:8px}
 .up .tx .ttl{font-size:14px}
 .up.cur .ttl{color:#3ea6ff}
-@media(max-width:1000px){.wl{grid-template-columns:1fr;padding:0 0 40px;gap:14px}.player{position:sticky;top:var(--hh);z-index:40;border-radius:0;max-height:none}.wmain>*:not(.player){margin-left:14px;margin-right:14px}.wside{padding:0 14px}.theater .wmain{margin:0}.theater .wmain>*:not(.player){margin-left:14px;margin-right:14px}}
+@media(max-width:1000px){.wl{grid-template-columns:1fr;padding:0 0 40px;gap:14px}.player{position:sticky;top:var(--hh);z-index:40;max-height:none}.pin{border-radius:0}.ambc{max-width:100vw}.wmain>*:not(.player){margin-left:14px;margin-right:14px}.wside{padding:0 14px}.theater .wmain{margin:0}.theater .wmain>*:not(.player){margin-left:14px;margin-right:14px}}
+.dimov{position:absolute;inset:0;z-index:1;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;padding:18px 70px 0 18px;opacity:0;transition:opacity .25s;pointer-events:none}
+.dimov b{font-size:20px;line-height:1.3;color:#fff;text-shadow:0 1px 6px #000;max-width:80%}
+.player.dim .dimov{opacity:1}
+.pbm{position:absolute;right:10px;bottom:64px;width:min(340px,92%);max-height:72%;overflow:auto;z-index:8;background:rgba(18,18,18,.97);color:#fff;border-radius:14px;padding:12px 14px;box-shadow:0 8px 30px rgba(0,0,0,.6);font-size:14px}
+.pbm .hd{display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px;margin-bottom:10px;cursor:pointer}
+.pbm .chips2{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.pbm .chip2{flex:1 1 auto;padding:8px 10px;border-radius:20px;background:#2a2a2a;text-align:center;font-weight:600;min-width:52px}
+.pbm .chip2.on{background:#fff;color:#000}
+.pbm .row2{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 2px;border-top:1px solid #2c2c2c;cursor:pointer;color:#fff;text-decoration:none}
+.pbm .row2 small{color:#9a9a9a;display:block;font-size:12px;margin-top:2px}
+.pbm .sw{flex:none;width:46px;height:26px;border-radius:13px;background:#3a3a3a;position:relative;transition:.2s}
+.pbm .sw:after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.2s}
+.pbm .sw.on{background:#2f7fff}.pbm .sw.on:after{left:23px}
+.pbm .sl{padding:10px 2px}
+.pbm .sl .lb{display:flex;justify-content:space-between;margin-bottom:6px;font-weight:600}
+.pbm .sl .lb span{color:#bbb}
+.pbm .sl .lb button{color:#bbb;font-size:16px;margin-left:8px}
+.pbm input[type=range]{width:100%;accent-color:#ff3d3d}
+.pbm .arrow{color:#aaa}
+.endsc{position:absolute;inset:0;z-index:6;background:rgba(0,0,0,.92);overflow:auto;padding:16px 18px;color:#fff;display:flex;flex-direction:column;gap:12px}
+.endsc .eh{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.endsc .en{display:flex;gap:12px;align-items:center;background:#1c1c1c;border-radius:12px;padding:10px;flex:1 1 320px;max-width:520px;cursor:pointer}
+.endsc .en .thumb{width:150px;flex:none;border-radius:8px}
+.endsc .cd{width:54px;height:54px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;background:conic-gradient(#fff var(--p,0%),#444 0)}
+.endsc .cd i{width:44px;height:44px;border-radius:50%;background:#1c1c1c;display:flex;align-items:center;justify-content:center;font-style:normal;font-size:20px;font-weight:700}
+.endsc .eb2{display:flex;gap:8px;flex-wrap:wrap}
+.endsc .eb2 button{background:#fff;color:#000;padding:9px 16px;border-radius:20px;font-weight:700}
+.endsc .eb2 button.g{background:#333;color:#fff}
+.endsc .eg{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
+.endsc .eg .c{cursor:pointer}
+.endsc .eg .ttl{font-size:13px;margin-top:6px}
 /* ---------- popup / toast ---------- */
 .pop{position:fixed;z-index:200;background:var(--bg2);border-radius:12px;padding:6px 0;min-width:190px;box-shadow:0 6px 30px rgba(0,0,0,.5)}
 .pop button,.pop a{display:block;width:100%;text-align:left;padding:10px 16px;font-size:14px;text-decoration:none}
@@ -2362,10 +2546,11 @@ a{color:inherit}
 <section id="watch" hidden>
  <div class="wl">
   <div class="wmain">
-   <div class="player paused" id="pl">
+   <div class="player paused" id="pl"><canvas id="amb" class="ambc"></canvas><div class="pin">
      <video id="v" playsinline preload="auto"></video>
      <img id="imgv" hidden alt="">
      <div class="aud" id="aud" hidden>&#9835;</div>
+     <div class="dimov" id="dimov"><b id="dimT"></b></div>
      <div class="wm" id="wm"></div>
      <div class="ov" id="ov">
        <div class="spin" id="spin" hidden></div>
@@ -2373,6 +2558,8 @@ a{color:inherit}
        <div class="big" id="big">&#9654;</div>
      </div>
      <div class="err" id="err" hidden></div>
+     <div class="endsc" id="endsc" hidden></div>
+     <div class="pbm" id="pbm" hidden></div>
      <div class="ctl" id="ctl">
        <div class="seek" id="seek"><div class="buf" id="buf"></div><div class="pro" id="pro"></div><div class="knob" id="knob"></div><div class="tip" id="tip">0:00</div></div>
        <div class="crow">
@@ -2380,11 +2567,11 @@ a{color:inherit}
          <button id="bVol" title="Mute (m)">&#128266;</button><input id="vol" type="range" min="0" max="1" step="0.05" value="1">
          <span class="t" id="tm">0:00 / 0:00</span><span class="sp"></span>
          <button class="tx2" id="bSpd" title="Speed">1x</button><button class="tx2" id="bQ" title="Quality" hidden>Auto</button>
-         <button id="bPip" title="Picture in picture">&#10064;</button><button id="bTh" title="Theater (t)">&#9645;</button><button id="bFs" title="Fullscreen (f)">&#9974;</button>
+         <button id="bPip" title="Picture in picture">&#10064;</button><button id="bTh" title="Theater (t)">&#9645;</button><button id="bFs" title="Fullscreen (f)">&#9974;</button><button id="bMore" title="Settings (Playback, Zoom, Brightness...)">&#8942;</button>
        </div>
        <div class="menu" id="menu" hidden></div>
      </div>
-   </div>
+   </div></div>
    <h1 id="wt"></h1>
    <div class="acts" id="acts"></div>
    <div class="desc" id="desc"></div>
@@ -2684,6 +2871,59 @@ function go(it){location.hash="#/w/"+ALL.indexOf(it)}
 /* ---------- player ---------- */
 var V=$("#v"),PL=$("#pl"),hls=null,mp=null,dash=null,retries=0,hideT,lastSave=0,dragging=false,IMGV=$("#imgv");
 var CURQ="auto",SEEK_AT=0,CURURL="";
+/* ---------- playback settings (3-dot menu) ---------- */
+var PBDEF={zoom:false,bright:100,boost:100,night:false,dim:true,intro:0,outro:0,contrast:100,sat:100,warm:0,loop:false};
+var PB=LS.get("ytb_pb",{}),PBLEVEL="main";
+function pbv(k){return PB[k]!==undefined?PB[k]:PBDEF[k]}
+function pbset(k,v){PB[k]=v;LS.set("ytb_pb",PB)}
+var AC=null,SRCN=null,GAINN=null,COMPN=null,GRAPH=false,PENDING_FX=false,FX_AT=0,CORS_BLOCK={},CORS_LOAD=false,OUTRO_DONE=false,ENDSHOWN=false,endT=null;
+function applyVideoFx(){
+  var f=[],b=pbv("bright"),c=pbv("contrast"),s=pbv("sat"),w=pbv("warm");
+  if(b!==100)f.push("brightness("+b+"%)");
+  if(c!==100)f.push("contrast("+c+"%)");
+  if(s!==100)f.push("saturate("+s+"%)");
+  if(w>0)f.push("sepia("+w+"%)");
+  V.style.filter=f.join(" ");
+  V.style.objectFit=pbv("zoom")?"cover":"";
+  V.loop=!!pbv("loop");
+}
+function needFx(){return pbv("boost")>100||pbv("night")}
+function setFx(){
+  if(!GRAPH)return;
+  var n=pbv("night");
+  try{
+    COMPN.threshold.value=n?-38:0;COMPN.ratio.value=n?8:1;COMPN.knee.value=n?24:0;COMPN.attack.value=0.003;COMPN.release.value=0.25;
+    GAINN.gain.value=(pbv("boost")/100)*(n?1.5:1);
+  }catch(e){}
+}
+function ensureGraph(){
+  if(GRAPH)return true;
+  try{
+    var A=window.AudioContext||window.webkitAudioContext;if(!A)return false;
+    AC=AC||new A();
+    SRCN=AC.createMediaElementSource(V);COMPN=AC.createDynamicsCompressor();GAINN=AC.createGain();
+    SRCN.connect(COMPN);COMPN.connect(GAINN);GAINN.connect(AC.destination);
+    GRAPH=true;if(AC.resume)AC.resume();return true;
+  }catch(e){return false}
+}
+function resetFx(msg){pbset("boost",100);pbset("night",false);if(msg)toast(msg);setFx();if(!$("#pbm").hidden)renderPb(PBLEVEL)}
+function applyAudioFx(){
+  if(!needFx()){setFx();return}
+  var eng=engineOf({u:CURURL,k:CUR&&CUR.k});
+  if(eng==="native"&&!GRAPH&&V.crossOrigin!=="anonymous"){
+    if(CORS_BLOCK[CURURL]){resetFx("Is stream par Boost/Night mode nahi chalega (server CORS allow nahi karta)");return}
+    PENDING_FX=true;FX_AT=V.currentTime||0;                 /* CORS ke saath dobara load, phir graph banega */
+    loadItem(CUR,{url:CURURL,keepQ:true,at:FX_AT,cors:true});return;
+  }
+  if(!ensureGraph()){resetFx("Audio boost is browser me nahi chal raha");return}
+  setFx();
+}
+function replaceVideo(){
+  var old=V,nv=document.createElement("video");
+  nv.id="v";nv.setAttribute("playsinline","");nv.preload="auto";nv.volume=old.volume;nv.muted=old.muted;
+  try{old.pause();old.removeAttribute("src");old.load()}catch(e){}
+  old.parentNode.replaceChild(nv,old);V=nv;GRAPH=false;SRCN=GAINN=COMPN=null;bindVideo();applyVideoFx();
+}
 var isTouch=false;try{isTouch=window.matchMedia&&matchMedia("(pointer:coarse)").matches}catch(e){}
 function destroyEngines(){
   try{if(hls){hls.destroy()}}catch(e){}hls=null;
@@ -2736,7 +2976,8 @@ function setQuality(v){
 }
 function loadItem(it,opt){
   opt=opt||{};
-  destroyEngines();showErr("");retries=0;V.hidden=true;IMGV.hidden=true;$("#aud").hidden=true;$("#menu").hidden=true;
+  destroyEngines();showErr("");hideEnd();OUTRO_DONE=false;CORS_LOAD=false;amBars={t:0,b:0,on:true};amN=0;retries=0;V.hidden=true;IMGV.hidden=true;$("#aud").hidden=true;$("#menu").hidden=true;
+  applyVideoFx();
   if(!opt.keepQ)CURQ="auto";
   var u=opt.url||it.u;CURURL=u;SEEK_AT=opt.at||0;
   if(it.k==="IMAGE"){IMGV.hidden=false;IMGV.referrerPolicy="no-referrer";IMGV.src=it.u;setLoading(false);updQBtn();return}
@@ -2767,15 +3008,19 @@ function loadItem(it,opt){
       if(window.mpegts&&mpegts.isSupported()){mp=mpegts.createPlayer({type:extOf(u)==="flv"?"flv":"mpegts",url:u,isLive:false});mp.attachMediaElement(V);mp.load();go2()}
       else fail(it,"TS/FLV is browser me supported nahi");
     },function(){fail(it,"mpegts.js load nahi hui")});
-  }else{V.src=u;go2()}
+  }else{
+    CORS_LOAD=!!(opt.cors||GRAPH||(needFx()&&!CORS_BLOCK[u]));
+    if(CORS_LOAD)V.crossOrigin="anonymous";else V.removeAttribute("crossorigin");
+    V.src=u;go2();
+  }
 }
 function togglePlay(){if(V.paused){var p=V.play();if(p&&p.catch)p.catch(function(){})}else V.pause()}
 function skip(s,rip){
   if(isFinite(V.duration))V.currentTime=Math.max(0,Math.min(V.duration,V.currentTime+s));else V.currentTime=Math.max(0,V.currentTime+s);
   if(rip){rip.classList.add("on");setTimeout(function(){rip.classList.remove("on")},450)}
 }
-function showCtl(){PL.classList.add("show");clearTimeout(hideT);if(!V.paused)hideT=setTimeout(function(){PL.classList.remove("show");$("#menu").hidden=true},2800)}
-function updPlayIcon(){$("#bPlay").innerHTML=V.paused?"&#9654;":"&#10074;&#10074;";PL.classList.toggle("paused",V.paused)}
+function showCtl(){PL.classList.add("show");clearTimeout(hideT);if(!V.paused)hideT=setTimeout(function(){if(!$("#pbm").hidden)return;PL.classList.remove("show");$("#menu").hidden=true},2800)}
+function updPlayIcon(){$("#bPlay").innerHTML=V.paused?"&#9654;":"&#10074;&#10074;";PL.classList.toggle("paused",V.paused);PL.classList.toggle("dim",!!(V.paused&&pbv("dim")&&(V.currentTime||0)>0.5&&!ENDSHOWN))}
 function updTime(){
   var d=V.duration,c=V.currentTime||0;
   $("#tm").textContent=fmtTime(c)+" / "+(isFinite(d)?fmtTime(d):"LIVE");
@@ -2784,7 +3029,9 @@ function updTime(){
 function updBuf(){
   try{var d=V.duration,b=V.buffered;if(b.length&&isFinite(d)&&d>0){var c=V.currentTime,e=0;for(var i=0;i<b.length;i++){if(b.start(i)<=c&&b.end(i)>=c)e=b.end(i)}$("#buf").style.width=(e/d*100)+"%"}}catch(e){}
 }
-V.addEventListener("play",function(){updPlayIcon();showCtl()});
+function bindVideo(){
+V.addEventListener("play",function(){hideEnd();updPlayIcon();showCtl();amN=0;ambStart()});
+V.addEventListener("seeked",function(){amN=0;ambStart()});V.addEventListener("loadeddata",function(){amN=0;ambStart()});
 V.addEventListener("pause",function(){updPlayIcon();showCtl()});
 V.addEventListener("waiting",function(){setLoading(true)});
 V.addEventListener("playing",function(){setLoading(false);showErr("")});
@@ -2793,19 +3040,33 @@ V.addEventListener("progress",updBuf);
 V.addEventListener("timeupdate",function(){
   updTime();updBuf();
   if(CUR&&Date.now()-lastSave>4000&&V.currentTime>1){lastSave=Date.now();saveHist(CUR,V.currentTime,isFinite(V.duration)?V.duration:0)}
+  var o=pbv("outro"),d=V.duration;
+  if(o>0&&!OUTRO_DONE&&isFinite(d)&&d>o*4&&d-V.currentTime<=o&&V.currentTime>1){OUTRO_DONE=true;V.pause();toast("Outro skipped");onEnded()}
 });
 V.addEventListener("loadedmetadata",function(){
   updTime();if(CUR&&isFinite(V.duration))DUR[CUR.u]=V.duration;
+  if(PENDING_FX){PENDING_FX=false;applyAudioFx()}else if(GRAPH||needFx()){applyAudioFx()}
   if(SEEK_AT>1){try{V.currentTime=SEEK_AT}catch(e){}SEEK_AT=0;return}
   var h=CUR&&HIST[CUR.u];
   if(h&&h.pos>5&&isFinite(V.duration)&&h.pos<V.duration-8){V.currentTime=h.pos;toast("Resumed from "+fmtTime(h.pos))}
+  else if(pbv("intro")>0&&isFinite(V.duration)&&V.duration>pbv("intro")*4){V.currentTime=pbv("intro");toast("Intro skipped ("+pbv("intro")+"s)")}
 });
-V.addEventListener("ended",function(){
-  if(CUR)saveHist(CUR,0,isFinite(V.duration)?V.duration:0);
-  if($("#auto").checked){var n=nextItem(1);if(n)go(n)}
+V.addEventListener("ended",function(){onEnded()});
+V.addEventListener("error",function(){
+  if(!(CUR&&!hls&&!mp&&!dash&&V.getAttribute("src")))return;
+  if(CORS_LOAD){                                          /* CORS wali load fail: boost nahi, normal play */
+    CORS_BLOCK[CURURL]=true;CORS_LOAD=false;PENDING_FX=false;
+    var at=V.currentTime||FX_AT||0,wasG=GRAPH;
+    pbset("boost",100);pbset("night",false);
+    if(wasG)replaceVideo();
+    toast("Server CORS allow nahi karta: Boost/Night mode band, normal play");
+    loadItem(CUR,{url:CURURL,keepQ:true,at:at});return;
+  }
+  fail(CUR,"Ye format/codec browser support nahi karta (MKV/AVI/HEVC/WMV etc.)")
 });
-V.addEventListener("error",function(){if(CUR&&!hls&&!mp&&!dash&&V.getAttribute("src"))fail(CUR,"Ye format/codec browser support nahi karta (MKV/AVI/HEVC/WMV etc.)")});
 V.addEventListener("volumechange",function(){$("#bVol").innerHTML=(V.muted||V.volume===0)?"&#128263;":"&#128266;";$("#vol").value=V.muted?0:V.volume});
+}
+bindVideo();
 $("#vol").addEventListener("input",function(){V.muted=false;V.volume=parseFloat(this.value)});
 $("#bVol").onclick=function(){V.muted=!V.muted};
 $("#bPlay").onclick=togglePlay;
@@ -2863,6 +3124,7 @@ document.addEventListener("keydown",function(e){
   if($("#watch").hidden)return;
   var t=e.target,tn=t&&t.tagName;if(tn==="SELECT"||tn==="TEXTAREA"||(tn==="INPUT"&&t.type!=="range"&&t.type!=="checkbox"))return;
   var k=e.key;
+  if(k==="Escape"&&!$("#pbm").hidden){pbClose();return}
   if(k===" "||k==="k"){e.preventDefault();togglePlay()}
   else if(k==="ArrowRight"){skip(5,$("#ripR"))}else if(k==="ArrowLeft"){skip(-5,$("#ripL"))}
   else if(k==="l"){skip(10,$("#ripR"))}else if(k==="j"){skip(-10,$("#ripL"))}
@@ -2885,6 +3147,162 @@ function setSession(it){
     navigator.mediaSession.setActionHandler("previoustrack",function(){var p=nextItem(-1);if(p)go(p)});
   }catch(e){}
 }
+
+/* ---------- Ambient light (YouTube jaisa glow; settings = ambient.json) ---------- */
+var AM=CFG.amb||{},AMS=LS.get("ytb_amb",{}),amCv=$("#amb"),amCx=null,amRaf=0,amLast=0,amN=0,amBars={t:0,b:0,on:true};
+function amv(k,d){return AMS[k]!==undefined?AMS[k]:(AM[k]!==undefined?AM[k]:d)}
+function amset(k,v){AMS[k]=v;LS.set("ytb_amb",AMS);applyAmb()}
+function applyAmb(){
+  var on=!!amv("enabled",true),sp=amv("spread",130)/100,bl=amv("blur",25),fs=amv("spreadFadeStart",20),fc=amv("spreadFadeCurve",20);
+  document.body.classList.toggle("amb-on",on);amCv.hidden=!on;
+  amCv.style.width=(sp*100)+"%";amCv.style.height=(sp*100)+"%";amCv.style.left=((1-sp)*50)+"%";amCv.style.top=((1-sp)*50)+"%";
+  amCv.style.filter="blur("+Math.round(bl*1.6)+"px) saturate(1.35)";
+  var m="radial-gradient(ellipse closest-side,#000 "+Math.max(0,100-fs-fc)+"%,rgba(0,0,0,0) 100%)";
+  amCv.style.webkitMaskImage=m;amCv.style.maskImage=m;amCv.style.opacity=amv("intensity",90)/100;
+  document.documentElement.style.setProperty("--hsh","0 0 "+amv("headerShadowSize",25)+"px rgba(0,0,0,"+(amv("headerShadowOpacity",30)/100)+")");
+  if(on)ambStart();
+}
+function detectBars(vw,vh){
+  try{
+    var c=document.createElement("canvas");c.width=64;c.height=36;var x=c.getContext("2d");x.drawImage(V,0,0,64,36);
+    var d=x.getImageData(0,0,64,36).data;
+    function lum(r){var s=0;for(var i=0;i<64;i++){var p=(r*64+i)*4;s+=d[p]*.3+d[p+1]*.59+d[p+2]*.11}return s/64}
+    var t=0,b=0;while(t<12&&lum(t)<14)t++;while(b<12&&lum(35-b)<14)b++;
+    amBars={t:t/36,b:b/36,on:true};
+  }catch(e){amBars={t:0,b:0,on:false}}
+}
+function ambDraw(){
+  if(!amCx){amCv.width=128;amCv.height=72;try{amCx=amCv.getContext("2d")}catch(e){}if(!amCx)return}
+  var vw=V.videoWidth,vh=V.videoHeight;if(!vw||!vh||V.readyState<2)return;
+  if(amv("detectHorizontalBarSizeEnabled",true)&&amBars.on!==false&&amN%45===0)detectBars(vw,vh);
+  var sy=Math.round(vh*amBars.t),sh=Math.max(1,Math.round(vh*(1-amBars.t-amBars.b)));
+  try{amCx.drawImage(V,0,sy,vw,sh,0,0,128,72);amN++}catch(e){}
+}
+function ambFrame(ts){
+  amRaf=0;
+  if(!amv("enabled",true)||$("#watch").hidden||document.hidden)return;
+  var fps=Math.min(60,Math.max(5,amv("framerateLimit",60)));
+  if(ts-amLast>=1000/fps){amLast=ts;ambDraw()}
+  if(!V.paused||amN<3||!amv("energySaver",true))amRaf=requestAnimationFrame(ambFrame);   /* paused: 2-3 frame ke baad ruk jao */
+}
+function ambStart(){if(!amRaf&&amv("enabled",true)&&!$("#watch").hidden){amRaf=requestAnimationFrame(ambFrame)}}
+document.addEventListener("visibilitychange",function(){if(!document.hidden){amN=0;ambStart()}});
+
+/* ---------- end screen (YouTube jaisa: replay + up next countdown + suggestions) ---------- */
+function hideEnd(){clearInterval(endT);endT=null;ENDSHOWN=false;var e=$("#endsc");if(e){e.hidden=true;e.textContent=""}}
+function onEnded(){
+  if(!CUR||ENDSHOWN)return;
+  saveHist(CUR,0,isFinite(V.duration)?V.duration:0);
+  showEnd();
+}
+function showEnd(){
+  ENDSHOWN=true;PL.classList.remove("dim");
+  var box=$("#endsc");box.textContent="";box.hidden=false;
+  var l=upList(),i=l.indexOf(CUR),next=l[i+1]||null,auto=$("#auto").checked,head=el("div","eh");
+  if(next){
+    var en=el("div","en"),th=mkThumb(next),tx=el("div","tx");
+    tx.appendChild(el("div","sub","Up next"));tx.appendChild(el("h3","ttl",next.t||"Video"));
+    en.appendChild(th);en.appendChild(tx);en.onclick=function(){hideEnd();go(next)};head.appendChild(en);
+    if(auto){
+      var cd=el("div","cd"),inn=el("i","","6"),left=6;cd.appendChild(inn);cd.style.setProperty("--p","0%");head.appendChild(cd);
+      endT=setInterval(function(){left--;inn.textContent=left;cd.style.setProperty("--p",((6-left)/6*100)+"%");if(left<=0){hideEnd();go(next)}},1000);
+    }
+  }
+  var bt=el("div","eb2"),rp=el("button","","\u21BA Replay");
+  rp.onclick=function(){hideEnd();V.currentTime=0;var p=V.play();if(p&&p.catch)p.catch(function(){})};bt.appendChild(rp);
+  if(next&&auto){var cn=el("button","g","Cancel autoplay");cn.onclick=function(){clearInterval(endT);endT=null;var c=head.querySelector(".cd");if(c)c.remove();cn.remove()};bt.appendChild(cn)}
+  if(next){var pn=el("button","","Play now");pn.onclick=function(){hideEnd();go(next)};bt.appendChild(pn)}
+  head.appendChild(bt);box.appendChild(head);
+  var sug=l.slice(i+2,i+8);
+  if(!sug.length)sug=l.filter(function(x){return x!==CUR&&x!==next}).slice(0,6);
+  if(sug.length){
+    box.appendChild(el("div","sub","More videos"));var g=el("div","eg");
+    sug.forEach(function(x){var c=el("div","c");c.appendChild(mkThumb(x));c.appendChild(el("div","ttl",x.t||"Video"));c.onclick=function(){hideEnd();go(x)};g.appendChild(c)});
+    box.appendChild(g);
+  }
+}
+
+/* ---------- 3-dot settings panel (Playback / Advanced color) ---------- */
+function pbClose(){$("#pbm").hidden=true}
+function renderPb(level){
+  PBLEVEL=level||"main";var box=$("#pbm");box.textContent="";box.hidden=false;
+  function hd(txt,back){
+    var h=el("div","hd");
+    if(back){h.appendChild(el("span","","\u2039"));h.appendChild(el("span","",txt));h.onclick=function(){renderPb(back)}}
+    else{h.appendChild(el("span","",txt));var x=el("span","","\u2715");x.style.marginLeft="auto";x.onclick=pbClose;h.appendChild(x)}
+    return h;
+  }
+  function nav(label,sub,to){var r=el("div","row2"),t=el("div");t.appendChild(el("div","",label));if(sub)t.appendChild(el("small","",sub));r.appendChild(t);r.appendChild(el("span","arrow","\u203A"));r.onclick=function(){renderPb(to)};return r}
+  function sw(label,sub,key,after){
+    var r=el("div","row2"),t=el("div");t.appendChild(el("div","",label));if(sub)t.appendChild(el("small","",sub));
+    var s=el("div","sw"+(pbv(key)?" on":""));r.appendChild(t);r.appendChild(s);
+    r.onclick=function(){pbset(key,!pbv(key));s.className="sw"+(pbv(key)?" on":"");applyVideoFx();updPlayIcon();if(after)after()};return r;
+  }
+  function slider(label,key,min,max,step,fmt,after){
+    var w=el("div","sl"),lb=el("div","lb"),vv=el("span","",fmt(pbv(key))),rs=el("button","","\u00D7"),right=el("div");
+    right.appendChild(vv);right.appendChild(rs);lb.appendChild(el("div","",label));lb.appendChild(right);
+    var inp=el("input");inp.type="range";inp.min=min;inp.max=max;inp.step=step;inp.value=pbv(key);
+    inp.oninput=function(){pbset(key,+inp.value);vv.textContent=fmt(+inp.value);applyVideoFx();if(after)after()};
+    rs.onclick=function(){inp.value=PBDEF[key];inp.oninput()};
+    w.appendChild(lb);w.appendChild(inp);return w;
+  }
+  var pct=function(v){return v+"%"},secs=function(v){return v?v+"s":"Off"};
+  if(PBLEVEL==="main"){
+    box.appendChild(hd("Settings"));
+    box.appendChild(nav("\u25B6  Playback","Speed, zoom, brightness, volume boost, skip...","play"));
+    box.appendChild(sw("\u21BB  Loop video",null,"loop"));
+    var ar=el("div","row2"),at=el("div");at.appendChild(el("div","","\u2728  Ambient light"));at.appendChild(el("small","","Video ke peeche glow (YouTube jaisa)"));
+    var asw=el("div","sw"+(amv("enabled",true)?" on":""));ar.appendChild(at);ar.appendChild(asw);
+    ar.onclick=function(){amset("enabled",!amv("enabled",true));asw.className="sw"+(amv("enabled",true)?" on":"")};box.appendChild(ar);
+    box.appendChild(nav("Ambient settings","Blur, spread, intensity, fps","amb"));
+    if(CUR){
+      var cp=el("div","row2");cp.appendChild(el("div","","\uD83D\uDCCB  Copy link"));cp.onclick=function(){copy(CURURL||CUR.u)};box.appendChild(cp);
+      extLinks(CURURL||CUR.u).forEach(function(x){var a=el("a","row2");a.appendChild(el("div","","\uD83D\uDCFA  "+(x.n==="Open link"?"Open / Download":"Open in "+x.n)));a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";box.appendChild(a)});
+    }
+  }else if(PBLEVEL==="play"){
+    box.appendChild(hd("Playback","main"));
+    var chips=el("div","chips2");
+    [0.25,0.5,1,1.5,2].forEach(function(s){
+      var c=el("div","chip2"+(V.playbackRate===s?" on":""),s+"x");
+      c.onclick=function(){V.playbackRate=s;$("#bSpd").textContent=s+"x";renderPb("play")};chips.appendChild(c);
+    });
+    box.appendChild(chips);
+    box.appendChild(sw("\u26F6  Zoom to fill",null,"zoom"));
+    box.appendChild(slider("Brightness","bright",50,200,5,pct));
+    box.appendChild(slider("Volume Boost","boost",100,300,10,pct,applyAudioFx));
+    box.appendChild(sw("Night mode - quieter loud scenes, clearer dialogue",null,"night",applyAudioFx));
+    box.appendChild(sw("Dim and show the title when paused",null,"dim"));
+    box.appendChild(slider("Skip intros automatically (pehle N sec)","intro",0,120,5,secs));
+    box.appendChild(slider("Skip end credits automatically (aakhri N sec)","outro",0,120,5,secs));
+    box.appendChild(nav("Advanced color","Contrast, saturation, warmth","color"));
+  }else if(PBLEVEL==="amb"){
+    box.appendChild(hd("Ambient light","main"));
+    function asl(label,key,min,max,step,fmt){
+      var w=el("div","sl"),lb=el("div","lb"),vv=el("span","",fmt(amv(key,0))),rs=el("button","","\u00D7"),right=el("div");
+      right.appendChild(vv);right.appendChild(rs);lb.appendChild(el("div","",label));lb.appendChild(right);
+      var inp=el("input");inp.type="range";inp.min=min;inp.max=max;inp.step=step;inp.value=amv(key,0);
+      inp.oninput=function(){amset(key,+inp.value);vv.textContent=fmt(+inp.value)};
+      rs.onclick=function(){delete AMS[key];LS.set("ytb_amb",AMS);inp.value=amv(key,0);vv.textContent=fmt(+inp.value);applyAmb()};
+      w.appendChild(lb);w.appendChild(inp);return w;
+    }
+    box.appendChild(asl("Blur","blur",0,100,1,pct));
+    box.appendChild(asl("Spread","spread",100,200,5,pct));
+    box.appendChild(asl("Glow intensity","intensity",0,100,5,pct));
+    box.appendChild(asl("Fade start","spreadFadeStart",0,60,5,pct));
+    box.appendChild(asl("Fade curve","spreadFadeCurve",0,60,5,pct));
+    box.appendChild(asl("Frame rate limit","framerateLimit",5,60,5,function(v){return v+" fps"}));
+    var rr2=el("div","row2");rr2.appendChild(el("div","","Reset to ambient.json defaults"));rr2.onclick=function(){AMS={};LS.set("ytb_amb",AMS);applyAmb();renderPb("amb")};box.appendChild(rr2);
+  }else if(PBLEVEL==="color"){
+    box.appendChild(hd("Advanced color","play"));
+    box.appendChild(slider("Contrast","contrast",50,200,5,pct));
+    box.appendChild(slider("Saturation","sat",0,300,5,pct));
+    box.appendChild(slider("Warmth (sepia)","warm",0,100,5,pct));
+    var rr=el("div","row2");rr.appendChild(el("div","","Reset color"));
+    rr.onclick=function(){["bright","contrast","sat","warm"].forEach(function(k){pbset(k,PBDEF[k])});applyVideoFx();renderPb("color")};box.appendChild(rr);
+  }
+}
+$("#bMore").onclick=function(e){e.stopPropagation();if(!$("#pbm").hidden){pbClose();return}renderPb("main");showCtl()};
+document.addEventListener("pointerdown",function(e){var b=$("#pbm");if(!b.hidden&&!e.target.closest("#pbm")&&!e.target.closest("#bMore"))pbClose()});
 
 /* ---------- watch page ---------- */
 function actBtn(txt,fn,on){var b=el("button","act"+(on?" on":""),txt);b.onclick=fn;return b}
@@ -2920,10 +3338,10 @@ function showWatch(i){
   var it=ALL[i];if(!it){location.hash="#/";return}
   CUR=it;LIST=LIST.length?LIST:computeList();
   $("#home").hidden=true;chipsEl.hidden=true;$("#watch").hidden=false;
-  renderMeta(it);renderUpnext(it);loadItem(it);setSession(it);window.scrollTo(0,0);showCtl();
+  $("#dimT").textContent=it.t||"";pbClose();renderMeta(it);renderUpnext(it);loadItem(it);setSession(it);applyAmb();window.scrollTo(0,0);showCtl();
 }
 function showHome(){
-  if(!$("#watch").hidden){destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title+(CFG.owner?" | "+CFG.owner:"")}
+  if(!$("#watch").hidden){hideEnd();pbClose();cancelAnimationFrame(amRaf);amRaf=0;destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title+(CFG.owner?" | "+CFG.owner:"")}
   $("#home").hidden=false;chipsEl.hidden=false;renderGrid();updChips();
 }
 function route(){var m=location.hash.match(/^#\/w\/(\d+)/);if(m)showWatch(+m[1]);else showHome()}
@@ -2959,12 +3377,32 @@ else{
   if(CFG.owner){var lo=$("#lockOwn"),la=el("a","","by "+CFG.owner);la.href=CFG.tg||"#";la.target="_blank";la.rel="noopener noreferrer";lo.appendChild(la)}
   $("#pwb").onclick=unlock;$("#pw").onkeydown=function(e){if(e.key==="Enter")unlock()};
 }
-window.__ytb={cur:function(){return {q:CURQ,u:CURURL}},sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
+window.__ytb={amb:function(){return {AM:AM,AMS:AMS,n:amN,bars:amBars}},pb:function(){return PB},fx:function(){return {graph:GRAPH,cors:CORS_LOAD,blocked:CORS_BLOCK}},cur:function(){return {q:CURQ,u:CURURL}},sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
 })();
 </script>
 </body>
 </html>
 """
+
+
+AMBIENT_DEFAULT = {
+    "enabled": True, "blur": 25, "edge": 20, "spread": 130, "spreadFadeStart": 20, "spreadFadeCurve": 20,
+    "framerateLimit": 60, "energySaver": True, "enableInPictureInPicture": True,
+    "detectHorizontalBarSizeEnabled": True, "headerShadowOpacity": 30, "headerShadowSize": 25,
+    "surroundingContentFillOpacity": -25, "hideScrollbar": True, "intensity": 90}
+
+
+def load_ambient_cfg() -> dict:
+    """Ambient light settings: ambient.json (ya env AMBIENT_JSON path) se, warna Logic Looper wali default."""
+    cfg = dict(AMBIENT_DEFAULT)
+    p = os.getenv("AMBIENT_JSON", "ambient.json")
+    try:
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                cfg.update(json.load(f))
+    except Exception as e:
+        logger.error(f"ambient json error: {e}")
+    return cfg
 
 
 def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web Player") -> str:
@@ -2981,7 +3419,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
         return (json.dumps(o, ensure_ascii=False).replace("</", "<\\/")
                 .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
-    cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK,
+    cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK, "amb": load_ambient_cfg(),
            "hash": hashlib.sha256(SKY_PASSWORD.encode("utf-8")).hexdigest() if SKY_PASSWORD else ""}
     return (_PLAYER_TEMPLATE.replace("__OWNER__", _html.escape(BOT_OWNER_NAME))
             .replace("__TITLE__", _html.escape(title))
@@ -3655,7 +4093,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['scr_all'] = True
         await scr_run(update.effective_chat, context, user_id, target_url, 1, SCR_ALL_MAX)
         return
-    await run_scrape_chunk(update, context, target_url, start_page=1, end_page=10)
+    await scr_run(update.effective_chat, context, user_id, target_url, 1, 10)
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3755,8 +4193,9 @@ async def fast_fetch(url: str, referer: Optional[str] = None) -> Optional[str]:
         return hit[1]
     page = await fetch(url, referer)
     if page:
-        if len(_FETCH_CACHE) > 40:
-            _FETCH_CACHE.clear()
+        if len(_FETCH_CACHE) > 150:
+            for k_ in sorted(_FETCH_CACHE, key=lambda x: _FETCH_CACHE[x][0])[:50]:
+                _FETCH_CACHE.pop(k_, None)
         _FETCH_CACHE[url] = (time.time(), page)
     return page
 
@@ -3885,7 +4324,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
             rep["pages_fail"].append(f"{pu} (HTTP {LAST_STATUS.get(pu, '?')})")
             return
         rep["pages_ok"] += 1
-        links = scr_find_links(page, pu)
+        links = await asyncio.to_thread(scr_find_links, page, pu)
         if pu == page_urls[0]:
             first_html["h"] = page
             if len(links) < 4:
@@ -4479,7 +4918,7 @@ async def scr_sitemap(page_url: str) -> dict:
 
 # ---------------- optional real browser (Playwright) ----------------
 async def pw_render(url: str, wait: float = 4.0, scroll: bool = False, play: bool = False,
-                    netlog: Optional[list] = None):
+                    netlog: Optional[list] = None, cookies_out: Optional[dict] = None):
     """-> (rendered_html, [stream urls seen in network traffic]). Needs: pip install playwright && playwright install chromium"""
     global _PW_SEM
     if not async_playwright:
@@ -4533,6 +4972,12 @@ async def pw_render(url: str, wait: float = 4.0, scroll: bool = False, play: boo
                         except Exception:
                             pass
             html = await page.content()
+            if cookies_out is not None:
+                try:
+                    for c_ in await ctx.cookies():
+                        cookies_out[c_["name"]] = c_["value"]
+                except Exception:
+                    pass
             return html, list(dict.fromkeys(streams))
         except Exception as e:
             logger.error(f"pw_render error {url}: {e}")
@@ -5168,22 +5613,47 @@ def reset_settings():
 
 # ---------------- adaptive speed limiter ----------------
 class AdaptiveLimiter:
-    """Concurrency khud kam/zyada: 429/503 aaye to aadhi, sab theek ho to dheere badhti hai."""
+    """Concurrency khud kam/zyada: 429/503 aaye to aadhi, sab theek ho to dheere badhti hai.
+    (Waiter-queue: 100-100 pending task ab har 50ms jag-jag ke event loop ko slow nahi karte.)"""
 
     def __init__(self, maxn: int):
+        import collections
         self.max = max(1, maxn)
         self.limit = self.max
         self.active = 0
         self.ok = 0
         self.throttled = 0
+        self._w = collections.deque()
+
+    def _wake(self):
+        while self._w and self.active < self.limit:
+            fut = self._w.popleft()
+            if not fut.done():
+                self.active += 1
+                fut.set_result(None)
 
     async def __aenter__(self):
-        while self.active >= self.limit:
-            await asyncio.sleep(0.05)
-        self.active += 1
+        if self.active < self.limit and not self._w:
+            self.active += 1
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._w.append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self.active -= 1
+                self._wake()
+            else:
+                try:
+                    self._w.remove(fut)
+                except ValueError:
+                    pass
+            raise
 
     async def __aexit__(self, *a):
         self.active -= 1
+        self._wake()
 
     def feedback(self, url: str, ok: bool):
         if LAST_STATUS.get(url) in (429, 503):
@@ -5193,6 +5663,7 @@ class AdaptiveLimiter:
             self.ok += 1
             if self.ok % 25 == 0 and self.limit < self.max:
                 self.limit = min(self.max, self.limit + 2)
+                self._wake()
 
 
 # ---------------- packed JS / base64 se chhupe links ----------------
@@ -5596,6 +6067,7 @@ async def restore_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         src.close()
         init_db()
         globals()["_RULES_CACHE"] = None
+        globals()["_COOKIE_CACHE"] = None
         load_settings()
         _FETCH_CACHE.clear()
         await update.message.reply_text(
@@ -5917,6 +6389,7 @@ async def sbrestore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if res == "ok":
         init_db()
         globals()["_RULES_CACHE"] = None
+        globals()["_COOKIE_CACHE"] = None
         load_settings()
         _FETCH_CACHE.clear()
         await update.message.reply_text(f"☁️ Restore ho gaya. 🍪 {len(list_cookie_domains())} cookies | "
