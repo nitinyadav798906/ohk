@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import html as _html
 import io
 import json
@@ -11,9 +13,11 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor as _TPE
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import ipaddress
+import socket
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Optional, List, Dict
-from urllib.parse import unquote, urljoin, urlparse, urlunparse, parse_qs
+from urllib.parse import unquote, urljoin, urlparse, urlunparse, parse_qs, quote, urlsplit
 
 import cloudscraper
 import requests
@@ -432,11 +436,160 @@ def get_custom_headers(url: str) -> dict:
 # ==========================================================
 # DUMMY HTTP SERVER & AUTO-PING KEEP ALIVE (24/7)
 # ==========================================================
+# ---- stream proxy: acctoken / IP-lock / Referer-lock links player me bot ke through chalane ke liye ----
+PROXY_BASE = (os.getenv("PROXY_BASE") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+_PX_SECRET = hashlib.sha256(((BOT_TOKEN or "dev") + "|px").encode()).digest()
+
+
+def px_sig(u: str, r: str) -> str:
+    return hmac.new(_PX_SECRET, (u + "\n" + r).encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def px_path(u: str, r: str = "") -> str:
+    return f"/p?u={quote(u, safe='')}&r={quote(r, safe='')}&s={px_sig(u, r)}"
+
+
+def px_url(u: str, r: str = "") -> str:
+    return (PROXY_BASE + px_path(u, r)) if PROXY_BASE else ""
+
+
+def px_needs(u: str, iplock: str = "") -> bool:
+    return bool(iplock) or bool(re.search(r'acctoken|[?&]ip=\d', u, re.I))
+
+
+def _px_host_ok(host: str) -> bool:
+    """SSRF guard: private/loopback/link-local IPs par proxy nahi (sirf test ke liye PROXY_ALLOW_PRIVATE=1)."""
+    if os.getenv("PROXY_ALLOW_PRIVATE") == "1":
+        return True
+    try:
+        for fam, _t, _p, _c, sa in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(sa[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def px_rewrite_m3u8(text: str, base: str, ref: str) -> str:
+    def P(u):
+        return px_path(u, ref)
+    out = []
+    for ln in text.splitlines():
+        t = ln.strip()
+        if not t:
+            out.append(ln)
+        elif t.startswith("#"):
+            out.append(re.sub(r'URI="([^"]+)"', lambda m: 'URI="' + P(urljoin(base, m.group(1))) + '"', ln))
+        else:
+            out.append(P(urljoin(base, t)))
+    return "\n".join(out) + "\n"
+
+
+def px_handle(h, head: bool = False):
+    q = parse_qs(urlsplit(h.path).query)
+    u = (q.get("u") or [""])[0]
+    r = (q.get("r") or [""])[0]
+    sg = (q.get("s") or [""])[0]
+
+    def cors():
+        h.send_header("Access-Control-Allow-Origin", "*")
+        h.send_header("Access-Control-Allow-Headers", "Range")
+        h.send_header("Access-Control-Expose-Headers", "Content-Length,Content-Range,Accept-Ranges")
+
+    def deny(code=403):
+        h.send_response(code)
+        cors()
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+
+    if not u.startswith(("http://", "https://")) or not hmac.compare_digest(sg, px_sig(u, r)):
+        return deny(403)
+    hdrs = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity"}
+    if r:
+        hdrs["Referer"] = r
+    if h.headers.get("Range"):
+        hdrs["Range"] = h.headers["Range"]
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    root0, cur, resp = _root_host(urlparse(u).netloc), u, None
+    try:
+        for _ in range(6):
+            if not _px_host_ok(urlparse(cur).hostname or ""):
+                return deny(403)
+            hh = dict(hdrs)
+            if _root_host(urlparse(cur).netloc) == root0:       # cookie sirf usi site ko, CDN ko nahi
+                ck = get_cookie_for_url(cur)
+                ex = globals().get("_SCR_EXTRA_COOKIES", {}).get(root0)
+                ck = "; ".join(x for x in (ck, ex) if x)
+                if ck:
+                    hh["Cookie"] = ck
+            resp = requests.get(cur, headers=hh, stream=True, timeout=(8, 30), allow_redirects=False, proxies=proxies)
+            if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                cur = urljoin(cur, resp.headers["Location"])
+                resp.close()
+                continue
+            break
+        ct = resp.headers.get("Content-Type", "")
+        if resp.status_code == 200 and (".m3u8" in urlparse(cur).path.lower() or "mpegurl" in ct.lower()):
+            data = b""
+            for ch in resp.iter_content(65536):
+                data += ch
+                if len(data) > 3_000_000:
+                    break
+            body = px_rewrite_m3u8(data.decode("utf-8", "ignore"), cur, r).encode("utf-8")
+            h.send_response(200)
+            h.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            h.send_header("Content-Length", str(len(body)))
+            cors()
+            h.end_headers()
+            if not head:
+                h.wfile.write(body)
+            return
+        h.send_response(resp.status_code)
+        for k in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"):
+            if resp.headers.get(k):
+                h.send_header(k, resp.headers[k])
+        cors()
+        h.end_headers()
+        if not head:
+            for ch in resp.iter_content(65536):
+                h.wfile.write(ch)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    except Exception as e:
+        logger.warning(f"proxy error {u[:80]}: {e}")
+        try:
+            deny(502)
+        except Exception:
+            pass
+    finally:
+        try:
+            if resp is not None:
+                resp.close()
+        except Exception:
+            pass
+
+
 class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/p?"):
+            return px_handle(self)
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot Status: Active and Running 24/7!")
+
+    def do_HEAD(self):
+        if self.path.startswith("/p?"):
+            return px_handle(self, head=True)
+        self.send_response(200)
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Range")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.end_headers()
 
     def log_message(self, format, *args):
         return
@@ -444,7 +597,7 @@ class DummyPortServer(BaseHTTPRequestHandler):
 def run_dummy_server():
     port = int(os.getenv("PORT", 8080))
     try:
-        server = HTTPServer(('0.0.0.0', port), DummyPortServer)
+        server = ThreadingHTTPServer(('0.0.0.0', port), DummyPortServer)
         logger.info(f"Dummy Web Server running on port {port}")
         server.serve_forever()
     except Exception as e:
@@ -857,6 +1010,10 @@ def reset_host_stats(url: str):
     EXTRACT_NOTE["v"] = ""
     _XH_EMBED.update(tried=0, ok=0)
     globals().get("_YTDLP_STATS", {}).pop(_root_host(urlparse(url).netloc), None)
+    _rt = _root_host(urlparse(url).netloc)
+    for _d in (globals().get("_DIG_DEAD", {}), globals().get("_DIG_FAILS", {})):
+        _d.pop(_rt, None)
+        _d.pop("n:" + _rt, None)
 
 
 def host_is_blocked(root: str) -> bool:
@@ -1440,11 +1597,17 @@ def stream_iplock(u: str) -> str:
 
 def iplock_hint(results: List[dict]) -> str:
     ips = sorted({r["iplock"] for r in results if r.get("iplock")})
-    if not ips:
-        return ""
-    n = sum(1 for r in results if r.get("iplock"))
-    return (f"\n⚠️ {n} link IP-locked hain ({', '.join(ips)}): ye sirf usi IP/network se chalengi jahan bot chal raha hai. "
-            "Player usi network se kholo, ya bot ko apne ghar ke IP par chalao.")
+    tok = sum(1 for r in results if "acctoken" in r["download_link"].lower())
+    out = ""
+    if ips:
+        n = sum(1 for r in results if r.get("iplock"))
+        out += (f"\n⚠️ {n} link IP-locked hain ({', '.join(ips)}): ye sirf usi IP/network se chalengi jahan bot chal raha hai.")
+    if tok:
+        out += f"\n⚠️ {tok} link me acctoken hai (bot ki IP/Referer se bandhi)."
+    if ips or tok:
+        out += ("\n✅ HTML player inhe bot-proxy se chalayega (PROXY_BASE set hai)." if PROXY_BASE else
+                "\n🔧 Fix: env PROXY_BASE=https://<tumhari-app-url> set karo, phir player ye links bot ke through chalayega.")
+    return out
 
 
 def _page_meta(text: str, link: str, page_url: str):
@@ -2520,6 +2683,15 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 .endsc .eg{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
 .endsc .eg .c{cursor:pointer}
 .endsc .eg .ttl{font-size:13px;margin-top:6px}
+.ubox{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
+.ucard{background:var(--bg2);color:var(--tx);width:min(520px,92%);max-height:92vh;overflow:auto;border-radius:16px;padding:18px;box-shadow:0 10px 40px rgba(0,0,0,.6)}
+.ucard h3{margin:0 0 10px}
+.ufl{display:block;font-size:13px;color:var(--tx2);margin-bottom:10px}
+.ufl input,.ufl textarea,.ufl select,.ucard select{display:block;width:100%;margin-top:4px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--tx);font:inherit;outline:0}
+.unote{font-size:12px;color:var(--tx2);margin:6px 0 12px;line-height:1.5}
+.ubtn{display:flex;gap:8px;flex-wrap:wrap}
+.ubtn button{background:var(--chipA);color:var(--chipAt);padding:9px 16px;border-radius:20px;font-weight:700}
+.ubtn button.g{background:var(--chip);color:var(--tx)}
 /* ---------- popup / toast ---------- */
 .pop{position:fixed;z-index:200;background:var(--bg2);border-radius:12px;padding:6px 0;min-width:190px;box-shadow:0 6px 30px rgba(0,0,0,.5)}
 .pop button,.pop a{display:block;width:100%;text-align:left;padding:10px 16px;font-size:14px;text-decoration:none}
@@ -2629,6 +2801,7 @@ function extOf(u){var m=pathOf(u).match(/\.([a-z0-9]{2,5})$/);return m?m[1]:""}
 var AUDIO_EXT=["mp3","m4a","aac","wav","ogg","oga","opus","flac","wma"];
 function fmtOf(it){
   var u=it.u.toLowerCase();
+  if(it.eng==="hls")return "HLS";if(it.eng==="dash")return "DASH";
   if(u.indexOf(".m3u8")>-1)return "HLS";
   var e=extOf(u);
   if(e==="mpd")return "DASH";
@@ -2639,6 +2812,7 @@ function fmtOf(it){
 function isAudio(it){return it.k==="AUDIO"||AUDIO_EXT.indexOf(extOf(it.u))>-1}
 function engineOf(it){
   var u=it.u.toLowerCase(),e=extOf(u);
+  if(it.eng)return it.eng;
   if(u.indexOf(".m3u8")>-1)return "hls";
   if(e==="mpd")return "dash";
   if(e==="ts"||e==="flv"||e==="m2ts")return "mpegts";
@@ -2667,7 +2841,7 @@ function extLinks(u){
 /* ---------- state ---------- */
 var FAV=LS.get("ytb_fav",{}),LATER=LS.get("ytb_later",{}),HIST=LS.get("ytb_hist",{});
 var ALL=DATA.slice(),BYURL={},DUR={},THUMBS={};
-function slim(it){return {t:it.t,u:it.u,k:it.k,p:it.p,th:it.th,d:it.d,v:it.v}}
+function slim(it){return {t:it.t,u:it.u,k:it.k,p:it.p,th:it.th,d:it.d,v:it.v,x:it.x,xa:it.xa,drm:it.drm,eng:it.eng}}
 ALL.forEach(function(it){BYURL[it.u]=it});
 [FAV,LATER].forEach(function(m){Object.keys(m).forEach(function(u){if(!BYURL[u]&&m[u]&&m[u].u){var o=m[u];o._x=1;BYURL[u]=o;ALL.push(o)}})});
 Object.keys(HIST).forEach(function(u){var h=HIST[u];if(!BYURL[u]&&h&&h.it&&h.it.u){h.it._x=1;BYURL[u]=h.it;ALL.push(h.it)}});
@@ -2830,6 +3004,7 @@ function exportFav(){
 }
 function gearMenu(anchor){
   showPop(anchor,[
+    {t:"\uD83D\uDD17  Play URL / MPD...",f:openUrlBox},
     {t:"\uD83D\uDDD1  Clear history ("+Object.keys(HIST).length+")",f:function(){clearList("hist")}},
     {t:"\uD83D\uDDD1  Clear favorites ("+Object.keys(FAV).length+")",f:function(){clearList("fav")}},
     {t:"\uD83D\uDDD1  Clear watch later ("+Object.keys(LATER).length+")",f:function(){clearList("later")}},
@@ -2870,7 +3045,10 @@ function go(it){location.hash="#/w/"+ALL.indexOf(it)}
 
 /* ---------- player ---------- */
 var V=$("#v"),PL=$("#pl"),hls=null,mp=null,dash=null,retries=0,hideT,lastSave=0,dragging=false,IMGV=$("#imgv");
-var CURQ="auto",SEEK_AT=0,CURURL="";
+var CURQ="auto",SEEK_AT=0,CURURL="",CURENG="native",PXS={};
+function PXON(it){if(PXS[it.u]!==undefined)return PXS[it.u];return !!(it.x&&it.xa)&&LS.get("ytb_px",true)}
+function reloadCur(at,cors){var o={keepQ:true,at:at};if(cors)o.cors=true;if(CUR&&CURURL!==CUR.x)o.url=CURURL;loadItem(CUR,o)}
+function b64u(x){x=(x||"").trim();if(/^[0-9a-fA-F]+$/.test(x)&&x.length%2===0){var s="";for(var i=0;i<x.length;i+=2)s+=String.fromCharCode(parseInt(x.substr(i,2),16));return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}return x}
 /* ---------- playback settings (3-dot menu) ---------- */
 var PBDEF={zoom:false,bright:100,boost:100,night:false,dim:true,intro:0,outro:0,contrast:100,sat:100,warm:0,loop:false};
 var PB=LS.get("ytb_pb",{}),PBLEVEL="main";
@@ -2909,11 +3087,11 @@ function ensureGraph(){
 function resetFx(msg){pbset("boost",100);pbset("night",false);if(msg)toast(msg);setFx();if(!$("#pbm").hidden)renderPb(PBLEVEL)}
 function applyAudioFx(){
   if(!needFx()){setFx();return}
-  var eng=engineOf({u:CURURL,k:CUR&&CUR.k});
+  var eng=CURENG;
   if(eng==="native"&&!GRAPH&&V.crossOrigin!=="anonymous"){
     if(CORS_BLOCK[CURURL]){resetFx("Is stream par Boost/Night mode nahi chalega (server CORS allow nahi karta)");return}
     PENDING_FX=true;FX_AT=V.currentTime||0;                 /* CORS ke saath dobara load, phir graph banega */
-    loadItem(CUR,{url:CURURL,keepQ:true,at:FX_AT,cors:true});return;
+    reloadCur(FX_AT,true);return;
   }
   if(!ensureGraph()){resetFx("Audio boost is browser me nahi chal raha");return}
   setFx();
@@ -2938,11 +3116,12 @@ function showErr(msg,it){
   e.textContent="";e.hidden=false;setLoading(false);
   e.appendChild(el("div","",msg));
   var box=el("div","eb");
-  var rt=el("button","","Retry");rt.onclick=function(){if(CUR)loadItem(CUR,{url:CURURL,keepQ:true,at:V.currentTime})};box.appendChild(rt);
+  var rt=el("button","","Retry");rt.onclick=function(){if(CUR)reloadCur(V.currentTime)};box.appendChild(rt);
   var lv=lowerVariant();
   if(lv){var lb=el("button","","Try "+lv[0]+"p");lb.onclick=function(){CURQ=lv[0];loadItem(CUR,{url:lv[1],keepQ:true,at:V.currentTime})};box.appendChild(lb)}
   if(it){
     extLinks(it.u).forEach(function(x){var a=el("a","",x.n==="Open link"?"Open / Download":x.n);a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";box.appendChild(a)});
+    if(it.x){var usingPx=(CURURL===it.x),pb=el("button","",usingPx?"Try direct (no proxy)":"Try via bot proxy");pb.onclick=function(){PXS[it.u]=!usingPx;loadItem(CUR,{keepQ:true,at:V.currentTime})};box.appendChild(pb)}
     var cp=el("button","","Copy link");cp.onclick=function(){copy(it.u)};box.appendChild(cp);
   }
   e.appendChild(box);
@@ -2979,11 +3158,11 @@ function loadItem(it,opt){
   destroyEngines();showErr("");hideEnd();OUTRO_DONE=false;CORS_LOAD=false;amBars={t:0,b:0,on:true};amN=0;retries=0;V.hidden=true;IMGV.hidden=true;$("#aud").hidden=true;$("#menu").hidden=true;
   applyVideoFx();
   if(!opt.keepQ)CURQ="auto";
-  var u=opt.url||it.u;CURURL=u;SEEK_AT=opt.at||0;
+  var u0=opt.url||it.u,eng0=engineOf({u:u0,k:it.k,eng:it.eng}),u=(!opt.url&&it.x&&eng0!=="dash"&&PXON(it))?it.x:u0;CURURL=u;CURENG=eng0;SEEK_AT=opt.at||0;
   if(it.k==="IMAGE"){IMGV.hidden=false;IMGV.referrerPolicy="no-referrer";IMGV.src=it.u;setLoading(false);updQBtn();return}
   if(it.k==="PDF"){showErr("PDF file hai.",it);return}
   V.hidden=false;$("#aud").hidden=!isAudio(it);setLoading(true);updQBtn();
-  var eng=engineOf({u:u,k:it.k});
+  var eng=eng0;
   var go2=function(){var p=V.play();if(p&&p.catch)p.catch(function(){})};
   if(eng==="hls"){
     loadScript(HLS_URL).then(function(){
@@ -3002,10 +3181,10 @@ function loadItem(it,opt){
       else fail(it,"HLS support nahi");
     },function(){if(V.canPlayType("application/vnd.apple.mpegurl")){V.src=u;go2()}else fail(it,"hls.js load nahi hui (internet?)")});
   }else if(eng==="dash"){
-    loadScript(DASH_URL).then(function(){dash=dashjs.MediaPlayer().create();dash.initialize(V,u,true)},function(){fail(it,"dash.js load nahi hui")});
+    loadScript(DASH_URL).then(function(){dash=dashjs.MediaPlayer().create();if(it.drm&&it.drm.length){var ckk={};it.drm.forEach(function(p){ckk[b64u(p[0])]=b64u(p[1])});dash.setProtectionData({"org.w3.clearkey":{"clearkeys":ckk}})}dash.initialize(V,u,true)},function(){fail(it,"dash.js load nahi hui")});
   }else if(eng==="mpegts"){
     loadScript(TS_URL).then(function(){
-      if(window.mpegts&&mpegts.isSupported()){mp=mpegts.createPlayer({type:extOf(u)==="flv"?"flv":"mpegts",url:u,isLive:false});mp.attachMediaElement(V);mp.load();go2()}
+      if(window.mpegts&&mpegts.isSupported()){mp=mpegts.createPlayer({type:extOf(u0)==="flv"?"flv":"mpegts",url:u,isLive:false});mp.attachMediaElement(V);mp.load();go2()}
       else fail(it,"TS/FLV is browser me supported nahi");
     },function(){fail(it,"mpegts.js load nahi hui")});
   }else{
@@ -3060,7 +3239,7 @@ V.addEventListener("error",function(){
     pbset("boost",100);pbset("night",false);
     if(wasG)replaceVideo();
     toast("Server CORS allow nahi karta: Boost/Night mode band, normal play");
-    loadItem(CUR,{url:CURURL,keepQ:true,at:at});return;
+    reloadCur(at);return;
   }
   fail(CUR,"Ye format/codec browser support nahi karta (MKV/AVI/HEVC/WMV etc.)")
 });
@@ -3149,7 +3328,7 @@ function setSession(it){
 }
 
 /* ---------- Ambient light (YouTube jaisa glow; settings = ambient.json) ---------- */
-var AM=CFG.amb||{},AMS=LS.get("ytb_amb",{}),amCv=$("#amb"),amCx=null,amRaf=0,amLast=0,amN=0,amBars={t:0,b:0,on:true};
+var AM=CFG.amb||{},AMS=LS.get("ytb_amb",{}),amCv=$("#amb"),amCx=null,amRaf=0,amLast=0,amN=0,amTry=0,amBars={t:0,b:0,on:true};
 function amv(k,d){return AMS[k]!==undefined?AMS[k]:(AM[k]!==undefined?AM[k]:d)}
 function amset(k,v){AMS[k]=v;LS.set("ytb_amb",AMS);applyAmb()}
 function applyAmb(){
@@ -3182,10 +3361,10 @@ function ambFrame(ts){
   amRaf=0;
   if(!amv("enabled",true)||$("#watch").hidden||document.hidden)return;
   var fps=Math.min(60,Math.max(5,amv("framerateLimit",60)));
-  if(ts-amLast>=1000/fps){amLast=ts;ambDraw()}
-  if(!V.paused||amN<3||!amv("energySaver",true))amRaf=requestAnimationFrame(ambFrame);   /* paused: 2-3 frame ke baad ruk jao */
+  if(ts-amLast>=1000/fps){amLast=ts;amTry++;ambDraw()}
+  if(amTry<400&&(!V.paused||amN<3||!amv("energySaver",true)))amRaf=requestAnimationFrame(ambFrame);   /* data na ho to bhi bounded */   /* paused: 2-3 frame ke baad ruk jao */
 }
-function ambStart(){if(!amRaf&&amv("enabled",true)&&!$("#watch").hidden){amRaf=requestAnimationFrame(ambFrame)}}
+function ambStart(){if(!amRaf&&amv("enabled",true)&&!$("#watch").hidden){amTry=0;amRaf=requestAnimationFrame(ambFrame)}}
 document.addEventListener("visibilitychange",function(){if(!document.hidden){amN=0;ambStart()}});
 
 /* ---------- end screen (YouTube jaisa: replay + up next countdown + suggestions) ---------- */
@@ -3222,6 +3401,38 @@ function showEnd(){
   }
 }
 
+/* ---------- Play URL box (MPD + ClearKey, cookie, proxy) ---------- */
+function openUrlBox(){
+  var old=$("#ubox");if(old)old.remove();
+  var bx=el("div","ubox");bx.id="ubox";var c=el("div","ucard");
+  c.appendChild(el("h3","","\uD83D\uDD17 Play URL / MPD"));
+  function fld(lbl,tag,ph){var w=el("label","ufl",lbl),i=el(tag);if(ph)i.placeholder=ph;if(tag==="textarea")i.rows=2;w.appendChild(i);c.appendChild(w);return i}
+  var iu=fld("Stream URL (mp4 / m3u8 / mpd ...)","input","https://...");
+  var it_=fld("Title (optional)","input","");
+  var ty=el("select");[["","Auto detect"],["hls","HLS (.m3u8)"],["dash","DASH (.mpd)"],["native","MP4 / WebM / other"]].forEach(function(o){var op=el("option","",o[1]);op.value=o[0];ty.appendChild(op)});
+  var tw=el("label","ufl","Type");tw.appendChild(ty);c.appendChild(tw);
+  var ik=fld("ClearKey (MPD) - key_id:key, ek line me ek","textarea","kid_hex:key_hex");
+  var ic=fld("Cookie (optional)","input","name=value; name2=value2");
+  c.appendChild(el("div","unote","Cookie/Referer header browser se bhejna mumkin nahi, isliye cookie sirf 'Copy command' me use hoti hai. Cookie ya acctoken wali stream agar direct na chale to bot-proxy (PROXY_BASE) ya VLC/ffmpeg use karo."));
+  var row=el("div","ubtn");
+  function mk(){
+    var u=iu.value.trim();if(!/^https?:\/\//i.test(u)){toast("Valid http(s) URL daalo");return null}
+    var drm=ik.value.split(/\n/).map(function(l){var p=l.trim().split(":");return p.length>=2&&p[0]&&p[1]?[p[0].trim(),p.slice(1).join(":").trim()]:null}).filter(Boolean);
+    var item=BYURL[u]||{t:"",u:u,k:"VIDEO",p:"",th:"",d:0,v:[],_x:1};
+    item.t=it_.value.trim()||item.t||domainOf(u)||"Pasted URL";item.drm=drm.length?drm:undefined;item.eng=ty.value||(/\.mpd(\?|$)/i.test(u)?"dash":undefined);
+    if(!BYURL[u]){BYURL[u]=item;ALL.push(item)}
+    return item;
+  }
+  var pl=el("button","","\u25B6 Play");pl.onclick=function(){var item=mk();if(!item)return;bx.remove();PXS[u0of(item)]=undefined;go(item)};
+  function u0of(i){return i.u}
+  var cm=el("button","g","Copy ffmpeg command");cm.onclick=function(){
+    var item=mk();if(!item)return;var k=(item.drm&&item.drm[0])?" -decryption_key "+item.drm[0][1]:"",ck=ic.value.trim()?' -headers "Cookie: '+ic.value.trim().replace(/"/g,'\\"')+'\\r\\n"':"";
+    copy("ffmpeg"+ck+k+' -i "'+item.u+'" -c copy out.mp4')};
+  var cn=el("button","g","Cancel");cn.onclick=function(){bx.remove()};
+  row.appendChild(pl);row.appendChild(cm);row.appendChild(cn);c.appendChild(row);
+  bx.appendChild(c);bx.onclick=function(e){if(e.target===bx)bx.remove()};document.body.appendChild(bx);iu.focus();
+}
+
 /* ---------- 3-dot settings panel (Playback / Advanced color) ---------- */
 function pbClose(){$("#pbm").hidden=true}
 function renderPb(level){
@@ -3255,6 +3466,9 @@ function renderPb(level){
     var asw=el("div","sw"+(amv("enabled",true)?" on":""));ar.appendChild(at);ar.appendChild(asw);
     ar.onclick=function(){amset("enabled",!amv("enabled",true));asw.className="sw"+(amv("enabled",true)?" on":"")};box.appendChild(ar);
     box.appendChild(nav("Ambient settings","Blur, spread, intensity, fps","amb"));
+    var pu=el("div","row2"),put=el("div");put.appendChild(el("div","","\uD83D\uDD17  Play URL (MPD / key / cookie)"));put.appendChild(el("small","","Koi bhi link paste karke chalao"));pu.appendChild(put);pu.onclick=function(){pbClose();openUrlBox()};box.appendChild(pu);
+    if(CFG.px){var xr=el("div","row2"),xt=el("div");xt.appendChild(el("div","","\uD83D\uDEE1  Bot proxy (acctoken / IP-lock links)"));xt.appendChild(el("small","","Stream bot ke through chalegi (same IP + Referer)"));
+      var xs=el("div","sw"+(LS.get("ytb_px",true)?" on":""));xr.appendChild(xt);xr.appendChild(xs);xr.onclick=function(){LS.set("ytb_px",!LS.get("ytb_px",true));xs.className="sw"+(LS.get("ytb_px",true)?" on":"");if(CUR&&CUR.x)loadItem(CUR,{keepQ:true,at:V.currentTime})};box.appendChild(xr)}
     if(CUR){
       var cp=el("div","row2");cp.appendChild(el("div","","\uD83D\uDCCB  Copy link"));cp.onclick=function(){copy(CURURL||CUR.u)};box.appendChild(cp);
       extLinks(CURURL||CUR.u).forEach(function(x){var a=el("a","row2");a.appendChild(el("div","","\uD83D\uDCFA  "+(x.n==="Open link"?"Open / Download":"Open in "+x.n)));a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";box.appendChild(a)});
@@ -3405,21 +3619,32 @@ def load_ambient_cfg() -> dict:
     return cfg
 
 
+def _px_fields(it: dict) -> dict:
+    mode = (get_setting("proxy") or "auto").lower()
+    u = it["download_link"]
+    if not PROXY_BASE or mode == "off" or (it.get("type") or "VIDEO") in ("IMAGE", "PDF") or not u.startswith("http"):
+        return {}
+    d = {"x": px_url(u, it.get("page_url") or "")}
+    if mode == "on" or px_needs(u, it.get("iplock") or ""):
+        d["xa"] = 1
+    return d
+
+
 def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web Player") -> str:
     """Self-contained YouTube-style web player (password gate, auto thumbnails, favorites, history,
     HLS/MP4/WebM/MKV/DASH/TS/FLV/audio, external-player fallback)."""
     items = []
     for it in results:
-        items.append({"t": it.get("title") or "Video", "u": it["download_link"], "k": it.get("type") or "VIDEO",
+        items.append(dict({"t": it.get("title") or "Video", "u": it["download_link"], "k": it.get("type") or "VIDEO",
                       "p": it.get("page_url") or "", "th": it.get("thumb") or "", "d": it.get("duration") or 0,
                       "v": [[v["q"], v["u"]] for v in (it.get("variants") or [])],
-                      "ip": it.get("iplock") or ""})
+                      "ip": it.get("iplock") or ""}, **_px_fields(it)))
 
     def js(o) -> str:
         return (json.dumps(o, ensure_ascii=False).replace("</", "<\\/")
                 .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
-    cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK, "amb": load_ambient_cfg(),
+    cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK, "amb": load_ambient_cfg(), "px": bool(PROXY_BASE),
            "hash": hashlib.sha256(SKY_PASSWORD.encode("utf-8")).hexdigest() if SKY_PASSWORD else ""}
     return (_PLAYER_TEMPLATE.replace("__OWNER__", _html.escape(BOT_OWNER_NAME))
             .replace("__TITLE__", _html.escape(title))
@@ -5570,7 +5795,7 @@ except Exception:
 # ---------------- settings (DB me save, /settings se badlo) ----------------
 _SETTINGS: Dict[str, str] = {}
 _SETTING_DEFAULTS = {"verify": "0", "min_quality": "0", "include": "", "exclude": "",
-                     "export": "", "ytdlp": "1", "keep_preview": "0"}
+                     "export": "", "ytdlp": "1", "keep_preview": "0", "proxy": "auto"}
 
 
 def load_settings():
@@ -5993,6 +6218,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not val.isdigit():
                 await update.message.reply_text("❌ min_quality number do (jaise 720) ya off")
                 return
+        elif key == "proxy":
+            val = val.lower() if val.lower() in ("auto", "on", "off") else "auto"
         elif key == "export":
             val = ",".join(x for x in re.split(r'[,\s]+', val.lower()) if x in ("m3u", "json", "csv"))
         else:
@@ -6005,6 +6232,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• ytdlp (fallback extractor): {'ON' if get_setting('ytdlp') != '0' else 'OFF'}"
         f"{'' if yt_dlp else '  (yt-dlp install nahi hai)'}\n"
         f"• keep_preview (sirf 0.5s clip wale items bhi rakho): {'ON' if get_setting('keep_preview') == '1' else 'OFF'}\n"
+        f"• proxy (player ko bot ke through stream: auto/on/off): {get_setting('proxy') or 'auto'} | PROXY_BASE: {PROXY_BASE or 'SET NAHI'}\n"
         f"• min_quality: {get_setting('min_quality')}\n"
         f"• include (title me ye words): {show('include')}\n"
         f"• exclude (title me ye words nahi): {show('exclude')}\n"
@@ -6342,6 +6570,8 @@ def sb_download_db() -> str:
         dst.close()
         src.close()
         _SB_LAST["hash"] = hashlib.md5(r.content).hexdigest()
+        globals()["_COOKIE_CACHE"] = None
+        globals()["_RULES_CACHE"] = None
         return "ok"
     except Exception as e:
         return f"error: {str(e)[:120]}"
@@ -6531,6 +6761,7 @@ async def sniff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pref = _PREFER.get(_root_host(urlparse(url).netloc))
     lines.append(f"⭐ Prefer hosts: {', '.join(pref) if pref else '-'}")
     _STREAM_CACHE.pop(url, None)
+    reset_host_stats(url)
     item = await extract_video_link(url, source_page=url)
     if item:
         lines.append(f"✅ FINAL: {_fmt_stream(item['download_link'], None, url)}")
