@@ -14,14 +14,19 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor as _TPE
 import ipaddress
+import secrets
 import socket
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Optional, List, Dict
-from urllib.parse import unquote, urljoin, urlparse, urlunparse, parse_qs, quote, urlsplit
+from urllib.parse import unquote, urljoin, urlparse, urlunparse, parse_qs, parse_qsl, quote, urlsplit
 
 import cloudscraper
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+try:                                    # Mini App (python-telegram-bot v20+)
+    from telegram import WebAppInfo, MenuButtonWebApp
+except ImportError:
+    WebAppInfo = MenuButtonWebApp = None
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -146,6 +151,23 @@ def init_db():
             watch_id INTEGER,
             page_url TEXT,
             PRIMARY KEY (watch_id, page_url)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mini_state (
+            user_id INTEGER PRIMARY KEY,
+            data TEXT,
+            updated REAL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mini_shares (
+            token TEXT PRIMARY KEY,
+            owner INTEGER,
+            by_name TEXT,
+            name TEXT,
+            data TEXT,
+            created REAL
         )
     """)
     conn.commit()
@@ -570,10 +592,332 @@ def px_handle(h, head: bool = False):
             pass
 
 
+# ==========================================================
+# TELEGRAM MINI APP: same server (PORT) se /app page + /api/* (Telegram login se secured)
+# ==========================================================
+MAIN_LOOP = None            # bot ka asyncio loop (_post_init me set)
+MINI_BOT = None
+MINI_JOBS: Dict[str, dict] = {}
+MINI_BOT_USERNAME = ""
+
+
+def tg_verify_init(init_data: str, max_age: int = 86400) -> Optional[dict]:
+    """Telegram WebApp initData ka HMAC check (official algorithm). -> user dict ya None."""
+    try:
+        d = dict(parse_qsl(init_data or "", keep_blank_values=True))
+        h = d.pop("hash", None)
+        if not h or not BOT_TOKEN:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(d.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(hmac.new(secret, check.encode(), hashlib.sha256).hexdigest(), h):
+            return None
+        if time.time() - int(d.get("auth_date", "0")) > max_age:
+            return None
+        user = json.loads(d.get("user", "{}"))
+        return user if isinstance(user, dict) and user.get("id") else None
+    except Exception:
+        return None
+
+
+def mini_state_get(uid: int) -> dict:
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute("SELECT data, updated FROM mini_state WHERE user_id=?", (uid,)).fetchone()
+        conn.close()
+        if row:
+            d = json.loads(row[0] or "{}")
+            d["ts"] = row[1]
+            return d
+    except Exception:
+        pass
+    return {}
+
+
+def mini_state_set(uid: int, data: dict):
+    clean = {k: data.get(k) for k in ("fav", "later", "hist", "lib") if k in data}
+    raw = json.dumps(clean, ensure_ascii=False)
+    if len(raw) > 1_800_000:
+        raise ValueError("state bahut bada hai")
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("INSERT INTO mini_state (user_id, data, updated) VALUES (?, ?, ?) "
+                 "ON CONFLICT(user_id) DO UPDATE SET data=excluded.data, updated=excluded.updated",
+                 (uid, raw, time.time()))
+    conn.commit()
+    conn.close()
+
+
+async def _mini_job_run(jid: str, uid: int, url: str, start: int, end: int):
+    j = MINI_JOBS[jid]
+    STOP_PROCESS[uid] = False
+    jj = job_start(uid, "mini", url, start, end)
+
+    async def progress(done, total):
+        j["done"], j["total"] = done, total
+
+    try:
+        try:
+            url = await scr_preflight(url)                 # age-gate bypass, jaise /scr me
+        except Exception:
+            pass
+        results, rep = await scr_scrape(url, start, end, uid, progress)
+        j["items"] = [_player_item(r) for r in results]
+        j["rep"] = {k: rep.get(k) for k in ("pages_ok", "links", "extracted", "cached")}
+        j["status"] = "done"
+    except Exception as e:
+        logger.error(f"mini job error: {e}")
+        j.update(status="error", error=str(e)[:200])
+    finally:
+        job_end(jj)
+
+
+def mini_job_start(uid: int, url: str, start: int, end: int) -> str:
+    now = time.time()
+    for k in [k for k, v in MINI_JOBS.items() if now - v["t0"] > 3600]:
+        MINI_JOBS.pop(k, None)
+    if any(v["uid"] == uid and v["status"] == "running" for v in MINI_JOBS.values()):
+        raise ValueError("Pehla scrape abhi chal raha hai (Stop dabao ya ruko)")
+    jid = secrets.token_hex(6)
+    MINI_JOBS[jid] = {"uid": uid, "status": "running", "done": 0, "total": 0, "items": [], "t0": now, "url": url}
+    asyncio.run_coroutine_threadsafe(_mini_job_run(jid, uid, url, start, end), MAIN_LOOP)
+    return jid
+
+
+def normalize_setting(key: str, val: str) -> str:
+    key, val = (key or "").lower(), (val or "").strip()
+    if key not in _SETTING_DEFAULTS:
+        raise ValueError(f"Unknown setting: {key}")
+    if key in ("verify", "ytdlp", "keep_preview"):
+        return "1" if val.lower() in ("on", "1", "yes", "true") else "0"
+    if key == "proxy":
+        return val.lower() if val.lower() in ("auto", "on", "off") else "auto"
+    if key == "min_quality":
+        if val.lower() in ("", "off", "0", "none"):
+            return "0"
+        if not val.isdigit():
+            raise ValueError("min_quality number do (jaise 720)")
+        return val
+    if key == "export":
+        return ",".join(x for x in re.split(r'[,\s]+', val.lower()) if x in ("m3u", "json", "csv"))
+    return "" if val.lower() in ("off", "none", "clear", "-") else val.lower()
+
+
+def admin_overview() -> dict:
+    saved, rules, custom = set(list_cookie_domains()), set(list_rule_domains()), set(list_custom_sites_db())
+    return {
+        "sites": [{"domain": d, "signed": d in saved, "rule": d in rules, "custom": d in custom} for d in get_all_sites()],
+        "cookies": sorted(saved),
+        "jobs": [{"id": j, "kind": v["kind"], "pages": v["pages"], "secs": int(time.time() - v["t0"]),
+                  "url": normalize_domain(v["url"]), "user": v["user"]} for j, v in JOBS.items()],
+        "settings": {k: (get_setting(k) or "") for k in _SETTING_DEFAULTS},
+        "users": get_all_users(), "prefer": dict(_PREFER), "proxy": PROXY_BASE, "admin": ADMIN_ID}
+
+
+def _admin_api(path: str, body: dict) -> dict:
+    act = body.get("action")
+    if path == "/api/admin/overview":
+        return admin_overview()
+    if path == "/api/admin/setting":
+        key = str(body.get("key") or "")
+        set_setting(key.lower(), normalize_setting(key, str(body.get("value") or "")))
+        return {"ok": True, "value": get_setting(key.lower())}
+    if path == "/api/admin/job":
+        if body.get("all"):
+            for v in JOBS.values():
+                STOP_PROCESS[v["user"]] = True
+        else:
+            STOP_PROCESS[int(body.get("user") or 0)] = True
+        return {"ok": True}
+    if path == "/api/admin/user":
+        uid2 = int(body.get("id") or 0)
+        if not uid2:
+            raise ValueError("user id do")
+        if act == "remove":
+            if uid2 == ADMIN_ID:
+                raise ValueError("admin ko hata nahi sakte")
+            remove_user_db(uid2)
+        else:
+            add_user_db(uid2)
+        return {"ok": True}
+    if path == "/api/admin/prefer":
+        dom = _root_host(normalize_domain(str(body.get("site") or "")))
+        if not DOMAIN_RE.match(dom):
+            raise ValueError("Invalid site")
+        raw = str(body.get("host") or "").strip()
+        if not raw or raw.lower() in ("off", "clear", "none"):
+            save_prefer(dom, [])
+        else:
+            host = (urlparse(raw).netloc if "://" in raw else raw).lower().split(":")[0]
+            host = host[4:] if host.startswith("www.") else host
+            if not DOMAIN_RE.match(host):
+                raise ValueError("Invalid host")
+            cur = list(_PREFER.get(dom, []))
+            save_prefer(dom, cur if host in cur else cur + [host])
+        return {"ok": True}
+    dom = normalize_domain(str(body.get("domain") or ""))
+    if not DOMAIN_RE.match(dom):
+        raise ValueError("Invalid domain")
+    if path == "/api/admin/cookie":
+        if act == "del":
+            return {"ok": delete_cookie_db(dom)}
+        ck = clean_cookie(str(body.get("cookie") or ""))
+        if "=" not in ck:
+            raise ValueError("cookie format: name=value; name2=value2")
+        if body.get("merge"):
+            old = get_cookie_for_url(f"https://{dom}/")
+            if old:
+                od = parse_cookie_str(old)
+                od.update(parse_cookie_str(ck))
+                ck = "; ".join(f"{k}={v}" for k, v in od.items())
+        set_cookie_db(dom, ck)
+        REDIRECTED.clear()
+        return {"ok": True, "count": len(parse_cookie_str(ck))}
+    if path == "/api/admin/site":
+        if act == "remove":
+            if dom in SITES_FULL:
+                raise ValueError("built-in site hata nahi sakte")
+            return {"ok": remove_custom_site_db(dom)}
+        if dom not in get_all_sites():
+            add_custom_site_db(dom, ADMIN_ID)
+        return {"ok": True}
+    if path == "/api/admin/test":
+        url = f"https://{dom}/"
+        html = asyncio.run_coroutine_threadsafe(fetch(url), MAIN_LOOP).result(70)
+        return {"ok": bool(html), "status": str(LAST_STATUS.get(url, "")), "detail": LAST_DETAIL.get(url, "")}
+    raise ValueError("unknown admin endpoint")
+
+
+def mini_page(h):
+    body = generate_web_app_html([], title="Mini Player", mini=True).encode("utf-8")
+    h.send_response(200)
+    h.send_header("Content-Type", "text/html; charset=utf-8")
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def api_handle(h, method: str):
+    path = urlsplit(h.path).path
+    q = parse_qs(urlsplit(h.path).query)
+
+    def send(code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        h.send_response(code)
+        h.send_header("Content-Type", "application/json; charset=utf-8")
+        h.send_header("Content-Length", str(len(body)))
+        h.send_header("Cache-Control", "no-store")
+        h.end_headers()
+        h.wfile.write(body)
+
+    try:
+        user = tg_verify_init(h.headers.get("X-Init-Data", ""))
+        if not user:
+            return send(401, {"error": "Telegram Mini App se kholo (login check fail)"})
+        uid = int(user["id"])
+        if not is_user_allowed(uid):
+            return send(403, {"error": "Access denied"})
+        body = {}
+        if method == "POST":
+            n = int(h.headers.get("Content-Length") or 0)
+            if n > 2_000_000:
+                return send(413, {"error": "too large"})
+            body = json.loads(h.rfile.read(n) or b"{}")
+        if path == "/api/me":
+            return send(200, {"id": uid, "name": user.get("first_name", ""), "admin": uid == ADMIN_ID,
+                              "proxy": bool(PROXY_BASE)})
+        if path == "/api/state":
+            if method == "POST":
+                mini_state_set(uid, body)
+                return send(200, {"ok": True})
+            return send(200, mini_state_get(uid))
+        if path == "/api/scrape" and method == "POST":
+            url = str(body.get("url") or "").strip()
+            if not re.match(r'^https?://', url, re.I) or not DOMAIN_RE.match(normalize_domain(url)):
+                return send(400, {"error": "Valid http(s) URL do"})
+            st = max(1, int(body.get("start") or 1))
+            en = max(st, min(int(body.get("end") or 5), st + SCR_MAX_PAGES - 1))
+            return send(200, {"id": mini_job_start(uid, url, st, en)})
+        if path == "/api/job":
+            j = MINI_JOBS.get((q.get("id") or [""])[0])
+            if not j or j["uid"] != uid:
+                return send(404, {"error": "job nahi mila"})
+            return send(200, {k: j.get(k) for k in ("status", "done", "total", "items", "error", "rep")})
+        if path == "/api/stop" and method == "POST":
+            STOP_PROCESS[uid] = True
+            return send(200, {"ok": True})
+        if path == "/api/send" and method == "POST":
+            items = [x for x in (body.get("items") or []) if isinstance(x, dict) and str(x.get("u", "")).startswith("http")][:3000]
+            if not items:
+                return send(400, {"error": "koi item nahi"})
+            m3u = "#EXTM3U\n" + "".join(f"#EXTINF:-1,{str(x.get('t') or 'Video').replace(chr(10), ' ')}\n{x['u']}\n" for x in items)
+            bio = io.BytesIO(m3u.encode("utf-8"))
+            bio.name = "playlist.m3u"
+            asyncio.run_coroutine_threadsafe(
+                MINI_BOT.send_document(chat_id=uid, document=bio, caption=f"📤 {len(items)} links (Mini App se)"),
+                MAIN_LOOP).result(40)
+            return send(200, {"ok": True, "n": len(items)})
+        if path == "/api/watch":
+            if method == "POST":
+                act = body.get("action")
+                if act == "del":
+                    return send(200, {"ok": watch_del(int(body.get("id") or 0), None if uid == ADMIN_ID else uid)})
+                url = str(body.get("url") or "").strip()
+                if not re.match(r'^https?://', url, re.I):
+                    return send(400, {"error": "Valid URL do"})
+                if len(watch_rows(uid)) >= (20 if uid == ADMIN_ID else 5):
+                    return send(400, {"error": "watch limit poori"})
+                mins = max(10, min(int(body.get("minutes") or 60), 1440))
+                return send(200, {"ok": True, "id": watch_add(uid, url, mins)})
+            return send(200, {"watches": [{"id": w[0], "url": w[2], "minutes": w[3]} for w in watch_rows(uid)]})
+        if path.startswith("/api/admin/"):
+            if uid != ADMIN_ID:
+                return send(403, {"error": "sirf admin"})
+            return send(200, _admin_api(path, body))
+        if path == "/api/share" and method == "POST":
+            items = [x for x in (body.get("items") or []) if isinstance(x, dict) and str(x.get("u", "")).startswith("http")][:500]
+            if not items:
+                return send(400, {"error": "koi item nahi"})
+            raw = json.dumps(items, ensure_ascii=False)
+            if len(raw) > 1_500_000:
+                return send(413, {"error": "playlist bahut badi"})
+            token = secrets.token_urlsafe(6)
+            conn = sqlite3.connect(DB_FILE)
+            conn.execute("INSERT INTO mini_shares (token, owner, by_name, name, data, created) VALUES (?,?,?,?,?,?)",
+                         (token, uid, str(user.get("first_name") or "")[:40], str(body.get("name") or "Playlist")[:60], raw, time.time()))
+            conn.commit()
+            conn.close()
+            return send(200, {"token": token, "web": f"{PROXY_BASE}/app?share={token}",
+                              "link": f"https://t.me/{MINI_BOT_USERNAME}?startapp={token}" if MINI_BOT_USERNAME else ""})
+        if path == "/api/shared":
+            conn = sqlite3.connect(DB_FILE)
+            row = conn.execute("SELECT name, by_name, data FROM mini_shares WHERE token=?", ((q.get("t") or [""])[0],)).fetchone()
+            conn.close()
+            if not row:
+                return send(404, {"error": "share link nahi mila / expire"})
+            return send(200, {"name": row[0], "by": row[1], "items": json.loads(row[2])})
+        return send(404, {"error": "unknown endpoint"})
+    except ValueError as e:
+        return send(400, {"error": str(e)})
+    except Exception as e:
+        logger.error(f"api error {path}: {e}")
+        return send(500, {"error": "server error"})
+
+
 class DummyPortServer(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path.startswith("/api/"):
+            return api_handle(self, "POST")
+        self.send_response(404)
+        self.end_headers()
+
     def do_GET(self):
         if self.path.startswith("/p?"):
             return px_handle(self)
+        if self.path.split("?")[0] in ("/app", "/app/"):
+            return mini_page(self)
+        if self.path.startswith("/api/"):
+            return api_handle(self, "GET")
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot Status: Active and Running 24/7!")
@@ -2692,6 +3036,16 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 .ubtn{display:flex;gap:8px;flex-wrap:wrap}
 .ubtn button{background:var(--chipA);color:var(--chipAt);padding:9px 16px;border-radius:20px;font-weight:700}
 .ubtn button.g{background:var(--chip);color:var(--tx)}
+.mbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:8px 16px}
+.mbar input{flex:1 1 240px;min-width:0;height:40px;border-radius:20px;border:1px solid var(--line);background:var(--bg);color:var(--tx);padding:0 16px;outline:0;font-size:15px}
+.mbar select{height:40px;border-radius:20px;border:1px solid var(--line);background:var(--chip);color:var(--tx);padding:0 10px}
+.mbar .act{border:0;cursor:pointer;color:var(--tx)}.mbar .act:disabled{opacity:.5}
+.mpost{display:contents}.mmsg{flex-basis:100%;font-size:13px;color:var(--tx2);min-height:16px}
+.adm{position:fixed;inset:0;z-index:600;background:var(--bg);color:var(--tx);overflow:auto;padding:12px 16px 40px}
+.ahd{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}.atabs{display:flex;gap:8px;overflow-x:auto;margin-bottom:12px}
+.arow{display:flex;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid var(--line);font-size:14px;flex-wrap:wrap}.arow .l{flex:1;min-width:0;word-break:break-all}
+.arow button,.aform button{background:var(--chip);color:var(--tx);padding:6px 12px;border-radius:14px;font-size:13px}
+.aform{display:flex;flex-direction:column;gap:8px;margin:12px 0}.aform input,.aform textarea,.arow input,.arow select{background:var(--bg2);color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:9px 12px;font:inherit}
 /* ---------- popup / toast ---------- */
 .pop{position:fixed;z-index:200;background:var(--bg2);border-radius:12px;padding:6px 0;min-width:190px;box-shadow:0 6px 30px rgba(0,0,0,.5)}
 .pop button,.pop a{display:block;width:100%;text-align:left;padding:10px 16px;font-size:14px;text-decoration:none}
@@ -2710,6 +3064,13 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 </header>
 <nav class="chips" id="chips"></nav>
 <main id="home">
+  <div class="mbar" id="mbar" hidden>
+    <input id="murl" type="url" placeholder="Listing / video page URL paste karo" autocomplete="off">
+    <select id="mpages"><option value="1">1 page</option><option value="3">3 pages</option><option value="5" selected>5 pages</option><option value="10">10 pages</option></select>
+    <button class="act" id="mgo">\u26A1 Scrape</button><button class="act" id="mstop" hidden>\u23F9 Stop</button><button class="act" id="mpl">\uD83D\uDCDA Playlists</button><button class="act" id="madmin" hidden>\uD83D\uDEE0 Admin</button>
+    <span class="mpost" id="mpost" hidden><button class="act" id="msave">\uD83D\uDCBE Save playlist</button><button class="act" id="msend">\uD83D\uDCE4 Send M3U to chat</button><button class="act" id="mwatch">\uD83D\uDC41 Watch URL</button><button class="act" id="mshare">\uD83D\uDD17 Share</button></span>
+    <div class="mmsg" id="mmsg"></div>
+  </div>
   <div class="bar"><span id="count"></span><span class="rt"><button class="clr" id="clr" hidden></button><select id="sort"><option value="def">Default</option><option value="az">A &rarr; Z</option><option value="za">Z &rarr; A</option><option value="long">Longest</option><option value="short">Shortest</option></select></span></div>
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" hidden></div>
@@ -2846,13 +3207,13 @@ ALL.forEach(function(it){BYURL[it.u]=it});
 [FAV,LATER].forEach(function(m){Object.keys(m).forEach(function(u){if(!BYURL[u]&&m[u]&&m[u].u){var o=m[u];o._x=1;BYURL[u]=o;ALL.push(o)}})});
 Object.keys(HIST).forEach(function(u){var h=HIST[u];if(!BYURL[u]&&h&&h.it&&h.it.u){h.it._x=1;BYURL[u]=h.it;ALL.push(h.it)}});
 var VIEW={chip:"all",q:"",sort:"def"},LIST=[],CUR=null;
-function saveLists(){LS.set("ytb_fav",FAV);LS.set("ytb_later",LATER)}
+function saveLists(){LS.set("ytb_fav",FAV);LS.set("ytb_later",LATER);syncPush()}
 function toggleFav(it){if(FAV[it.u]){delete FAV[it.u];toast("Removed from Favorites")}else{FAV[it.u]=slim(it);toast("Added to Favorites \u2665")}saveLists();updChips()}
 function toggleLater(it){if(LATER[it.u]){delete LATER[it.u];toast("Removed from Watch later")}else{LATER[it.u]=slim(it);toast("Saved to Watch later")}saveLists();updChips()}
 function saveHist(it,pos,dur){
   HIST[it.u]={ts:Date.now(),pos:pos,dur:dur,it:slim(it)};
   var ks=Object.keys(HIST);if(ks.length>300){ks.sort(function(a,b){return HIST[a].ts-HIST[b].ts});for(var i=0;i<ks.length-300;i++)delete HIST[ks[i]]}
-  LS.set("ytb_hist",HIST);
+  LS.set("ytb_hist",HIST);syncPush();
 }
 
 /* ---------- thumbnails ---------- */
@@ -2994,7 +3355,7 @@ function clearList(kind){
     if(kind==="hist"){HIST={};LS.set("ytb_hist",HIST)}else if(kind==="fav"){FAV={};LS.set("ytb_fav",FAV)}else{LATER={};LS.set("ytb_later",LATER)}
     toast(nm[kind]+" cleared");
   }
-  updChips();renderGrid();
+  updChips();renderGrid();syncPush();
 }
 function exportFav(){
   var l=Object.keys(FAV).map(function(u){return FAV[u]});
@@ -3560,9 +3921,124 @@ function showHome(){
 }
 function route(){var m=location.hash.match(/^#\/w\/(\d+)/);if(m)showWatch(+m[1]);else showHome()}
 
+/* ---------- Telegram Mini App mode (CFG.mini) ---------- */
+var MINI=!!CFG.mini,TGW=null,LIBR=[],MJOB=null,syncT=0,lastItems=[];
+function api(path,body){
+  var o={method:body?"POST":"GET",headers:{"X-Init-Data":(TGW&&TGW.initData)||""}};
+  if(body){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(body)}
+  return fetch(path,o).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||("HTTP "+r.status));return j})});
+}
+function pushNow(){if(!MINI||!TGW||!TGW.initData)return Promise.resolve();return api("/api/state",{fav:FAV,later:LATER,hist:HIST,lib:LIBR}).catch(function(){})}
+function syncPush(){if(!MINI)return;clearTimeout(syncT);syncT=setTimeout(pushNow,1500)}
+function rehydrate(){
+  [FAV,LATER].forEach(function(m){Object.keys(m).forEach(function(u){if(!BYURL[u]&&m[u]&&m[u].u){var o=m[u];o._x=1;BYURL[u]=o;ALL.push(o)}})});
+  Object.keys(HIST).forEach(function(u){var h=HIST[u];if(!BYURL[u]&&h&&h.it&&h.it.u){h.it._x=1;BYURL[u]=h.it;ALL.push(h.it)}});
+}
+function mergeState(s){
+  if(s&&s.ts){FAV=s.fav||{};LATER=s.later||{};HIST=s.hist||{};LIBR=s.lib||[];LS.set("ytb_fav",FAV);LS.set("ytb_later",LATER);LS.set("ytb_hist",HIST)}
+  else pushNow();
+  rehydrate();updChips();renderGrid();
+}
+function setMsg(x){$("#mmsg").textContent=x}
+function loadItems(items){
+  DATA.splice(0,DATA.length);items.forEach(function(x){DATA.push(x)});
+  ALL.length=0;DATA.forEach(function(x){ALL.push(x)});BYURL={};ALL.forEach(function(x){BYURL[x.u]=x});rehydrate();
+  VIEW.chip="all";LIST=[];updChips();renderGrid();
+}
+function startScrape(){
+  var u=$("#murl").value.trim();if(!/^https?:\/\//i.test(u)){toast("Valid URL daalo");return}
+  setMsg("Shuru ho raha hai...");$("#mgo").disabled=true;$("#mstop").hidden=false;$("#mpost").hidden=true;
+  api("/api/scrape",{url:u,start:1,end:+$("#mpages").value}).then(function(r){MJOB=r.id;pollJob()})
+   .catch(function(e){setMsg("\u274C "+e.message);$("#mgo").disabled=false;$("#mstop").hidden=true});
+}
+function pollJob(){
+  api("/api/job?id="+MJOB).then(function(j){
+    if(j.status==="running"){setMsg(j.total?("Extracting "+j.done+"/"+j.total):"Pages scan ho rahe hain...");setTimeout(pollJob,1200);return}
+    $("#mgo").disabled=false;$("#mstop").hidden=true;
+    if(j.status==="done"){lastItems=j.items;loadItems(j.items);setMsg("\u2705 "+j.items.length+" videos mile"+(j.items.length?"":" (bot me /debug <url> se check karo)"));$("#mpost").hidden=!j.items.length}
+    else setMsg("\u274C "+(j.error||"fail"));
+  }).catch(function(e){setMsg("\u274C "+e.message);$("#mgo").disabled=false;$("#mstop").hidden=true});
+}
+function playlistsMenu(anchor){
+  var es=[];
+  LIBR.forEach(function(p,i){
+    es.push({t:"\uD83D\uDCDA "+p.name+" ("+p.items.length+")",f:function(){loadItems(p.items);lastItems=p.items;$("#mpost").hidden=false;setMsg("Playlist: "+p.name)}});
+    es.push({t:"\uD83D\uDD17  Share: "+p.name,f:function(){shareItems(p.items,p.name)}});
+    es.push({t:"\uD83D\uDDD1  Delete: "+p.name,f:function(){LIBR.splice(i,1);pushNow();toast("Playlist deleted")}});
+  });
+  if(!es.length)es.push({t:"Koi playlist nahi (scrape ke baad Save dabao)",f:function(){}});
+  showPop(anchor,es);
+}
+/* ---- share + admin ---- */
+function shareItems(items,name){
+  if(!items||!items.length){toast("Pehle scrape karo");return}
+  api("/api/share",{name:name,items:items}).then(function(r){var l=r.link||r.web;copy(l);setMsg("\uD83D\uDD17 Share link copy ho gaya: "+l)}).catch(function(e){toast("\u274C "+e.message)});
+}
+var ADM=null,ADMTAB="sites";
+function admLoad(tab){api("/api/admin/overview").then(function(o){ADM=o;renderAdmin(tab||ADMTAB)}).catch(function(e){toast("\u274C "+e.message)})}
+function admDo(path,body,msg){api(path,body).then(function(r){toast(msg||"Done");admLoad()}).catch(function(e){toast("\u274C "+e.message)})}
+function openAdmin(){var b=$("#adm");if(!b){b=el("div","adm");b.id="adm";document.body.appendChild(b)}b.hidden=false;b.textContent="Loading...";admLoad("sites")}
+function renderAdmin(tab){
+  ADMTAB=tab;var box=$("#adm");box.textContent="";
+  var hd=el("div","ahd"),x=el("button","act","\u2715 Close");x.onclick=function(){box.hidden=true};hd.appendChild(el("b","","\uD83D\uDEE0 Admin"));hd.appendChild(x);box.appendChild(hd);
+  var tabs=el("div","atabs");[["sites","Sites"],["cookies","Cookies"],["jobs","Jobs"],["settings","Settings"],["users","Users"]].forEach(function(t_){var b=el("button","chip"+(tab===t_[0]?" on":""),t_[1]);b.onclick=function(){renderAdmin(t_[0])};tabs.appendChild(b)});box.appendChild(tabs);
+  var body=el("div");box.appendChild(body);
+  function row(txt,btns){var r=el("div","arow"),l=el("div","l",txt);r.appendChild(l);(btns||[]).forEach(function(b){r.appendChild(b)});body.appendChild(r);return r}
+  function btn(t_,f){var b=el("button","",t_);b.onclick=f;return b}
+  function form(fields,label,fn){var f=el("div","aform"),ins=fields.map(function(p){var i=el(p[0]);i.placeholder=p[1];if(p[0]==="textarea")i.rows=3;f.appendChild(i);return i});f.appendChild(btn(label,function(){fn(ins)}));body.appendChild(f)}
+  if(tab==="sites"){
+    ADM.sites.forEach(function(si){row((si.signed?"\uD83D\uDFE2 ":"\u26AA ")+si.domain+(si.rule?" \uD83E\uDDE9":""),[btn("Test",function(){toast("Test chal raha...");api("/api/admin/test",{domain:si.domain}).then(function(r){toast(r.ok?"\u2705 reachable":"\u274C "+(r.status||"fail")+" "+r.detail)}).catch(function(e){toast("\u274C "+e.message)})})].concat(si.custom?[btn("\uD83D\uDDD1",function(){admDo("/api/admin/site",{action:"remove",domain:si.domain},"Site hata di")})]:[]))});
+    form([["input","naya domain, jaise example.com"]],"\u2795 Add site",function(i){admDo("/api/admin/site",{action:"add",domain:i[0].value},"Site add")});
+  }else if(tab==="cookies"){
+    if(!ADM.cookies.length)row("Koi saved cookie nahi");
+    ADM.cookies.forEach(function(d){row("\uD83C\uDF6A "+d,[btn("Delete",function(){admDo("/api/admin/cookie",{action:"del",domain:d},"Cookie delete")})])});
+    var mr=el("label","arow","Purani me merge (updatecookie)");var mc=el("input");mc.type="checkbox";mc.checked=true;mr.appendChild(mc);body.appendChild(mr);
+    form([["input","domain"],["textarea","cookie: name=value; name2=value2"]],"\uD83D\uDCBE Save cookie",function(i){admDo("/api/admin/cookie",{domain:i[0].value,cookie:i[1].value,merge:mc.checked},"Cookie saved");i[1].value=""});
+  }else if(tab==="jobs"){
+    if(!ADM.jobs.length)row("Abhi koi job nahi chal raha");
+    ADM.jobs.forEach(function(j){row("#"+j.id+" "+j.kind+" | "+j.url+" | pages "+j.pages+" | "+j.secs+"s | user "+j.user,[btn("Cancel",function(){admDo("/api/admin/job",{user:j.user},"Stop request bheji")})])});
+    if(ADM.jobs.length)body.appendChild(btn("\u23F9 Cancel all",function(){admDo("/api/admin/job",{all:true},"Sab ko stop request")}));
+  }else if(tab==="settings"){
+    row("Bot proxy: "+(ADM.proxy||"PROXY_BASE set nahi"));
+    Object.keys(ADM.settings).forEach(function(k){
+      var v=ADM.settings[k],r=row(k+": ",[]);
+      if(["verify","ytdlp","keep_preview"].indexOf(k)>-1){r.appendChild(btn(v==="1"||(k==="ytdlp"&&v!=="0")?"ON":"OFF",function(){var on=(v==="1")||(k==="ytdlp"&&v!=="0");admDo("/api/admin/setting",{key:k,value:on?"off":"on"},k+" updated")}))}
+      else if(k==="proxy"){var sl=el("select");["auto","on","off"].forEach(function(o){var op=el("option","",o);op.value=o;if(o===(v||"auto"))op.selected=true;sl.appendChild(op)});sl.onchange=function(){admDo("/api/admin/setting",{key:k,value:sl.value},"proxy = "+sl.value)};r.appendChild(sl)}
+      else{var inp=el("input");inp.value=v;r.appendChild(inp);r.appendChild(btn("Save",function(){admDo("/api/admin/setting",{key:k,value:inp.value},k+" saved")}))}
+    });
+    Object.keys(ADM.prefer).forEach(function(d){row("\u2B50 prefer "+d+": "+ADM.prefer[d].join(", "),[btn("Clear",function(){admDo("/api/admin/prefer",{site:d,host:"off"},"prefer clear")})])});
+    form([["input","prefer: site (rusvideos.love)"],["input","asli video host (ebacdn.net)"]],"\u2B50 Set prefer host",function(i){admDo("/api/admin/prefer",{site:i[0].value,host:i[1].value},"prefer set")});
+  }else if(tab==="users"){
+    ADM.users.forEach(function(u){row((u===ADM.admin?"\uD83D\uDC51 ":"\uD83D\uDC64 ")+u,u===ADM.admin?[]:[btn("Remove",function(){admDo("/api/admin/user",{action:"remove",id:u},"User hata diya")})])});
+    form([["input","Telegram user id"]],"\u2795 Add user",function(i){admDo("/api/admin/user",{action:"add",id:+i[0].value},"User add")});
+  }
+}
+function initMini(){
+  $("#mbar").hidden=false;
+  $("#mgo").onclick=startScrape;$("#mstop").onclick=function(){api("/api/stop",{}).then(function(){setMsg("Stop request bheji...")})};
+  $("#mpl").onclick=function(e){e.stopPropagation();playlistsMenu(this)};
+  $("#mshare").onclick=function(){shareItems(lastItems,(domainOf((lastItems[0]||{}).p||(lastItems[0]||{}).u||"")||"Playlist"))};
+  $("#madmin").onclick=openAdmin;
+  $("#msave").onclick=function(){if(!lastItems.length)return;LIBR.unshift({name:(domainOf(lastItems[0].p||lastItems[0].u)||"scrape")+" "+new Date().toLocaleDateString(),ts:Date.now(),items:lastItems});LIBR=LIBR.slice(0,8);pushNow().then(function(){toast("Playlist saved (sab devices me)")})};
+  $("#msend").onclick=function(){api("/api/send",{items:lastItems.map(function(x){return {t:x.t,u:x.u}})}).then(function(r){toast("Chat me bhej diya ("+r.n+")")}).catch(function(e){toast("\u274C "+e.message)})};
+  $("#mwatch").onclick=function(){api("/api/watch",{action:"add",url:$("#murl").value.trim(),minutes:60}).then(function(r){toast("Watch #"+r.id+" add (har 60 min)")}).catch(function(e){toast("\u274C "+e.message)})};
+  loadScript("https://telegram.org/js/telegram-web-app.js").then(null,function(){}).then(function(){
+    TGW=window.Telegram&&Telegram.WebApp;
+    if(!TGW||!TGW.initData){setMsg("\u26A0 Ye page Telegram Mini App ke andar kholo (bot me /app)");$("#mgo").disabled=true;return}
+    try{TGW.ready();TGW.expand()}catch(e){}
+    if(LS.get("ytb_theme",null)===null&&TGW.colorScheme)document.documentElement.setAttribute("data-theme",TGW.colorScheme);
+    api("/api/state").then(mergeState).catch(function(e){setMsg("\u274C "+e.message)});
+    api("/api/me").then(function(m_){if(m_.admin)$("#madmin").hidden=false}).catch(function(){});
+    var sp=(TGW.initDataUnsafe&&TGW.initDataUnsafe.start_param)||((location.search.match(/[?&]share=([\w-]+)/)||[])[1]);
+    if(sp)api("/api/shared?t="+encodeURIComponent(sp)).then(function(r){lastItems=r.items;loadItems(r.items);$("#mpost").hidden=false;setMsg("\uD83D\uDD17 Shared playlist: "+r.name+(r.by?" ("+r.by+")":"")+" - "+r.items.length+" videos. 'Save playlist' se apni library me rakho")}).catch(function(e){setMsg("\u274C "+e.message)});
+  });
+  document.addEventListener("visibilitychange",function(){if(document.hidden)pushNow()});
+}
+
 /* ---------- init ---------- */
 function start(){
   $("#lock").hidden=true;$("#app").hidden=false;
+  if(MINI)initMini();
   $("#siteT").textContent=CFG.title;
   if(CFG.owner){
     var ow=$("#ownT");ow.textContent="by "+CFG.owner;ow.hidden=false;if(CFG.tg)ow.href=CFG.tg;
@@ -3591,7 +4067,7 @@ else{
   if(CFG.owner){var lo=$("#lockOwn"),la=el("a","","by "+CFG.owner);la.href=CFG.tg||"#";la.target="_blank";la.rel="noopener noreferrer";lo.appendChild(la)}
   $("#pwb").onclick=unlock;$("#pw").onkeydown=function(e){if(e.key==="Enter")unlock()};
 }
-window.__ytb={amb:function(){return {AM:AM,AMS:AMS,n:amN,bars:amBars}},pb:function(){return PB},fx:function(){return {graph:GRAPH,cors:CORS_LOAD,blocked:CORS_BLOCK}},cur:function(){return {q:CURQ,u:CURURL}},sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
+window.__ytb={pushNow:function(){return pushNow()},amb:function(){return {AM:AM,AMS:AMS,n:amN,bars:amBars}},pb:function(){return PB},fx:function(){return {graph:GRAPH,cors:CORS_LOAD,blocked:CORS_BLOCK}},cur:function(){return {q:CURQ,u:CURURL}},sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
 })();
 </script>
 </body>
@@ -3630,15 +4106,17 @@ def _px_fields(it: dict) -> dict:
     return d
 
 
-def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web Player") -> str:
+def _player_item(it: dict) -> dict:
+    return dict({"t": it.get("title") or "Video", "u": it["download_link"], "k": it.get("type") or "VIDEO",
+                 "p": it.get("page_url") or "", "th": it.get("thumb") or "", "d": it.get("duration") or 0,
+                 "v": [[v["q"], v["u"]] for v in (it.get("variants") or [])],
+                 "ip": it.get("iplock") or ""}, **_px_fields(it))
+
+
+def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web Player", mini: bool = False) -> str:
     """Self-contained YouTube-style web player (password gate, auto thumbnails, favorites, history,
     HLS/MP4/WebM/MKV/DASH/TS/FLV/audio, external-player fallback)."""
-    items = []
-    for it in results:
-        items.append(dict({"t": it.get("title") or "Video", "u": it["download_link"], "k": it.get("type") or "VIDEO",
-                      "p": it.get("page_url") or "", "th": it.get("thumb") or "", "d": it.get("duration") or 0,
-                      "v": [[v["q"], v["u"]] for v in (it.get("variants") or [])],
-                      "ip": it.get("iplock") or ""}, **_px_fields(it)))
+    items = [_player_item(it) for it in results]
 
     def js(o) -> str:
         return (json.dumps(o, ensure_ascii=False).replace("</", "<\\/")
@@ -3646,6 +4124,8 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
 
     cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK, "amb": load_ambient_cfg(), "px": bool(PROXY_BASE),
            "hash": hashlib.sha256(SKY_PASSWORD.encode("utf-8")).hexdigest() if SKY_PASSWORD else ""}
+    if mini:
+        cfg.update(mini=True, hash="")      # Mini App: login Telegram se hota hai, password nahi
     return (_PLAYER_TEMPLATE.replace("__OWNER__", _html.escape(BOT_OWNER_NAME))
             .replace("__TITLE__", _html.escape(title))
             .replace("__CFG__", js(cfg)).replace("__DATA__", js(items)))
@@ -3666,8 +4146,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Full Web Player UI: Custom Video & Media Player interface in HTML.\n"
         "2. 4 Files Export: 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
         "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n\n"
-        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /sniff, /prefer, /sky, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup"
+        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /sniff, /prefer, /sky, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup, /app (Mini App)"
     )
+
+async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/app -> Mini App kholne ka button."""
+    if not is_user_allowed(update.effective_user.id):
+        return
+    if not PROXY_BASE or WebAppInfo is None:
+        await update.message.reply_text(
+            "ℹ️ Mini App ke liye env PROXY_BASE=https://<tumhari-app-url> chahiye (HTTPS), "
+            "aur python-telegram-bot v20+.")
+        return
+    await update.message.reply_text(
+        "🎬 Mini Player: scrape, play, synced favorites/history, playlists.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎬 Open Mini App", web_app=WebAppInfo(url=PROXY_BASE + "/app"))]]))
+
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -6814,6 +7308,18 @@ async def prefer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _post_init(app):
+    global MAIN_LOOP, MINI_BOT
+    MAIN_LOOP = asyncio.get_running_loop()
+    MINI_BOT = app.bot
+    try:
+        globals()["MINI_BOT_USERNAME"] = app.bot.username or ""
+    except Exception:
+        pass
+    if PROXY_BASE and MenuButtonWebApp is not None:
+        try:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Player", web_app=WebAppInfo(url=PROXY_BASE + "/app")))
+        except Exception as e:
+            logger.warning(f"menu button set fail: {e}")
     _ensure_fast_executor()
     app.bot_data["tasks"] = [asyncio.create_task(_watch_loop(app)), asyncio.create_task(_backup_loop(app)),
                              asyncio.create_task(_sb_loop(app))]
@@ -6836,6 +7342,7 @@ def main():
            .concurrent_updates(True).post_init(_post_init).build())
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("app", app_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("debug", debug_command))
