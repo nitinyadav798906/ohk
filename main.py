@@ -4878,8 +4878,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_user_db(uid)
         await update.message.reply_text(f"✅ User `{uid}` added.", parse_mode="Markdown")
     else:
-        await update.message.reply_text("Usage: /adduser <telegram_user_id>
-Example: /adduser 123456789")
+        await update.message.reply_text("Usage: /adduser <telegram_user_id>\nExample: /adduser 123456789")
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -4891,8 +4890,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         remove_user_db(uid)
         await update.message.reply_text(f"🗑 User `{uid}` removed.", parse_mode="Markdown")
     else:
-        await update.message.reply_text("Usage: /removeuser <telegram_user_id>
-Example: /removeuser 123456789")
+        await update.message.reply_text("Usage: /removeuser <telegram_user_id>\nExample: /removeuser 123456789")
 
 async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id): return
@@ -4913,26 +4911,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     px = "ON" if PROXY_BASE else "OFF"
     conc = f"{SCR_CONCURRENCY}/{SCR_PAGE_CONCURRENCY}"
     await update.message.reply_text(
-        f"📊 Bot Status
-
-"
-        f"• Users: {users_count}
-"
-        f"• Sites: {sites_n} | Cookies: {cookies_n}
-"
-        f"• Active jobs: {jobs_n}
-"
-        f"• Your watches: {watches_n}
-"
-        f"• Scrape parallel: {conc} (video/pages)
-"
-        f"• Proxy/MiniApp: {px}
-"
-        f"• curl_cffi: {'ON' if cffi_requests else 'OFF'}
-"
-        f"• Engine: 24/7 Active 🟢
-
-"
+        f"📊 Bot Status\n\n"
+        f"• Users: {users_count}\n"
+        f"• Sites: {sites_n} | Cookies: {cookies_n}\n"
+        f"• Active jobs: {jobs_n}\n"
+        f"• Your watches: {watches_n}\n"
+        f"• Scrape parallel: {conc} (video/pages)\n"
+        f"• Proxy/MiniApp: {px}\n"
+        f"• curl_cffi: {'ON' if cffi_requests else 'OFF'}\n"
+        f"• Engine: 24/7 Active 🟢\n\n"
         f"📖 /help — saari commands"
     )
 
@@ -5921,7 +5908,7 @@ async def scr_send_files(chat, results: List[dict], start: int, end: int, domain
         [InlineKeyboardButton(f"▶️ Continue (Pages {nxt}-{nxt + 9})", callback_data="scr_continue")],
         [InlineKeyboardButton("🛑 Stop", callback_data="scr_stop")]])
 
-        _html_full = generate_web_app_html(results, title=f"{domain} ({start}-{end})")
+    _html_full = generate_web_app_html(results, title=f"{domain} ({start}-{end})")
     _zip_files = [
         (f"{tag}_full.txt", full),
         (f"{tag}_simple.txt", simple),
