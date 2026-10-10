@@ -170,6 +170,15 @@ def init_db():
             created REAL
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS site_health (
+            domain TEXT, ts REAL, links INTEGER, ok INTEGER
+        )
+    """)
+    try:
+        cursor.execute("ALTER TABLE mini_shares ADD COLUMN expires REAL")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -307,6 +316,33 @@ def list_cookie_domains() -> List[str]:
     return rows
 
 _COOKIE_CACHE: Optional[list] = None
+
+
+
+
+def cookie_age_warnings(max_days: float = 14.0) -> List[str]:
+    """Return human lines for cookies older than max_days (admin alert)."""
+    out = []
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute("SELECT domain, updated FROM site_cookies").fetchall()
+        conn.close()
+        now = time.time()
+        for dom, upd in rows:
+            try:
+                # updated may be string CURRENT_TIMESTAMP style
+                if isinstance(upd, (int, float)):
+                    ts = float(upd)
+                else:
+                    ts = time.mktime(time.strptime(str(upd)[:19], "%Y-%m-%d %H:%M:%S"))
+                age_d = (now - ts) / 86400
+                if age_d >= max_days:
+                    out.append(f"• {dom}: {age_d:.0f} days old")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
 
 
 def get_cookie_for_url(url: str) -> Optional[str]:
@@ -508,6 +544,151 @@ def px_rewrite_m3u8(text: str, base: str, ref: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def px_rewrite_mpd(text: str, base: str, ref: str) -> str:
+    """DASH MPD: BaseURL / SegmentTemplate media / initialization / SegmentURL media relative URLs ko proxy path me rewrite."""
+    def P(u: str) -> str:
+        u = (u or "").strip()
+        if not u or u.startswith("data:") or u.startswith("#"):
+            return u
+        full = urljoin(base, u)
+        if not full.startswith(("http://", "https://")):
+            return u
+        return px_path(full, ref)
+
+    def repl_attr(m):
+        return m.group(1) + P(m.group(2)) + m.group(3)
+
+    out = text
+    # BaseURL text content
+    out = re.sub(
+        r'(<BaseURL[^>]*>)([^<]+)(</BaseURL>)',
+        lambda m: m.group(1) + P(m.group(2).strip()) + m.group(3),
+        out, flags=re.I)
+    # media= / initialization= / sourceURL= attributes (SegmentTemplate, SegmentURL, ...)
+    out = re.sub(
+        r'\b((?:media|initialization|sourceURL|bitstreamSwitchingURL)=["\'])([^"\']+)(["\'])',
+        repl_attr, out, flags=re.I)
+    return out
+
+
+_PX_USAGE: Dict[str, object] = {"day": "", "total": 0, "ip": {}}
+
+
+def px_account(ip: str, nbytes: int = 0, check: bool = False) -> bool:
+    """Proxy bandwidth: har IP ka daily cap (env PROXY_DAILY_MB_PER_IP, default 2048) + optional total cap (PROXY_DAILY_MB_TOTAL)."""
+    day = time.strftime("%Y-%m-%d")
+    if _PX_USAGE["day"] != day:
+        _PX_USAGE.update(day=day, total=0, ip={})
+    if check:
+        try:
+            cap_ip = float(os.getenv("PROXY_DAILY_MB_PER_IP", "2048")) * 1048576
+            cap_all = float(os.getenv("PROXY_DAILY_MB_TOTAL", "0")) * 1048576
+        except ValueError:
+            return True
+        return not ((cap_ip and _PX_USAGE["ip"].get(ip, 0) >= cap_ip) or (cap_all and _PX_USAGE["total"] >= cap_all))
+    _PX_USAGE["ip"][ip] = _PX_USAGE["ip"].get(ip, 0) + nbytes
+    _PX_USAGE["total"] += nbytes
+    return True
+
+
+def px_usage_info() -> dict:
+    ips = sorted(_PX_USAGE["ip"].items(), key=lambda kv: -kv[1])[:5]
+    mask = lambda ip: re.sub(r'(\d+)$', 'x', ip) if '.' in ip else ip[:8] + '..'
+    return {"day": _PX_USAGE["day"], "total_mb": round(_PX_USAGE["total"] / 1048576, 1),
+            "ips": [[mask(i), round(b / 1048576, 1)] for i, b in ips]}
+
+
+_RF_CACHE: Dict[str, tuple] = {}
+
+
+def rf_url(page_url: str) -> str:
+    return f"{PROXY_BASE}/r?p={quote(page_url, safe='')}&s={px_sig(page_url, 'refresh')}"
+
+
+async def _refresh_one(p: str) -> Optional[dict]:
+    _STREAM_CACHE.pop(p, None)
+    r = await guarded_extract(p, p)
+    if not r or r.get("preview_only"):
+        return None
+    return _player_item(r)
+
+
+def rf_handle(h):
+    """/r?p=<page_url>&s=<sig> : expire hui link ke liye page se NAYI stream nikalo (HTML player + Mini App, dono)."""
+    q = parse_qs(urlsplit(h.path).query)
+    p = (q.get("p") or [""])[0]
+    sg = (q.get("s") or [""])[0]
+
+    def out(code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        h.send_response(code)
+        h.send_header("Content-Type", "application/json; charset=utf-8")
+        h.send_header("Content-Length", str(len(body)))
+        h.send_header("Access-Control-Allow-Origin", "*")
+        h.send_header("Cache-Control", "no-store")
+        h.end_headers()
+        h.wfile.write(body)
+
+    if not p.startswith(("http://", "https://")) or not hmac.compare_digest(sg, px_sig(p, "refresh")):
+        return out(403, {"error": "bad signature"})
+    hit = _RF_CACHE.get(p)
+    if hit and time.time() - hit[0] < 90:
+        return out(200, hit[1])
+    try:
+        res = asyncio.run_coroutine_threadsafe(_refresh_one(p), MAIN_LOOP).result(100)
+    except Exception:
+        return out(502, {"error": "refresh fail"})
+    if not res:
+        return out(404, {"error": "naya link nahi mila"})
+    if len(_RF_CACHE) > 500:
+        _RF_CACHE.clear()
+    _RF_CACHE[p] = (time.time(), res)
+    return out(200, res)
+
+
+def record_health(url: str, links: int, ok_n: int):
+    """Har scrape ka success rate yaad rakho; achanak girne par admin ko alert."""
+    if links < 3:
+        return
+    dom = _root_host(urlparse(url).netloc)
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute("SELECT links, ok FROM site_health WHERE domain=? ORDER BY ts DESC LIMIT 5", (dom,)).fetchall()
+        conn.execute("INSERT INTO site_health (domain, ts, links, ok) VALUES (?,?,?,?)", (dom, time.time(), links, ok_n))
+        conn.execute("DELETE FROM site_health WHERE ts < ?", (time.time() - 30 * 86400,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        return
+    prev = (sum(r[1] for r in rows) / max(1, sum(r[0] for r in rows))) if len(rows) >= 2 else None
+    rate = ok_n / links
+    if prev is not None and prev >= 0.7 and rate < 0.3 and MINI_BOT is not None and MAIN_LOOP is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(MINI_BOT.send_message(
+                ADMIN_ID, f"⚠️ Site health: {dom} ka success rate {prev:.0%} se gir ke {rate:.0%} ho gaya.\n"
+                          f"Check: /debug https://{dom}/"), MAIN_LOOP)
+        except Exception:
+            pass
+
+
+def health_overview() -> list:
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute("SELECT domain, links, ok, ts FROM site_health ORDER BY ts DESC LIMIT 400").fetchall()
+        conn.close()
+    except Exception:
+        return []
+    by: Dict[str, list] = {}
+    for d, l, o, ts in rows:
+        by.setdefault(d, []).append((l, o, ts))
+    out = []
+    for d, lst in by.items():
+        last5 = lst[:5]
+        out.append({"domain": d, "runs": len(lst), "last": round(lst[0][1] / max(1, lst[0][0]), 2),
+                    "avg": round(sum(x[1] for x in last5) / max(1, sum(x[0] for x in last5)), 2), "ts": lst[0][2]})
+    return sorted(out, key=lambda x: x["last"])
+
+
 def px_handle(h, head: bool = False):
     q = parse_qs(urlsplit(h.path).query)
     u = (q.get("u") or [""])[0]
@@ -527,6 +708,9 @@ def px_handle(h, head: bool = False):
 
     if not u.startswith(("http://", "https://")) or not hmac.compare_digest(sg, px_sig(u, r)):
         return deny(403)
+    ip = (h.headers.get("X-Forwarded-For") or h.client_address[0]).split(",")[0].strip()
+    if not px_account(ip, check=True):
+        return deny(429)
     hdrs = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity"}
     if r:
         hdrs["Referer"] = r
@@ -552,20 +736,30 @@ def px_handle(h, head: bool = False):
                 continue
             break
         ct = resp.headers.get("Content-Type", "")
-        if resp.status_code == 200 and (".m3u8" in urlparse(cur).path.lower() or "mpegurl" in ct.lower()):
+        path_l = urlparse(cur).path.lower()
+        is_m3u8 = ".m3u8" in path_l or "mpegurl" in ct.lower()
+        is_mpd = ".mpd" in path_l or "dash+xml" in ct.lower() or "mpeg-dash" in ct.lower()
+        if resp.status_code == 200 and (is_m3u8 or is_mpd):
             data = b""
             for ch in resp.iter_content(65536):
                 data += ch
-                if len(data) > 3_000_000:
+                if len(data) > 4_000_000:
                     break
-            body = px_rewrite_m3u8(data.decode("utf-8", "ignore"), cur, r).encode("utf-8")
+            txt = data.decode("utf-8", "ignore")
+            if is_mpd:
+                body = px_rewrite_mpd(txt, cur, r).encode("utf-8")
+                ctype = "application/dash+xml"
+            else:
+                body = px_rewrite_m3u8(txt, cur, r).encode("utf-8")
+                ctype = "application/vnd.apple.mpegurl"
             h.send_response(200)
-            h.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            h.send_header("Content-Type", ctype)
             h.send_header("Content-Length", str(len(body)))
             cors()
             h.end_headers()
             if not head:
                 h.wfile.write(body)
+                px_account(ip, len(body))
             return
         h.send_response(resp.status_code)
         for k in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"):
@@ -576,6 +770,7 @@ def px_handle(h, head: bool = False):
         if not head:
             for ch in resp.iter_content(65536):
                 h.wfile.write(ch)
+                px_account(ip, len(ch))
     except (BrokenPipeError, ConnectionResetError):
         pass
     except Exception as e:
@@ -647,22 +842,41 @@ def mini_state_set(uid: int, data: dict):
     conn.close()
 
 
-async def _mini_job_run(jid: str, uid: int, url: str, start: int, end: int):
+async def _mini_job_run(jid: str, uid: int, url, start: int, end: int):
     j = MINI_JOBS[jid]
+    urls = [url] if isinstance(url, str) else list(url)
     STOP_PROCESS[uid] = False
-    jj = job_start(uid, "mini", url, start, end)
-
-    async def progress(done, total):
-        j["done"], j["total"] = done, total
-
+    jj = job_start(uid, "mini", urls[0], start, end)
+    merged: List[dict] = []
+    seen = set()
+    rep_all = {"pages_ok": 0, "links": 0, "extracted": 0, "cached": 0}
     try:
-        try:
-            url = await scr_preflight(url)                 # age-gate bypass, jaise /scr me
-        except Exception:
-            pass
-        results, rep = await scr_scrape(url, start, end, uid, progress)
-        j["items"] = [_player_item(r) for r in results]
-        j["rep"] = {k: rep.get(k) for k in ("pages_ok", "links", "extracted", "cached")}
+        for idx, u in enumerate(urls, 1):
+            if STOP_PROCESS.get(uid):
+                break
+            j["part"] = f"{idx}/{len(urls)}" if len(urls) > 1 else ""
+
+            async def progress(done, total):
+                j["done"], j["total"] = done, total
+
+            try:
+                u2 = await scr_preflight(u)                # age-gate bypass, jaise /scr me
+            except Exception:
+                u2 = u
+            try:
+                results, rep = await scr_scrape(u2, start, end, uid, progress)
+            except Exception as e:
+                logger.error(f"mini job url error {u}: {e}")
+                continue
+            for r in results:
+                it = _player_item(r)
+                if it["u"] not in seen:
+                    seen.add(it["u"])
+                    merged.append(it)
+            for k in rep_all:
+                rep_all[k] += int(rep.get(k) or 0)
+        j["items"] = merged
+        j["rep"] = rep_all
         j["status"] = "done"
     except Exception as e:
         logger.error(f"mini job error: {e}")
@@ -710,7 +924,8 @@ def admin_overview() -> dict:
         "jobs": [{"id": j, "kind": v["kind"], "pages": v["pages"], "secs": int(time.time() - v["t0"]),
                   "url": normalize_domain(v["url"]), "user": v["user"]} for j, v in JOBS.items()],
         "settings": {k: (get_setting(k) or "") for k in _SETTING_DEFAULTS},
-        "users": get_all_users(), "prefer": dict(_PREFER), "proxy": PROXY_BASE, "admin": ADMIN_ID}
+        "users": get_all_users(), "prefer": dict(_PREFER), "proxy": PROXY_BASE, "admin": ADMIN_ID,
+        "health": health_overview(), "px_usage": px_usage_info()}
 
 
 def _admin_api(path: str, body: dict) -> dict:
@@ -832,17 +1047,18 @@ def api_handle(h, method: str):
                 return send(200, {"ok": True})
             return send(200, mini_state_get(uid))
         if path == "/api/scrape" and method == "POST":
-            url = str(body.get("url") or "").strip()
-            if not re.match(r'^https?://', url, re.I) or not DOMAIN_RE.match(normalize_domain(url)):
+            raw_urls = body.get("urls") or [body.get("url")]
+            urls = [str(x).strip() for x in raw_urls if x][:10]
+            if not urls or any(not re.match(r'^https?://', x, re.I) or not DOMAIN_RE.match(normalize_domain(x)) for x in urls):
                 return send(400, {"error": "Valid http(s) URL do"})
             st = max(1, int(body.get("start") or 1))
             en = max(st, min(int(body.get("end") or 5), st + SCR_MAX_PAGES - 1))
-            return send(200, {"id": mini_job_start(uid, url, st, en)})
+            return send(200, {"id": mini_job_start(uid, urls[0] if len(urls) == 1 else urls, st, en)})
         if path == "/api/job":
             j = MINI_JOBS.get((q.get("id") or [""])[0])
             if not j or j["uid"] != uid:
                 return send(404, {"error": "job nahi mila"})
-            return send(200, {k: j.get(k) for k in ("status", "done", "total", "items", "error", "rep")})
+            return send(200, {k: j.get(k) for k in ("status", "done", "total", "items", "error", "rep", "part")})
         if path == "/api/stop" and method == "POST":
             STOP_PROCESS[uid] = True
             return send(200, {"ok": True})
@@ -883,16 +1099,34 @@ def api_handle(h, method: str):
                 return send(413, {"error": "playlist bahut badi"})
             token = secrets.token_urlsafe(6)
             conn = sqlite3.connect(DB_FILE)
-            conn.execute("INSERT INTO mini_shares (token, owner, by_name, name, data, created) VALUES (?,?,?,?,?,?)",
-                         (token, uid, str(user.get("first_name") or "")[:40], str(body.get("name") or "Playlist")[:60], raw, time.time()))
+            days = int(body.get("days", 7) or 0)
+            exp = (time.time() + days * 86400) if days > 0 else None
+            conn.execute("INSERT INTO mini_shares (token, owner, by_name, name, data, created, expires) VALUES (?,?,?,?,?,?,?)",
+                         (token, uid, str(user.get("first_name") or "")[:40], str(body.get("name") or "Playlist")[:60], raw, time.time(), exp))
             conn.commit()
             conn.close()
             return send(200, {"token": token, "web": f"{PROXY_BASE}/app?share={token}",
                               "link": f"https://t.me/{MINI_BOT_USERNAME}?startapp={token}" if MINI_BOT_USERNAME else ""})
+        if path == "/api/shares":
+            conn = sqlite3.connect(DB_FILE)
+            rows = conn.execute("SELECT token, name, expires FROM mini_shares WHERE owner=? AND (expires IS NULL OR expires>?) "
+                                "ORDER BY created DESC LIMIT 30", (uid, time.time())).fetchall()
+            conn.close()
+            return send(200, {"shares": [{"token": r[0], "name": r[1], "expires": r[2]} for r in rows]})
+        if path == "/api/share/revoke" and method == "POST":
+            conn = sqlite3.connect(DB_FILE)
+            cur = conn.execute("DELETE FROM mini_shares WHERE token=? AND (owner=? OR ?)",
+                               (str(body.get("token") or ""), uid, 1 if uid == ADMIN_ID else 0))
+            conn.commit()
+            n = cur.rowcount
+            conn.close()
+            return send(200, {"ok": n > 0})
         if path == "/api/shared":
             conn = sqlite3.connect(DB_FILE)
-            row = conn.execute("SELECT name, by_name, data FROM mini_shares WHERE token=?", ((q.get("t") or [""])[0],)).fetchone()
+            row = conn.execute("SELECT name, by_name, data, expires FROM mini_shares WHERE token=?", ((q.get("t") or [""])[0],)).fetchone()
             conn.close()
+            if row and row[3] and row[3] < time.time():
+                row = None
             if not row:
                 return send(404, {"error": "share link nahi mila / expire"})
             return send(200, {"name": row[0], "by": row[1], "items": json.loads(row[2])})
@@ -914,6 +1148,8 @@ class DummyPortServer(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/p?"):
             return px_handle(self)
+        if self.path.startswith("/r?"):
+            return rf_handle(self)
         if self.path.split("?")[0] in ("/app", "/app/"):
             return mini_page(self)
         if self.path.startswith("/api/"):
@@ -2999,7 +3235,7 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 .dimov{position:absolute;inset:0;z-index:1;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;padding:18px 70px 0 18px;opacity:0;transition:opacity .25s;pointer-events:none}
 .dimov b{font-size:20px;line-height:1.3;color:#fff;text-shadow:0 1px 6px #000;max-width:80%}
 .player.dim .dimov{opacity:1}
-.pbm{position:absolute;right:10px;bottom:64px;width:min(340px,92%);max-height:72%;overflow:auto;z-index:8;background:rgba(18,18,18,.97);color:#fff;border-radius:14px;padding:12px 14px;box-shadow:0 8px 30px rgba(0,0,0,.6);font-size:14px}
+#vstats{position:absolute;left:10px;top:10px;z-index:9;background:rgba(0,0,0,.72);color:#0f0;font:11px/1.45 monospace;padding:8px 10px;border-radius:8px;max-width:min(340px,90%);pointer-events:none;white-space:pre;display:none}#vstats.on{display:block}.pbm{position:absolute;right:10px;bottom:64px;width:min(340px,92%);max-height:72%;overflow:auto;z-index:8;background:rgba(18,18,18,.97);color:#fff;border-radius:14px;padding:12px 14px;box-shadow:0 8px 30px rgba(0,0,0,.6);font-size:14px}
 .pbm .hd{display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px;margin-bottom:10px;cursor:pointer}
 .pbm .chips2{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
 .pbm .chip2{flex:1 1 auto;padding:8px 10px;border-radius:20px;background:#2a2a2a;text-align:center;font-weight:600;min-width:52px}
@@ -3038,6 +3274,7 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 .ubtn button.g{background:var(--chip);color:var(--tx)}
 .mbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:8px 16px}
 .mbar input{flex:1 1 240px;min-width:0;height:40px;border-radius:20px;border:1px solid var(--line);background:var(--bg);color:var(--tx);padding:0 16px;outline:0;font-size:15px}
+.mbar textarea{flex:1 1 240px;min-width:0;min-height:40px;max-height:120px;border-radius:20px;border:1px solid var(--line);background:var(--bg);color:var(--tx);padding:9px 16px;outline:0;font:inherit;resize:vertical}
 .mbar select{height:40px;border-radius:20px;border:1px solid var(--line);background:var(--chip);color:var(--tx);padding:0 10px}
 .mbar .act{border:0;cursor:pointer;color:var(--tx)}.mbar .act:disabled{opacity:.5}
 .mpost{display:contents}.mmsg{flex-basis:100%;font-size:13px;color:var(--tx2);min-height:16px}
@@ -3065,10 +3302,10 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 <nav class="chips" id="chips"></nav>
 <main id="home">
   <div class="mbar" id="mbar" hidden>
-    <input id="murl" type="url" placeholder="Listing / video page URL paste karo" autocomplete="off">
+    <textarea id="murl" rows="1" placeholder="Listing / video URL paste karo (ek ya kai, har line me ek)"></textarea>
     <select id="mpages"><option value="1">1 page</option><option value="3">3 pages</option><option value="5" selected>5 pages</option><option value="10">10 pages</option></select>
     <button class="act" id="mgo">\u26A1 Scrape</button><button class="act" id="mstop" hidden>\u23F9 Stop</button><button class="act" id="mpl">\uD83D\uDCDA Playlists</button><button class="act" id="madmin" hidden>\uD83D\uDEE0 Admin</button>
-    <span class="mpost" id="mpost" hidden><button class="act" id="msave">\uD83D\uDCBE Save playlist</button><button class="act" id="msend">\uD83D\uDCE4 Send M3U to chat</button><button class="act" id="mwatch">\uD83D\uDC41 Watch URL</button><button class="act" id="mshare">\uD83D\uDD17 Share</button></span>
+    <span class="mpost" id="mpost" hidden><button class="act" id="msave">\uD83D\uDCBE Save playlist</button><button class="act" id="msend">\uD83D\uDCE4 Send M3U to chat</button><button class="act" id="mwatch">\uD83D\uDC41 Watch URL</button><button class="act" id="mshare">\uD83D\uDD17 Share</button><button class="act" id="mrf">\uD83D\uDD04 Refresh links</button></span>
     <div class="mmsg" id="mmsg"></div>
   </div>
   <div class="bar"><span id="count"></span><span class="rt"><button class="clr" id="clr" hidden></button><select id="sort"><option value="def">Default</option><option value="az">A &rarr; Z</option><option value="za">Z &rarr; A</option><option value="long">Longest</option><option value="short">Shortest</option></select></span></div>
@@ -3090,7 +3327,7 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
        <div class="rip l" id="ripL">&#9194; 10s</div><div class="rip r" id="ripR">10s &#9193;</div>
        <div class="big" id="big">&#9654;</div>
      </div>
-     <div class="err" id="err" hidden></div>
+     <div class="err" id="err" hidden></div>\n     <div id="vstats"></div>
      <div class="endsc" id="endsc" hidden></div>
      <div class="pbm" id="pbm" hidden></div>
      <div class="ctl" id="ctl">
@@ -3120,6 +3357,7 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 var DATA=__DATA__, CFG=__CFG__;
 var HLS_URL="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js",
     DASH_URL="https://cdn.jsdelivr.net/npm/dashjs@4/dist/dash.all.min.js",
+    SHAKA_URL="https://cdn.jsdelivr.net/npm/shaka-player@4.7.11/dist/shaka-player.compiled.min.js",
     TS_URL="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.js";
 function $(s,r){return (r||document).querySelector(s)}
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
@@ -3202,7 +3440,7 @@ function extLinks(u){
 /* ---------- state ---------- */
 var FAV=LS.get("ytb_fav",{}),LATER=LS.get("ytb_later",{}),HIST=LS.get("ytb_hist",{});
 var ALL=DATA.slice(),BYURL={},DUR={},THUMBS={};
-function slim(it){return {t:it.t,u:it.u,k:it.k,p:it.p,th:it.th,d:it.d,v:it.v,x:it.x,xa:it.xa,drm:it.drm,eng:it.eng}}
+function slim(it){return {t:it.t,u:it.u,k:it.k,p:it.p,th:it.th,d:it.d,v:it.v,x:it.x,xa:it.xa,rf:it.rf,drm:it.drm,eng:it.eng}}
 ALL.forEach(function(it){BYURL[it.u]=it});
 [FAV,LATER].forEach(function(m){Object.keys(m).forEach(function(u){if(!BYURL[u]&&m[u]&&m[u].u){var o=m[u];o._x=1;BYURL[u]=o;ALL.push(o)}})});
 Object.keys(HIST).forEach(function(u){var h=HIST[u];if(!BYURL[u]&&h&&h.it&&h.it.u){h.it._x=1;BYURL[u]=h.it;ALL.push(h.it)}});
@@ -3407,6 +3645,7 @@ function go(it){location.hash="#/w/"+ALL.indexOf(it)}
 /* ---------- player ---------- */
 var V=$("#v"),PL=$("#pl"),hls=null,mp=null,dash=null,retries=0,hideT,lastSave=0,dragging=false,IMGV=$("#imgv");
 var CURQ="auto",SEEK_AT=0,CURURL="",CURENG="native",PXS={};
+var shakaPlayer=null,HOLD2X=false,HOLD_SPD=1,PRELOAD_V=null,PRELOAD_U="",BUF_TOAST_T=0;
 function PXON(it){if(PXS[it.u]!==undefined)return PXS[it.u];return !!(it.x&&it.xa)&&LS.get("ytb_px",true)}
 function reloadCur(at,cors){var o={keepQ:true,at:at};if(cors)o.cors=true;if(CUR&&CURURL!==CUR.x)o.url=CURURL;loadItem(CUR,o)}
 function b64u(x){x=(x||"").trim();if(/^[0-9a-fA-F]+$/.test(x)&&x.length%2===0){var s="";for(var i=0;i<x.length;i+=2)s+=String.fromCharCode(parseInt(x.substr(i,2),16));return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}return x}
@@ -3468,8 +3707,75 @@ function destroyEngines(){
   try{if(hls){hls.destroy()}}catch(e){}hls=null;
   try{if(mp){mp.destroy()}}catch(e){}mp=null;
   try{if(dash){dash.reset()}}catch(e){}dash=null;
+  try{if(shakaPlayer){shakaPlayer.destroy();shakaPlayer=null}}catch(e){shakaPlayer=null}
   try{V.pause();V.removeAttribute("src");V.load()}catch(e){}
+  try{if(STATS_ON){var box=$("#vstats");if(box){box.className="";box.textContent=""}}}catch(e){}
+  try{if(PRELOAD_V){PRELOAD_V.removeAttribute("src");PRELOAD_V.load()}}catch(e){}
 }
+
+/* ---- advanced: live stats overlay + DASH/HLS audio tracks ---- */
+var STATS_ON=false,STATS_T=null;
+function toggleStats(){
+  STATS_ON=!STATS_ON;
+  var box=$("#vstats");
+  if(!STATS_ON){box.className="";box.textContent="";clearInterval(STATS_T);STATS_T=null;toast("Stats off");return}
+  box.className="on";toast("Stats on (i key)");
+  function tick(){
+    if(!STATS_ON)return;
+    var lines=[],res=(V.videoWidth||0)+"x"+(V.videoHeight||0);
+    lines.push("Engine: "+(CURENG||"?")+" | Res: "+res);
+    lines.push("Time: "+fmtTime(V.currentTime||0)+" / "+(isFinite(V.duration)?fmtTime(V.duration):"LIVE"));
+    try{
+      var b=V.buffered,buf=0;
+      if(b&&b.length){for(var i=0;i<b.length;i++)if(b.start(i)<=(V.currentTime||0)&&b.end(i)>=(V.currentTime||0))buf=b.end(i)-(V.currentTime||0)}
+      lines.push("Buffer: "+buf.toFixed(1)+"s | Rate: "+(V.playbackRate||1)+"x");
+    }catch(e){}
+    if(hls&&hls.levels&&hls.levels.length){
+      var lv=hls.levels[hls.currentLevel]||{};
+      lines.push("HLS lvl: "+(hls.currentLevel)+"/"+(hls.levels.length-1)+" "+(lv.height?lv.height+"p":"")+" "+(lv.bitrate?Math.round(lv.bitrate/1000)+"k":""));
+    }
+    if(dash){
+      try{
+        var db=dashBitrates(),qi=dash.getQualityFor?dash.getQualityFor("video"):-1;
+        var bi=db[qi]||{};
+        lines.push("DASH Q: "+(qi)+"/"+(db.length?db.length-1:0)+" "+(bi.height?bi.height+"p":"")+" "+(bi.bitrate?Math.round(bi.bitrate/1000)+"k":""));
+        if(dash.getAverageThroughput){var th=dash.getAverageThroughput("video");if(th)lines.push("Throughput: "+Math.round(th)+" kbps")}
+      }catch(e){}
+    }
+    if(CUR&&CUR.u)lines.push((CUR.u||"").slice(0,90));
+    box.textContent=lines.join("\\n");
+  }
+  tick();STATS_T=setInterval(tick,800);
+}
+function listAudioTracks(){
+  var out=[];
+  try{
+    if(dash&&dash.getTracksFor){
+      var tr=dash.getTracksFor("audio")||[];
+      tr.forEach(function(t,i){
+        var lab=(t.lang||t.language||"")+" "+(t.roles?t.roles.join(","):"")+" "+(t.labels&&t.labels[0]?t.labels[0]:"");
+        out.push({v:i,l:(lab.trim()||("Audio "+(i+1))),track:t});
+      });
+    }
+  }catch(e){}
+  try{
+    if(hls&&hls.audioTracks&&hls.audioTracks.length){
+      hls.audioTracks.forEach(function(t,i){out.push({v:i,l:(t.name||t.lang||("Audio "+(i+1))),hls:true})});
+    }
+  }catch(e){}
+  return out;
+}
+function setAudioTrack(i){
+  try{
+    if(dash&&dash.getTracksFor){
+      var tr=dash.getTracksFor("audio")||[];
+      if(tr[i])dash.setCurrentTrack(tr[i]);
+    }
+    if(hls&&hls.audioTracks&&hls.audioTracks[i]!=null)hls.audioTrack=i;
+  }catch(e){}
+  toast("Audio track set");
+}
+
 function setLoading(b){$("#spin").hidden=!b}
 function showErr(msg,it){
   var e=$("#err");
@@ -3482,12 +3788,21 @@ function showErr(msg,it){
   if(lv){var lb=el("button","","Try "+lv[0]+"p");lb.onclick=function(){CURQ=lv[0];loadItem(CUR,{url:lv[1],keepQ:true,at:V.currentTime})};box.appendChild(lb)}
   if(it){
     extLinks(it.u).forEach(function(x){var a=el("a","",x.n==="Open link"?"Open / Download":x.n);a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";box.appendChild(a)});
+    if(it.rf){var rb=el("button","","\uD83D\uDD04 Refresh link");rb.onclick=function(){setLoading(true);refreshItem(it,function(ok){if(ok){toast("Naya link mil gaya");loadItem(it,{keepQ:true})}else{setLoading(false);toast("Naya link nahi mila")}})};box.appendChild(rb)}
     if(it.x){var usingPx=(CURURL===it.x),pb=el("button","",usingPx?"Try direct (no proxy)":"Try via bot proxy");pb.onclick=function(){PXS[it.u]=!usingPx;loadItem(CUR,{keepQ:true,at:V.currentTime})};box.appendChild(pb)}
     var cp=el("button","","Copy link");cp.onclick=function(){copy(it.u)};box.appendChild(cp);
   }
   e.appendChild(box);
 }
-function fail(it,why){showErr((why||"Ye stream browser me play nahi ho raha")+" ("+fmtOf(it)+"). Kisi external player me kholo:",it)}
+function fail(it,why){
+  var key=it.p||it.u,now=Date.now();
+  if(it.rf&&!(RFTRIED[key]&&now-RFTRIED[key]<600000)){          /* link expire ho gayi ho sakti hai -> khud refresh */
+    RFTRIED[key]=now;toast("Link refresh ho rahi...");setLoading(true);
+    refreshItem(it,function(ok){if(ok&&CUR===it){toast("Naya link mil gaya");loadItem(it,{keepQ:true})}else showErr((why||"Ye stream browser me play nahi ho raha")+" ("+fmtOf(it)+"). Refresh se bhi naya link nahi mila:",it)});
+    return;
+  }
+  showErr((why||"Ye stream browser me play nahi ho raha")+" ("+fmtOf(it)+"). Kisi external player me kholo:",it)
+}
 function hasVariants(it){return !!(it&&it.v&&it.v.length>1)}
 function qLabel(q){return q+"p"+(q>=720?" HD":"")}
 function curQ(){
@@ -3501,11 +3816,25 @@ function lowerVariant(){
   for(var i=0;i<v.length;i++){if(cq==null||v[i][0]<cq)return v[i]}
   return null;
 }
+function dashBitrates(){
+  try{
+    if(!dash||!dash.getBitrateInfoListFor)return [];
+    return dash.getBitrateInfoListFor("video")||[];
+  }catch(e){return []}
+}
 function updQBtn(){
-  var b=$("#bQ"),hl=hls&&hls.levels&&hls.levels.length>1;
-  if(!hl&&!hasVariants(CUR)){b.hidden=true;return}
+  var b=$("#bQ"),hl=hls&&hls.levels&&hls.levels.length>1,db=dashBitrates();
+  if(!hl&&!db.length&&!hasVariants(CUR)){b.hidden=true;return}
   b.hidden=false;
   if(hl){var lv=hls.levels[hls.currentLevel];b.textContent=(hls.currentLevel>=0&&lv&&lv.height)?lv.height+"p":"Auto"}
+  else if(db.length){
+    try{
+      var qi=dash.getQualityFor?dash.getQualityFor("video"):-1;
+      var auto=dash.getAutoSwitchQualityFor?dash.getAutoSwitchQualityFor("video"):true;
+      if(auto||qi<0){b.textContent="Auto"}
+      else{var bi=db[qi];b.textContent=bi&&bi.height?(bi.height+"p"):(bi?(Math.round(bi.bitrate/1000)+"k"):"Auto")}
+    }catch(e){b.textContent="Auto"}
+  }
   else{var q=curQ();b.textContent=q?q+"p":"Auto"}
 }
 function buildQuality(){updQBtn()}
@@ -3514,15 +3843,68 @@ function setQuality(v){
   if(v!=="auto"){for(var i=0;i<CUR.v.length;i++)if(CUR.v[i][0]===v)u=CUR.v[i][1]}
   CURQ=v;loadItem(CUR,{url:u,at:V.currentTime,keepQ:true});
 }
+
+/* ---- power extras: Shaka fallback, hold-to-2x, preload next, share timestamp, buffer toast ---- */
+function tryShaka(it,u,opt){
+  loadScript(SHAKA_URL).then(function(){
+    if(!window.shaka){fail(it,"DASH engines fail (dash.js + shaka)");return}
+    try{shaka.polyfill.installAll()}catch(e){}
+    if(!shaka.Player.isBrowserSupported()){fail(it,"Browser DASH support nahi");return}
+    shakaPlayer=new shaka.Player(V);
+    shakaPlayer.addEventListener("error",function(ev){
+      var code=(ev&&ev.detail&&ev.detail.code)||"?";
+      if(retries++<2){try{shakaPlayer.retry()}catch(e){fail(it,"Shaka error "+code)}}
+      else fail(it,"Shaka/DASH fail ("+code+")");
+    });
+    shakaPlayer.configure({abr:{enabled:true},streaming:{bufferingGoal:20,rebufferingGoal:4}});
+    shakaPlayer.load(u).then(function(){
+      setLoading(false);buildQuality();
+      var p=V.play();if(p&&p.catch)p.catch(function(){});
+      if(SEEK_AT>1){try{V.currentTime=SEEK_AT}catch(e){}SEEK_AT=0}
+      toast("Shaka engine");
+    },function(e){fail(it,"Shaka load fail")});
+  },function(){fail(it,"Shaka load nahi hui")});
+}
+function shareTimestamp(){
+  if(!CUR)return;
+  var t=Math.floor(V.currentTime||0),base=CUR.p||CUR.u||"";
+  var link=base+(base.indexOf("?")>=0?"&":"?")+"t="+t+"s";
+  var msg=(CUR.t||"Video")+" @ "+fmtTime(t)+"\\n"+link;
+  copy(msg);
+  toast("Timestamp link copied");
+}
+function preloadNext(){
+  try{
+    var n=nextItem(1);if(!n||!n.u)return;
+    if(PRELOAD_U===n.u)return;
+    PRELOAD_U=n.u;
+    if(!PRELOAD_V){PRELOAD_V=document.createElement("video");PRELOAD_V.muted=true;PRELOAD_V.preload="auto";PRELOAD_V.style.display="none";document.body.appendChild(PRELOAD_V)}
+    var eng=engineOf(n);
+    if(eng==="native"||eng==="hls"){PRELOAD_V.src=n.x||n.u}
+  }catch(e){}
+}
+function onBufferToast(){
+  var now=Date.now();
+  if(now-BUF_TOAST_T<8000)return;
+  BUF_TOAST_T=now;
+  if(hls&&hls.levels&&hls.levels.length>1&&hls.currentLevel>0){
+    try{hls.nextLevel=Math.max(0,hls.currentLevel-1);toast("Slow connection – quality kam")}catch(e){}
+  }else if(dash&&dashBitrates().length>1){
+    try{
+      var qi=dash.getQualityFor("video");
+      if(qi>0){dash.setAutoSwitchQualityFor("video",false);dash.setQualityFor("video",qi-1);toast("Slow connection – quality kam")}
+    }catch(e){}
+  }else toast("Buffering…");
+}
 function loadItem(it,opt){
   opt=opt||{};
-  destroyEngines();showErr("");hideEnd();OUTRO_DONE=false;CORS_LOAD=false;amBars={t:0,b:0,on:true};amN=0;retries=0;V.hidden=true;IMGV.hidden=true;$("#aud").hidden=true;$("#menu").hidden=true;
+  destroyEngines();showErr("");hideEnd();OUTRO_DONE=false;CORS_LOAD=false;amBars={t:0,b:0,on:true};amN=0;AB.a=AB.b=null;var tk0=V.querySelector("track");if(tk0)tk0.remove();retries=0;V.hidden=true;IMGV.hidden=true;$("#aud").hidden=true;$("#menu").hidden=true;
   applyVideoFx();
   if(!opt.keepQ)CURQ="auto";
   var u0=opt.url||it.u,eng0=engineOf({u:u0,k:it.k,eng:it.eng}),u=(!opt.url&&it.x&&eng0!=="dash"&&PXON(it))?it.x:u0;CURURL=u;CURENG=eng0;SEEK_AT=opt.at||0;
   if(it.k==="IMAGE"){IMGV.hidden=false;IMGV.referrerPolicy="no-referrer";IMGV.src=it.u;setLoading(false);updQBtn();return}
   if(it.k==="PDF"){showErr("PDF file hai.",it);return}
-  V.hidden=false;$("#aud").hidden=!isAudio(it);setLoading(true);updQBtn();
+  V.hidden=false;$("#aud").hidden=!(isAudio(it)||AUDONLY);V.style.visibility=AUDONLY?"hidden":"";setLoading(true);updQBtn();
   var eng=eng0;
   var go2=function(){var p=V.play();if(p&&p.catch)p.catch(function(){})};
   if(eng==="hls"){
@@ -3542,7 +3924,39 @@ function loadItem(it,opt){
       else fail(it,"HLS support nahi");
     },function(){if(V.canPlayType("application/vnd.apple.mpegurl")){V.src=u;go2()}else fail(it,"hls.js load nahi hui (internet?)")});
   }else if(eng==="dash"){
-    loadScript(DASH_URL).then(function(){dash=dashjs.MediaPlayer().create();if(it.drm&&it.drm.length){var ckk={};it.drm.forEach(function(p){ckk[b64u(p[0])]=b64u(p[1])});dash.setProtectionData({"org.w3.clearkey":{"clearkeys":ckk}})}dash.initialize(V,u,true)},function(){fail(it,"dash.js load nahi hui")});
+    loadScript(DASH_URL).then(function(){
+      if(!window.dashjs){fail(it,"dash.js load nahi hui");return}
+      dash=dashjs.MediaPlayer().create();
+      try{
+        dash.updateSettings({
+          streaming:{
+            abr:{autoSwitchBitrate:{video:true,audio:true}},
+            buffer:{stableBufferTime:12,bufferTimeAtTopQuality:30,bufferTimeAtTopQualityLongForm:60},
+            retryAttempts:{MPD:3,MediaSegment:3,InitializationSegment:3},
+            retryIntervals:{MPD:500,MediaSegment:500,InitializationSegment:500}
+          },
+          debug:{logLevel:dashjs.Debug?dashjs.Debug.LOG_LEVEL_WARNING:0}
+        });
+      }catch(e){}
+      if(it.drm&&it.drm.length){
+        var ckk={};it.drm.forEach(function(p){ckk[b64u(p[0])]=b64u(p[1])});
+        try{dash.setProtectionData({"org.w3.clearkey":{"clearkeys":ckk}})}catch(e){}
+      }
+      dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED,function(){
+        setLoading(false);buildQuality();go2();
+        if(SEEK_AT>1){try{V.currentTime=SEEK_AT}catch(e){}SEEK_AT=0}
+      });
+      dash.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED,function(){updQBtn()});
+      dash.on(dashjs.MediaPlayer.events.ERROR,function(e){
+        var msg=(e&&e.error&&(e.error.message||e.error.code))||"DASH error";
+        if(retries++<2){try{dash.reset();dash.initialize(V,u,true)}catch(ex){fail(it,"DASH: "+msg)}}
+        else{try{if(dash){dash.reset()}dash=null}catch(ex){}toast("dash.js fail → Shaka try");tryShaka(it,u,opt)}
+      });
+      dash.on(dashjs.MediaPlayer.events.PLAYBACK_ERROR,function(){
+        if(retries++<2){try{dash.seek(V.currentTime||0)}catch(e){}}
+      });
+      try{dash.initialize(V,u,true)}catch(e){fail(it,"DASH init fail: "+(e.message||e))}
+    },function(){fail(it,"dash.js load nahi hui (internet?)")});
   }else if(eng==="mpegts"){
     loadScript(TS_URL).then(function(){
       if(window.mpegts&&mpegts.isSupported()){mp=mpegts.createPlayer({type:extOf(u0)==="flv"?"flv":"mpegts",url:u,isLive:false});mp.attachMediaElement(V);mp.load();go2()}
@@ -3573,18 +3987,20 @@ function bindVideo(){
 V.addEventListener("play",function(){hideEnd();updPlayIcon();showCtl();amN=0;ambStart()});
 V.addEventListener("seeked",function(){amN=0;ambStart()});V.addEventListener("loadeddata",function(){amN=0;ambStart()});
 V.addEventListener("pause",function(){updPlayIcon();showCtl()});
-V.addEventListener("waiting",function(){setLoading(true)});
-V.addEventListener("playing",function(){setLoading(false);showErr("")});
+V.addEventListener("waiting",function(){setLoading(true);onBufferToast()});
+V.addEventListener("playing",function(){setLoading(false);showErr("");preloadNext()});
 V.addEventListener("canplay",function(){setLoading(false)});
 V.addEventListener("progress",updBuf);
 V.addEventListener("timeupdate",function(){
   updTime();updBuf();
   if(CUR&&Date.now()-lastSave>4000&&V.currentTime>1){lastSave=Date.now();saveHist(CUR,V.currentTime,isFinite(V.duration)?V.duration:0)}
+  if(AB.a!==null&&AB.b!==null&&V.currentTime>=AB.b){V.currentTime=AB.a}
   var o=pbv("outro"),d=V.duration;
   if(o>0&&!OUTRO_DONE&&isFinite(d)&&d>o*4&&d-V.currentTime<=o&&V.currentTime>1){OUTRO_DONE=true;V.pause();toast("Outro skipped");onEnded()}
 });
 V.addEventListener("loadedmetadata",function(){
   updTime();if(CUR&&isFinite(V.duration))DUR[CUR.u]=V.duration;
+  if(CUR&&SPD[CUR.u]){V.playbackRate=SPD[CUR.u]}$("#bSpd").textContent=V.playbackRate+"x";
   if(PENDING_FX){PENDING_FX=false;applyAudioFx()}else if(GRAPH||needFx()){applyAudioFx()}
   if(SEEK_AT>1){try{V.currentTime=SEEK_AT}catch(e){}SEEK_AT=0;return}
   var h=CUR&&HIST[CUR.u];
@@ -3628,6 +4044,20 @@ ov.addEventListener("click",function(e){
   else{lastTap=now;tapT=setTimeout(function(){if(isTouch&&!PL.classList.contains("show")&&!V.paused)showCtl();else togglePlay()},260)}
 });
 PL.addEventListener("mousemove",showCtl);PL.addEventListener("touchstart",showCtl,{passive:true});
+var TG={};
+ov.addEventListener("touchstart",function(e){if(e.touches.length!==1){TG={};return}var t_=e.touches[0];TG={x:t_.clientX,y:t_.clientY,m:null,v0:V.volume,b0:pbv("bright"),t0:Date.now()};
+  clearTimeout(TG.holdT);TG.holdT=setTimeout(function(){if(!TG.t0||TG.m)return;HOLD2X=true;HOLD_SPD=V.playbackRate||1;V.playbackRate=Math.max(HOLD_SPD,2);toast("2x (hold)")},450);
+},{passive:true});
+ov.addEventListener("touchend",function(){clearTimeout(TG.holdT);if(HOLD2X){V.playbackRate=HOLD_SPD;HOLD2X=false;toast("1x");$("#bSpd").textContent=V.playbackRate+"x"}TG={};},{passive:true});
+ov.addEventListener("touchcancel",function(){clearTimeout(TG.holdT);if(HOLD2X){V.playbackRate=HOLD_SPD;HOLD2X=false}$("#bSpd").textContent=(V.playbackRate||1)+"x";TG={};},{passive:true});
+ov.addEventListener("touchmove",function(e){
+  if(!e.touches||e.touches.length!==1||TG.x===undefined)return;
+  var t_=e.touches[0],dx=t_.clientX-TG.x,dy=t_.clientY-TG.y,r_=ov.getBoundingClientRect();
+  if(!TG.m){if(Math.abs(dy)>14&&Math.abs(dy)>Math.abs(dx)*1.5){clearTimeout(TG.holdT);if(HOLD2X){V.playbackRate=HOLD_SPD;HOLD2X=false}TG.m=(TG.x-r_.left)<r_.width/2?"b":"v"}else return}
+  var d_=-dy/(r_.height||300);
+  if(TG.m==="v"){V.muted=false;V.volume=Math.min(1,Math.max(0,TG.v0+d_));toast("Volume "+Math.round(V.volume*100)+"%")}
+  else{var b_=Math.round(Math.min(200,Math.max(50,TG.b0+d_*150)));pbset("bright",b_);applyVideoFx();toast("Brightness "+b_+"%")}
+},{passive:true});
 /* menus */
 var menu=$("#menu");
 function openMenu(items,cur,fn){
@@ -3638,13 +4068,25 @@ function openMenu(items,cur,fn){
 }
 $("#bSpd").onclick=function(){
   var sp=[0.25,0.5,0.75,1,1.25,1.5,2,3,4].map(function(s){return {v:s,l:s+"x"}});
-  openMenu(sp,V.playbackRate,function(v){V.playbackRate=v;$("#bSpd").textContent=v+"x"});
+  openMenu(sp,V.playbackRate,setSpeed);
 };
 $("#bQ").onclick=function(){
   if(hls&&hls.levels&&hls.levels.length>1){
     var it=[{v:-1,l:"Auto"}];
     hls.levels.map(function(l,i){return {v:i,l:(l.height?qLabel(l.height):(Math.round(l.bitrate/1000)+"k")),h:l.height||0}}).sort(function(a,b){return b.h-a.h}).forEach(function(x){it.push(x)});
     openMenu(it,hls.currentLevel,function(v){hls.currentLevel=v;updQBtn()});
+  }else if(dash&&dashBitrates().length){
+    var db=dashBitrates(),cur=-1;
+    try{cur=dash.getAutoSwitchQualityFor&&dash.getAutoSwitchQualityFor("video")?-1:(dash.getQualityFor("video")||-1)}catch(e){}
+    var it=[{v:-1,l:"Auto"}];
+    db.map(function(b,i){return {v:i,l:(b.height?qLabel(b.height):(Math.round(b.bitrate/1000)+"k"))+(b.bitrate?" · "+Math.round(b.bitrate/1000)+"k":""),h:b.height||0}}).sort(function(a,b){return b.h-a.h}).forEach(function(x){it.push(x)});
+    openMenu(it,cur,function(v){
+      try{
+        if(v<0){dash.setAutoSwitchQualityFor("video",true)}
+        else{dash.setAutoSwitchQualityFor("video",false);dash.setQualityFor("video",v)}
+      }catch(e){}
+      updQBtn();
+    });
   }else if(hasVariants(CUR)){
     var items=[{v:"auto",l:"Auto"}].concat(CUR.v.map(function(p){return {v:p[0],l:qLabel(p[0])}}));
     openMenu(items,CURQ,setQuality);
@@ -3663,6 +4105,9 @@ $("#bFs").onclick=toggleFs;
 document.addEventListener("keydown",function(e){
   if($("#watch").hidden)return;
   var t=e.target,tn=t&&t.tagName;if(tn==="SELECT"||tn==="TEXTAREA"||(tn==="INPUT"&&t.type!=="range"&&t.type!=="checkbox"))return;
+if(e.key==="i"||e.key==="I"){e.preventDefault();toggleStats();return}
+  if(e.key==="c"||e.key==="C"){e.preventDefault();var tk=V.querySelector("track");if(tk){tk.track.mode=tk.track.mode==="showing"?"hidden":"showing";toast("Captions "+(tk.track.mode==="showing"?"ON":"OFF"))}else toast("Subtitle nahi lagi");return}
+  if(e.key==="s"&&!e.ctrlKey&&!e.metaKey){e.preventDefault();shareTimestamp();return}
   var k=e.key;
   if(k==="Escape"&&!$("#pbm").hidden){pbClose();return}
   if(k===" "||k==="k"){e.preventDefault();togglePlay()}
@@ -3670,6 +4115,7 @@ document.addEventListener("keydown",function(e){
   else if(k==="l"){skip(10,$("#ripR"))}else if(k==="j"){skip(-10,$("#ripL"))}
   else if(k==="ArrowUp"){e.preventDefault();V.volume=Math.min(1,V.volume+.1)}else if(k==="ArrowDown"){e.preventDefault();V.volume=Math.max(0,V.volume-.1)}
   else if(k==="m"){V.muted=!V.muted}else if(k==="f"){toggleFs()}else if(k==="t"){toggleTheater()}
+  else if(k==="."){V.pause();V.currentTime=(V.currentTime||0)+1/30}else if(k===","){V.pause();V.currentTime=Math.max(0,(V.currentTime||0)-1/30)}
   else if(k==="n"){var n=nextItem(1);if(n)go(n)}else if(k==="p"){var p=nextItem(-1);if(p)go(p)}
   else if(/^[0-9]$/.test(k)&&isFinite(V.duration)){V.currentTime=V.duration*(+k)/10}
   if(k!==" ")showCtl();
@@ -3762,6 +4208,84 @@ function showEnd(){
   }
 }
 
+/* ---------- extras: refresh link, speed memory, subtitles, sleep, A-B, shot, audio-only, cast, import ---------- */
+var RFTRIED={},SPD=LS.get("ytb_spd",{}),AB={a:null,b:null},AUDONLY=false,SLEEPT=null,SLEEPEND=0,SUBURL=null;
+function setSpeed(v){V.playbackRate=v;$("#bSpd").textContent=v+"x";if(CUR){if(v===1)delete SPD[CUR.u];else SPD[CUR.u]=v;LS.set("ytb_spd",SPD)}}
+function applyFresh(it,nw){
+  var old=it.u;
+  ["u","th","d","ip","v","rf"].forEach(function(k){if(nw[k]!==undefined)it[k]=nw[k]});
+  if(nw.x!==undefined){it.x=nw.x;if(nw.xa)it.xa=nw.xa;else delete it.xa}else{delete it.x;delete it.xa}
+  if(old!==it.u){
+    delete BYURL[old];BYURL[it.u]=it;
+    [FAV,LATER].forEach(function(m){if(m[old]){delete m[old];m[it.u]=slim(it)}});
+    if(HIST[old]){HIST[it.u]=HIST[old];delete HIST[old];HIST[it.u].it=slim(it)}
+    if(SPD[old]){SPD[it.u]=SPD[old];delete SPD[old];LS.set("ytb_spd",SPD)}
+    LS.set("ytb_hist",HIST);saveLists();
+  }
+}
+function refreshItem(it,cb){
+  if(!it.rf){cb(false);return}
+  fetch(it.rf).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||"fail");return j})})
+    .then(function(nw){applyFresh(it,nw);cb(true)}).catch(function(){cb(false)});
+}
+function refreshAll(list,done){
+  var todo=list.filter(function(x){return x.rf}),i=0,okn=0,run=0,fin=0;
+  if(!todo.length){toast("Is list me refresh-able link nahi");return}
+  function next(){
+    if(fin>=todo.length){toast("\uD83D\uDD04 "+okn+"/"+todo.length+" links refresh hui");if(done)done();return}
+    while(run<3&&i<todo.length){(function(it){run++;i++;refreshItem(it,function(ok){if(ok)okn++;run--;fin++;toast("Refresh "+fin+"/"+todo.length);next()})})(todo[i])}
+  }
+  next();
+}
+function srt2vtt(t){return "WEBVTT\n\n"+String(t).replace(/\r/g,"").replace(/(\d+:\d+:\d+),(\d+)/g,"$1.$2")}
+function setSub(vtt,label){
+  var old=V.querySelector("track");if(old)old.remove();
+  if(SUBURL){try{URL.revokeObjectURL(SUBURL)}catch(e){}SUBURL=null}
+  if(!vtt){toast("Subtitles off");return}
+  SUBURL=URL.createObjectURL(new Blob([vtt],{type:"text/vtt"}));
+  var tr=document.createElement("track");tr.kind="subtitles";tr.label=label||"Sub";tr.srclang="en";tr.src=SUBURL;tr.default=true;V.appendChild(tr);
+  try{tr.track.mode="showing"}catch(e){}
+  toast("Subtitles on");
+}
+function pickFile(accept,cb){
+  var i=document.createElement("input");i.type="file";i.accept=accept;
+  i.onchange=function(){var f=i.files&&i.files[0];if(!f)return;var rd=new FileReader();rd.onload=function(){cb(String(rd.result||""))};rd.readAsText(f)};
+  i.click();
+}
+function parseLinks(txt){
+  var out=[],pend=null;
+  String(txt).split(/\r?\n/).forEach(function(ln){
+    ln=ln.trim();if(!ln)return;
+    if(/^#EXTINF/i.test(ln)){pend=(ln.split(",").slice(1).join(",")||"").trim();return}
+    if(ln[0]==="#")return;
+    var m=ln.match(/(https?:\/\/[^\s"<>]+)/);
+    if(!m){var mt=ln.match(/^(?:\d+[.)]\s*)?Title\s*:\s*(.+)$/i);if(mt)pend=mt[1].trim();return}
+    var t_=ln.slice(0,m.index).replace(/^\d+[.)]\s*/,"").replace(/[\s:\-|>]+$/,"").trim()||pend||domainOf(m[1])||"Video";
+    out.push({t:t_.slice(0,200),u:m[1],k:"VIDEO",p:"",th:"",d:0,v:[]});pend=null;
+  });
+  return out;
+}
+function setSleep(min){
+  clearTimeout(SLEEPT);SLEEPT=null;SLEEPEND=0;
+  if(!min){toast("Sleep timer off");return}
+  SLEEPEND=Date.now()+min*60000;
+  SLEEPT=setTimeout(function(){V.pause();toast("Sleep timer: pause kar diya");SLEEPT=null;SLEEPEND=0},min*60000);
+  toast("Sleep timer: "+min+" min");
+}
+function shot(){
+  var msg="CORS ki wajah se screenshot nahi ho sakta (Bot proxy on karke try karo)";
+  try{
+    var c=document.createElement("canvas");c.width=V.videoWidth;c.height=V.videoHeight;if(!c.width){toast("Video abhi load nahi hui");return}
+    c.getContext("2d").drawImage(V,0,0);
+    c.toBlob(function(b){if(!b){toast(msg);return}var a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="screenshot.png";document.body.appendChild(a);a.click();a.remove();toast("Screenshot saved")},"image/png");
+  }catch(e){toast(msg)}
+}
+function toggleAudOnly(){AUDONLY=!AUDONLY;V.style.visibility=AUDONLY?"hidden":"";$("#aud").hidden=!(AUDONLY||(CUR&&isAudio(CUR)));toast(AUDONLY?"Audio-only ON":"Audio-only OFF")}
+function castTV(){
+  if(V.remote&&V.remote.prompt){V.remote.prompt().catch(function(){toast("Koi device nahi mila")})}
+  else toast("Is browser me Cast/AirPlay supported nahi (Chrome ya Safari use karo)");
+}
+
 /* ---------- Play URL box (MPD + ClearKey, cookie, proxy) ---------- */
 function openUrlBox(){
   var old=$("#ubox");if(old)old.remove();
@@ -3828,6 +4352,7 @@ function renderPb(level){
     ar.onclick=function(){amset("enabled",!amv("enabled",true));asw.className="sw"+(amv("enabled",true)?" on":"")};box.appendChild(ar);
     box.appendChild(nav("Ambient settings","Blur, spread, intensity, fps","amb"));
     var pu=el("div","row2"),put=el("div");put.appendChild(el("div","","\uD83D\uDD17  Play URL (MPD / key / cookie)"));put.appendChild(el("small","","Koi bhi link paste karke chalao"));pu.appendChild(put);pu.onclick=function(){pbClose();openUrlBox()};box.appendChild(pu);
+    box.appendChild(nav("More tools","Subtitles, sleep timer, A-B repeat, refresh, screenshot, cast...","tools"));
     if(CFG.px){var xr=el("div","row2"),xt=el("div");xt.appendChild(el("div","","\uD83D\uDEE1  Bot proxy (acctoken / IP-lock links)"));xt.appendChild(el("small","","Stream bot ke through chalegi (same IP + Referer)"));
       var xs=el("div","sw"+(LS.get("ytb_px",true)?" on":""));xr.appendChild(xt);xr.appendChild(xs);xr.onclick=function(){LS.set("ytb_px",!LS.get("ytb_px",true));xs.className="sw"+(LS.get("ytb_px",true)?" on":"");if(CUR&&CUR.x)loadItem(CUR,{keepQ:true,at:V.currentTime})};box.appendChild(xr)}
     if(CUR){
@@ -3839,7 +4364,7 @@ function renderPb(level){
     var chips=el("div","chips2");
     [0.25,0.5,1,1.5,2].forEach(function(s){
       var c=el("div","chip2"+(V.playbackRate===s?" on":""),s+"x");
-      c.onclick=function(){V.playbackRate=s;$("#bSpd").textContent=s+"x";renderPb("play")};chips.appendChild(c);
+      c.onclick=function(){setSpeed(s);renderPb("play")};chips.appendChild(c);
     });
     box.appendChild(chips);
     box.appendChild(sw("\u26F6  Zoom to fill",null,"zoom"));
@@ -3850,6 +4375,36 @@ function renderPb(level){
     box.appendChild(slider("Skip intros automatically (pehle N sec)","intro",0,120,5,secs));
     box.appendChild(slider("Skip end credits automatically (aakhri N sec)","outro",0,120,5,secs));
     box.appendChild(nav("Advanced color","Contrast, saturation, warmth","color"));
+  }else if(PBLEVEL==="tools"){
+    box.appendChild(hd("More tools","main"));
+    function rowBtn(label,sub,fn){var r=el("div","row2"),t_=el("div");t_.appendChild(el("div","",label));if(sub)t_.appendChild(el("small","",sub));r.appendChild(t_);r.onclick=fn;box.appendChild(r);return r}
+    if(CUR&&CUR.rf)rowBtn("\uD83D\uDD04  Refresh this link","Expire link ka naya stream page se",function(){pbClose();setLoading(true);refreshItem(CUR,function(ok){if(ok){toast("Naya link mil gaya");loadItem(CUR,{keepQ:true})}else{setLoading(false);toast("Naya link nahi mila")}})});
+    var rl=upList().filter(function(x){return x.rf});
+    if(rl.length)rowBtn("\uD83D\uDD04  Refresh all links ("+rl.length+")","Poori list ki links dobara nikalo",function(){pbClose();refreshAll(rl,function(){LIST=[];renderGrid()})});
+    rowBtn("\uD83D\uDCAC  Subtitles","File ya URL (.srt / .vtt)",function(){renderPb("subs")});
+    rowBtn("\uD83D\uDCCA  Live stats","Resolution / bitrate / buffer (i key)",function(){toggleStats();renderPb("tools")});
+    rowBtn("\uD83D\uDD0A  Audio track",(function(){var a=listAudioTracks();return a.length?(a.length+" tracks"):"Single / N/A"})(),function(){
+      var a=listAudioTracks();if(!a.length){toast("Extra audio track nahi");return;}
+      openMenu(a.map(function(x){return {v:x.v,l:x.l}}),-1,function(v){setAudioTrack(v)});
+    });
+    rowBtn("\u23F2  Sleep timer",SLEEPEND?("Band hoga: "+Math.max(1,Math.round((SLEEPEND-Date.now())/60000))+" min me"):"15 / 30 / 60 / 90 min",function(){renderPb("sleep")});
+    var ab=rowBtn("\uD83D\uDD01  A-B repeat",AB.a===null?"A point set karo":(AB.b===null?"A="+fmtTime(AB.a)+" | ab B set karo":"A="+fmtTime(AB.a)+" B="+fmtTime(AB.b)+" (clear karne ko tap)"),function(){
+      if(AB.a===null){AB.a=V.currentTime||0;toast("A = "+fmtTime(AB.a))}else if(AB.b===null){if((V.currentTime||0)<=AB.a){toast("B, A ke baad hona chahiye");return}AB.b=V.currentTime;toast("Repeat on")}else{AB.a=AB.b=null;toast("A-B repeat off")}renderPb("tools")});
+    rowBtn("\uD83D\uDD17  Share timestamp","Current time wali link copy (s key)",function(){shareTimestamp();pbClose()});
+    rowBtn("\uD83D\uDCF8  Screenshot","Current frame PNG",function(){shot()});
+    rowBtn("\uD83C\uDFA7  Audio only: "+(AUDONLY?"ON":"OFF"),"Screen band, awaaz chalti rahe",function(){toggleAudOnly();renderPb("tools")});
+    rowBtn("\uD83D\uDCFA  Cast to TV","Chromecast / AirPlay (browser support par)",function(){castTV()});
+    rowBtn("\uD83D\uDCE5  Import list (.m3u / .txt)","Links ki file se playlist banao",function(){pickFile(".m3u,.m3u8,.txt",function(txt){var its=parseLinks(txt);if(!its.length){toast("File me link nahi mila");return}its.forEach(function(x){if(!BYURL[x.u]){BYURL[x.u]=x;ALL.push(x);DATA.push(x)}});LIST=[];updChips();renderGrid();toast(its.length+" links import hui")})});
+    rowBtn("\uD83D\uDCE4  Export library (JSON)","Favorites, watch later, history backup",function(){var b=new Blob([JSON.stringify({fav:FAV,later:LATER,hist:HIST})],{type:"application/json"}),a_=document.createElement("a");a_.href=URL.createObjectURL(b);a_.download="library.json";document.body.appendChild(a_);a_.click();a_.remove();toast("library.json download")});
+  }else if(PBLEVEL==="subs"){
+    box.appendChild(hd("Subtitles","tools"));
+    var su=el("div","sl"),sinp=el("input");sinp.placeholder="https://.../sub.vtt (CORS allow ho)";sinp.style.width="100%";su.appendChild(sinp);box.appendChild(su);
+    var go_=el("div","row2");go_.appendChild(el("div","","\u25B6  URL se load karo"));go_.onclick=function(){var u_=sinp.value.trim();if(!/^https?:/i.test(u_)){toast("Valid URL daalo");return}fetch(u_).then(function(r){return r.text()}).then(function(tx){setSub(/^\uFEFF?WEBVTT/.test(tx)?tx:srt2vtt(tx),"URL")}).catch(function(){toast("Subtitle load nahi hui (CORS?) - file se try karo")})};box.appendChild(go_);
+    var fl=el("div","row2");fl.appendChild(el("div","","\uD83D\uDCC2  File se load karo (.srt / .vtt)"));fl.onclick=function(){pickFile(".srt,.vtt",function(tx){setSub(/^\uFEFF?WEBVTT/.test(tx)?tx:srt2vtt(tx),"File")})};box.appendChild(fl);
+    var off=el("div","row2");off.appendChild(el("div","","\u2715  Subtitles off"));off.onclick=function(){setSub(null)};box.appendChild(off);
+  }else if(PBLEVEL==="sleep"){
+    box.appendChild(hd("Sleep timer","tools"));
+    var chs=el("div","chips2");[["Off",0],["15 min",15],["30 min",30],["60 min",60],["90 min",90]].forEach(function(p_){var c_=el("div","chip2",p_[0]);c_.onclick=function(){setSleep(p_[1]);renderPb("sleep")};chs.appendChild(c_)});box.appendChild(chs);
   }else if(PBLEVEL==="amb"){
     box.appendChild(hd("Ambient light","main"));
     function asl(label,key,min,max,step,fmt){
@@ -3912,12 +4467,12 @@ function renderUpnext(it){
 function showWatch(i){
   var it=ALL[i];if(!it){location.hash="#/";return}
   CUR=it;LIST=LIST.length?LIST:computeList();
-  $("#home").hidden=true;chipsEl.hidden=true;$("#watch").hidden=false;
+  $("#home").hidden=true;chipsEl.hidden=true;$("#watch").hidden=false;tgBack(true);
   $("#dimT").textContent=it.t||"";pbClose();renderMeta(it);renderUpnext(it);loadItem(it);setSession(it);applyAmb();window.scrollTo(0,0);showCtl();
 }
 function showHome(){
   if(!$("#watch").hidden){hideEnd();pbClose();cancelAnimationFrame(amRaf);amRaf=0;destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title+(CFG.owner?" | "+CFG.owner:"")}
-  $("#home").hidden=false;chipsEl.hidden=false;renderGrid();updChips();
+  $("#home").hidden=false;chipsEl.hidden=false;tgBack(false);renderGrid();updChips();
 }
 function route(){var m=location.hash.match(/^#\/w\/(\d+)/);if(m)showWatch(+m[1]);else showHome()}
 
@@ -3946,16 +4501,18 @@ function loadItems(items){
   VIEW.chip="all";LIST=[];updChips();renderGrid();
 }
 function startScrape(){
-  var u=$("#murl").value.trim();if(!/^https?:\/\//i.test(u)){toast("Valid URL daalo");return}
+  var urls=$("#murl").value.split(/\s+/).filter(function(x){return /^https?:\/\//i.test(x)});
+  if(!urls.length){toast("Valid URL daalo");return}
   setMsg("Shuru ho raha hai...");$("#mgo").disabled=true;$("#mstop").hidden=false;$("#mpost").hidden=true;
-  api("/api/scrape",{url:u,start:1,end:+$("#mpages").value}).then(function(r){MJOB=r.id;pollJob()})
+  var body=urls.length>1?{urls:urls.slice(0,10),start:1,end:+$("#mpages").value}:{url:urls[0],start:1,end:+$("#mpages").value};
+  api("/api/scrape",body).then(function(r){MJOB=r.id;pollJob()})
    .catch(function(e){setMsg("\u274C "+e.message);$("#mgo").disabled=false;$("#mstop").hidden=true});
 }
 function pollJob(){
   api("/api/job?id="+MJOB).then(function(j){
-    if(j.status==="running"){setMsg(j.total?("Extracting "+j.done+"/"+j.total):"Pages scan ho rahe hain...");setTimeout(pollJob,1200);return}
+    if(j.status==="running"){setMsg((j.part?("URL "+j.part+" - "):"")+(j.total?("Extracting "+j.done+"/"+j.total):"Pages scan ho rahe hain..."));setTimeout(pollJob,1200);return}
     $("#mgo").disabled=false;$("#mstop").hidden=true;
-    if(j.status==="done"){lastItems=j.items;loadItems(j.items);setMsg("\u2705 "+j.items.length+" videos mile"+(j.items.length?"":" (bot me /debug <url> se check karo)"));$("#mpost").hidden=!j.items.length}
+    if(j.status==="done"){tgHaptic();lastItems=j.items;loadItems(j.items);setMsg("\u2705 "+j.items.length+" videos mile"+(j.items.length?"":" (bot me /debug <url> se check karo)"));$("#mpost").hidden=!j.items.length}
     else setMsg("\u274C "+(j.error||"fail"));
   }).catch(function(e){setMsg("\u274C "+e.message);$("#mgo").disabled=false;$("#mstop").hidden=true});
 }
@@ -3967,12 +4524,15 @@ function playlistsMenu(anchor){
     es.push({t:"\uD83D\uDDD1  Delete: "+p.name,f:function(){LIBR.splice(i,1);pushNow();toast("Playlist deleted")}});
   });
   if(!es.length)es.push({t:"Koi playlist nahi (scrape ke baad Save dabao)",f:function(){}});
+  es.push({t:"\uD83D\uDD17  Manage share links",f:function(){api("/api/shares").then(function(r){
+    var xs=r.shares.map(function(s_){return {t:"\uD83D\uDDD1 Revoke: "+s_.name+" ("+(s_.expires?new Date(s_.expires*1000).toLocaleDateString():"never")+")",f:function(){api("/api/share/revoke",{token:s_.token}).then(function(){toast("Link band kar di")})}}});
+    if(!xs.length)xs.push({t:"Koi active share link nahi",f:function(){}});showPop(anchor,xs)}).catch(function(e){toast("\u274C "+e.message)})}});
   showPop(anchor,es);
 }
 /* ---- share + admin ---- */
 function shareItems(items,name){
   if(!items||!items.length){toast("Pehle scrape karo");return}
-  api("/api/share",{name:name,items:items}).then(function(r){var l=r.link||r.web;copy(l);setMsg("\uD83D\uDD17 Share link copy ho gaya: "+l)}).catch(function(e){toast("\u274C "+e.message)});
+  api("/api/share",{name:name,items:items,days:7}).then(function(r){var l=r.link||r.web;copy(l);setMsg("\uD83D\uDD17 Share link copy ho gaya: "+l)}).catch(function(e){toast("\u274C "+e.message)});
 }
 var ADM=null,ADMTAB="sites";
 function admLoad(tab){api("/api/admin/overview").then(function(o){ADM=o;renderAdmin(tab||ADMTAB)}).catch(function(e){toast("\u274C "+e.message)})}
@@ -3981,7 +4541,7 @@ function openAdmin(){var b=$("#adm");if(!b){b=el("div","adm");b.id="adm";documen
 function renderAdmin(tab){
   ADMTAB=tab;var box=$("#adm");box.textContent="";
   var hd=el("div","ahd"),x=el("button","act","\u2715 Close");x.onclick=function(){box.hidden=true};hd.appendChild(el("b","","\uD83D\uDEE0 Admin"));hd.appendChild(x);box.appendChild(hd);
-  var tabs=el("div","atabs");[["sites","Sites"],["cookies","Cookies"],["jobs","Jobs"],["settings","Settings"],["users","Users"]].forEach(function(t_){var b=el("button","chip"+(tab===t_[0]?" on":""),t_[1]);b.onclick=function(){renderAdmin(t_[0])};tabs.appendChild(b)});box.appendChild(tabs);
+  var tabs=el("div","atabs");[["sites","Sites"],["health","Health"],["cookies","Cookies"],["jobs","Jobs"],["settings","Settings"],["users","Users"]].forEach(function(t_){var b=el("button","chip"+(tab===t_[0]?" on":""),t_[1]);b.onclick=function(){renderAdmin(t_[0])};tabs.appendChild(b)});box.appendChild(tabs);
   var body=el("div");box.appendChild(body);
   function row(txt,btns){var r=el("div","arow"),l=el("div","l",txt);r.appendChild(l);(btns||[]).forEach(function(b){r.appendChild(b)});body.appendChild(r);return r}
   function btn(t_,f){var b=el("button","",t_);b.onclick=f;return b}
@@ -4000,6 +4560,7 @@ function renderAdmin(tab){
     if(ADM.jobs.length)body.appendChild(btn("\u23F9 Cancel all",function(){admDo("/api/admin/job",{all:true},"Sab ko stop request")}));
   }else if(tab==="settings"){
     row("Bot proxy: "+(ADM.proxy||"PROXY_BASE set nahi"));
+    if(ADM.px_usage)row("\uD83D\uDEE1 Proxy aaj: "+ADM.px_usage.total_mb+" MB"+(ADM.px_usage.ips.length?" | top: "+ADM.px_usage.ips.map(function(p_){return p_[0]+" "+p_[1]+"MB"}).join(", "):""));
     Object.keys(ADM.settings).forEach(function(k){
       var v=ADM.settings[k],r=row(k+": ",[]);
       if(["verify","ytdlp","keep_preview"].indexOf(k)>-1){r.appendChild(btn(v==="1"||(k==="ytdlp"&&v!=="0")?"ON":"OFF",function(){var on=(v==="1")||(k==="ytdlp"&&v!=="0");admDo("/api/admin/setting",{key:k,value:on?"off":"on"},k+" updated")}))}
@@ -4008,20 +4569,26 @@ function renderAdmin(tab){
     });
     Object.keys(ADM.prefer).forEach(function(d){row("\u2B50 prefer "+d+": "+ADM.prefer[d].join(", "),[btn("Clear",function(){admDo("/api/admin/prefer",{site:d,host:"off"},"prefer clear")})])});
     form([["input","prefer: site (rusvideos.love)"],["input","asli video host (ebacdn.net)"]],"\u2B50 Set prefer host",function(i){admDo("/api/admin/prefer",{site:i[0].value,host:i[1].value},"prefer set")});
+  }else if(tab==="health"){
+    if(!ADM.health.length)row("Abhi data nahi (kuch scrape chalao)");
+    ADM.health.forEach(function(h_){row((h_.last>=0.7?"\uD83D\uDFE2 ":(h_.last>=0.3?"\uD83D\uDFE1 ":"\uD83D\uDD34 "))+h_.domain+": "+Math.round(h_.last*100)+"% (avg "+Math.round(h_.avg*100)+"%, "+h_.runs+" runs)")});
   }else if(tab==="users"){
     ADM.users.forEach(function(u){row((u===ADM.admin?"\uD83D\uDC51 ":"\uD83D\uDC64 ")+u,u===ADM.admin?[]:[btn("Remove",function(){admDo("/api/admin/user",{action:"remove",id:u},"User hata diya")})])});
     form([["input","Telegram user id"]],"\u2795 Add user",function(i){admDo("/api/admin/user",{action:"add",id:+i[0].value},"User add")});
   }
 }
+function tgBack(on){if(!TGW||!TGW.BackButton)return;try{if(on){TGW.BackButton.show();if(!tgBack.b){tgBack.b=1;TGW.BackButton.onClick(function(){location.hash="#/"})}}else TGW.BackButton.hide()}catch(e){}}
+function tgHaptic(){try{if(TGW&&TGW.HapticFeedback)TGW.HapticFeedback.notificationOccurred("success")}catch(e){}}
 function initMini(){
   $("#mbar").hidden=false;
   $("#mgo").onclick=startScrape;$("#mstop").onclick=function(){api("/api/stop",{}).then(function(){setMsg("Stop request bheji...")})};
   $("#mpl").onclick=function(e){e.stopPropagation();playlistsMenu(this)};
   $("#mshare").onclick=function(){shareItems(lastItems,(domainOf((lastItems[0]||{}).p||(lastItems[0]||{}).u||"")||"Playlist"))};
   $("#madmin").onclick=openAdmin;
+  $("#mrf").onclick=function(){setMsg("Links refresh ho rahi hain...");refreshAll(lastItems,function(){LIST=[];renderGrid();setMsg("\u2705 Refresh poora");pushNow()})};
   $("#msave").onclick=function(){if(!lastItems.length)return;LIBR.unshift({name:(domainOf(lastItems[0].p||lastItems[0].u)||"scrape")+" "+new Date().toLocaleDateString(),ts:Date.now(),items:lastItems});LIBR=LIBR.slice(0,8);pushNow().then(function(){toast("Playlist saved (sab devices me)")})};
   $("#msend").onclick=function(){api("/api/send",{items:lastItems.map(function(x){return {t:x.t,u:x.u}})}).then(function(r){toast("Chat me bhej diya ("+r.n+")")}).catch(function(e){toast("\u274C "+e.message)})};
-  $("#mwatch").onclick=function(){api("/api/watch",{action:"add",url:$("#murl").value.trim(),minutes:60}).then(function(r){toast("Watch #"+r.id+" add (har 60 min)")}).catch(function(e){toast("\u274C "+e.message)})};
+  $("#mwatch").onclick=function(){api("/api/watch",{action:"add",url:($("#murl").value.trim().split(/\s+/)[0]||""),minutes:60}).then(function(r){toast("Watch #"+r.id+" add (har 60 min)")}).catch(function(e){toast("\u274C "+e.message)})};
   loadScript("https://telegram.org/js/telegram-web-app.js").then(null,function(){}).then(function(){
     TGW=window.Telegram&&Telegram.WebApp;
     if(!TGW||!TGW.initData){setMsg("\u26A0 Ye page Telegram Mini App ke andar kholo (bot me /app)");$("#mgo").disabled=true;return}
@@ -4067,7 +4634,7 @@ else{
   if(CFG.owner){var lo=$("#lockOwn"),la=el("a","","by "+CFG.owner);la.href=CFG.tg||"#";la.target="_blank";la.rel="noopener noreferrer";lo.appendChild(la)}
   $("#pwb").onclick=unlock;$("#pw").onkeydown=function(e){if(e.key==="Enter")unlock()};
 }
-window.__ytb={pushNow:function(){return pushNow()},amb:function(){return {AM:AM,AMS:AMS,n:amN,bars:amBars}},pb:function(){return PB},fx:function(){return {graph:GRAPH,cors:CORS_LOAD,blocked:CORS_BLOCK}},cur:function(){return {q:CURQ,u:CURURL}},sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
+window.__ytb={refresh:refreshItem,applyFresh:applyFresh,parseLinks:parseLinks,srt2vtt:srt2vtt,AB:function(){return AB},spd:function(){return SPD},sleep:function(){return SLEEPEND},pushNow:function(){return pushNow()},amb:function(){return {AM:AM,AMS:AMS,n:amN,bars:amBars}},pb:function(){return PB},fx:function(){return {graph:GRAPH,cors:CORS_LOAD,blocked:CORS_BLOCK}},cur:function(){return {q:CURQ,u:CURURL}},sha256:hashPw,fmtOf:fmtOf,engineOf:engineOf,computeList:computeList,state:function(){return {ALL:ALL,VIEW:VIEW,FAV:FAV}}};
 })();
 </script>
 </body>
@@ -4096,11 +4663,14 @@ def load_ambient_cfg() -> dict:
 
 
 def _px_fields(it: dict) -> dict:
+    d: dict = {}
+    if PROXY_BASE and str(it.get("page_url") or "").startswith("http"):
+        d["rf"] = rf_url(it["page_url"])                 # expire link ko page se dobara nikalne ke liye
     mode = (get_setting("proxy") or "auto").lower()
     u = it["download_link"]
     if not PROXY_BASE or mode == "off" or (it.get("type") or "VIDEO") in ("IMAGE", "PDF") or not u.startswith("http"):
-        return {}
-    d = {"x": px_url(u, it.get("page_url") or "")}
+        return d
+    d["x"] = px_url(u, it.get("page_url") or "")
     if mode == "on" or px_needs(u, it.get("iplock") or ""):
         d["xa"] = 1
     return d
@@ -4145,9 +4715,147 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 Features:\n"
         "1. Full Web Player UI: Custom Video & Media Player interface in HTML.\n"
         "2. 4 Files Export: 2 TXT & 2 HTML Files (Full Web App + Simple List).\n"
-        "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n\n"
-        "🛠️ Commands: /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /sniff, /prefer, /sky, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup, /app (Mini App)"
+        "3. FFmpeg Downloader: Upload .txt file to auto-download & send video.\n4. ZIP pack of all result files + M3U/JSON/CSV exports.\n5. DASH quality + Shaka fallback, hold-to-2x, live stats, share timestamp.\n6. Scrape cache (8 min), cookie age alerts, watch monitor.\n\n"
+        "📖 /help — saari commands + usage\n\n🛠️ Commands: /help, /site, /scr, /addsite, /addscr, /delscr, /removesite, /login, /logout, /cookie, /updatecookie, /stop, /stats, /userlist, /debug, /dump, /sniff, /prefer, /sky, /settings, /jobs, /cancel, /watch, /watchlist, /unwatch, /backup, /app, /mini, /restart, /updatewithoutrestart, /cleanup_backups, /adscr, /health"
     )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/help -> saari commands + usage (user vs admin)."""
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        await update.message.reply_text("⛔ Access Denied!")
+        return
+    user_help = (
+        "📖 <b>HELP — Commands &amp; Usage</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🚀 SCRAPE / EXTRACT</b>\n"
+        "• <code>/scr &lt;url&gt;</code> — listing scrape (default pages 1–10)\n"
+        "• <code>/scr &lt;url&gt; 5</code> — sirf page 5\n"
+        "• <code>/scr &lt;url&gt; 1-15</code> — pages 1 se 15\n"
+        "• <code>/scr &lt;url&gt; all</code> — max pages auto (jab tak naye links aayein)\n"
+        "• Seedhe <b>URL paste</b> (command ke bina) — wahi scrape flow\n"
+        "• <code>/stop</code> ya <code>/cancel</code> — apna chal raha scrape rok do\n"
+        "• <code>/jobs</code> — abhi kaunse jobs chal rahe hain\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🌐 SITES</b>\n"
+        "• <code>/site</code> — supported / custom sites list\n"
+        "• <code>/addsite example.com</code> — naya domain add\n"
+        "• <code>/addsite example.com cookie=...</code> — domain + cookie\n"
+        "• <code>/removesite example.com</code> — custom site hatao\n"
+        "• <code>/addscr</code> — site-specific link shapes / regex rules\n"
+        "• <code>/delscr example.com</code> — rule delete\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🔑 LOGIN / COOKIES</b>\n"
+        "• <code>/login domain cookie_string</code> — session cookie save\n"
+        "• <code>/logout domain</code> — cookie hatao\n"
+        "• <code>/updatecookie domain</code> — cookie update flow\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🎬 PLAYER / FILES</b>\n"
+        "• Scrape ke baad: <b>2 TXT + 2 HTML + ZIP</b> (full player + simple)\n"
+        "• <code>/sky</code> — agli TXT/M3U se YouTube-style HTML player\n"
+        "• <code>/sky My Playlist</code> — title ke sath\n"
+        "• <code>/sky off</code> — sky mode band\n"
+        "• File caption me <code>/sky</code> likh ke TXT bhejo\n"
+        "• <code>/app</code> / <code>/mini</code> — Telegram Mini App player\n• <code>/commands</code> — /help ka alias\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>👁 WATCH (auto new videos)</b>\n"
+        "• <code>/watch &lt;listing_url&gt; [minutes]</code> — default 60 min\n"
+        "  Example: <code>/watch https://site.com/new 30</code>\n"
+        "• <code>/watchlist</code> — apni watches\n"
+        "• <code>/unwatch &lt;id&gt;</code> — watch hatao\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>ℹ️ UTILS</b>\n"
+        "• <code>/start</code> — bot intro\n"
+        "• <code>/help</code> — yeh message\n"
+        "• <code>/stats</code> — usage / status\n"
+        "• <code>/stop</code> — scrape stop\n"
+        "• <code>/cancel</code> — jobs stop (apne)\n\n"
+        "📦 Exports: Full TXT, Simple TXT, Full HTML player, Simple HTML, ZIP, "
+        "optional M3U/JSON/CSV (<code>/settings export</code> — admin).\n\n"
+        f"👑 Owner: {BOT_OWNER_NAME}"
+    )
+    await update.message.reply_text(user_help, parse_mode="HTML", disable_web_page_preview=True)
+
+    if uid == ADMIN_ID:
+        admin_help = (
+            "🔐 <b>ADMIN ONLY</b>\n\n"
+            "• <code>/adduser &lt;id&gt;</code> / <code>/removeuser &lt;id&gt;</code> / <code>/userlist</code>\n"
+            "• <code>/cookie &lt;domain&gt;</code> — id+pass se login, cookies nikaalo\n"
+            "• <code>/cookie domain https://.../api/login</code> — API login save\n"
+            "• <code>/debug &lt;url&gt;</code> — fetch/status diagnose\n"
+            "• <code>/dump &lt;url&gt;</code> — page dump\n"
+            "• <code>/sniff &lt;video_page_url&gt;</code> — stream kahan milti hai\n"
+            "• <code>/prefer &lt;site&gt; &lt;host_or_url&gt;</code> — asli CDN host priority\n"
+            "• <code>/prefer &lt;site&gt; off</code> — prefer clear\n"
+            "• <code>/settings</code> — verify, ytdlp, min_quality, include/exclude, export, proxy\n"
+            "• <code>/settings verify on</code> | <code>min_quality 720</code> | <code>export m3u,json</code>\n"
+            "• <code>/settings reset</code>\n"
+            "• <code>/backup</code> — DB backup file\n"
+            "• Restore: <code>bot_data.db</code> bhejo, caption me <code>restore</code>\n"
+            "• <code>/sbsync</code> / <code>/sbrestore</code> — Supabase storage sync\n"
+            "• <code>/health</code> — site success rates + purani cookies\n"
+            "• <code>/cancel all</code> — saari jobs stop\n"
+            "• <code>/turbo</code> — ultra-fast scrape limits (is session)\n"
+            "• <code>/turbo off</code> — normal limits wapas\n"
+            "• <code>/restart</code> — bot process restart (host auto-start)\n"
+            "• <code>/updatewithoutrestart</code> — cookies/rules/settings live reload\n"
+            "• <code>/cleanup_backups</code> — temp files + purani DB rows + caches saaf\n"
+            "• <code>/adscr</code> — alias of /addscr\n"
+            "• <code>/mini</code> — alias of /app (Mini App)\n"
+            "• <code>/commands</code> — alias of /help\n\n"
+            "⚡ Speed env (optional): <code>SCR_CONCURRENCY</code>, <code>SCR_PAGE_CONCURRENCY</code>, "
+            "<code>SCR_ALL_MAX</code>, <code>PROXY_URL</code>, <code>PROXY_BASE</code>"
+        )
+        await update.message.reply_text(admin_help, parse_mode="HTML", disable_web_page_preview=True)
+
+
+
+async def turbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/turbo [off] — admin: is process me scrape limits ultra-high."""
+    global SCR_CONCURRENCY, SCR_PAGE_CONCURRENCY
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = [a.lower() for a in (context.args or [])]
+    if args and args[0] in ("off", "normal", "0"):
+        SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "48"))
+        SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "20"))
+        await update.message.reply_text(
+            f"♻️ Turbo OFF — concurrency={SCR_CONCURRENCY}, page={SCR_PAGE_CONCURRENCY}")
+        return
+    SCR_CONCURRENCY = max(SCR_CONCURRENCY, int(os.getenv("TURBO_CONCURRENCY", "72")))
+    SCR_PAGE_CONCURRENCY = max(SCR_PAGE_CONCURRENCY, int(os.getenv("TURBO_PAGE_CONCURRENCY", "28")))
+    await update.message.reply_text(
+        f"🚀 TURBO ON (is process)\n"
+        f"• Video extract parallel: {SCR_CONCURRENCY}\n"
+        f"• Listing page parallel: {SCR_PAGE_CONCURRENCY}\n"
+        f"• Thread workers: {os.getenv('SCR_WORKERS', '96')}\n\n"
+        f"Band: /turbo off\n"
+        f"Permanent ke liye env: SCR_CONCURRENCY / SCR_PAGE_CONCURRENCY / SCR_WORKERS")
+
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/health -> har site ka recent success rate (admin)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    rows = health_overview()
+    if not rows:
+        await update.message.reply_text("📭 Abhi koi scrape data nahi (kuch scrape chalao).")
+        return
+    ic = lambda r: "🟢" if r >= 0.7 else ("🟡" if r >= 0.3 else "🔴")
+    u = px_usage_info()
+    await update.message.reply_text("🩺 Site health (last run | avg of 5)\n" + "\n".join(
+        f"{ic(x['last'])} {x['domain']}: {x['last']:.0%} | {x['avg']:.0%} ({x['runs']} runs)" for x in rows[:30])
+        + f"\n\n🛡 Proxy aaj: {u['total_mb']} MB")
+
+
+    # cookie freshness
+    try:
+        oldc = cookie_age_warnings(14)
+        if oldc:
+            await update.message.reply_text("🍪 Cookies 14+ din purani (re-login socho):\n" + "\n".join(oldc[:15]))
+    except Exception:
+        pass
 
 async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/app -> Mini App kholne ka button."""
@@ -4169,13 +4877,22 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(context.args[0])
         add_user_db(uid)
         await update.message.reply_text(f"✅ User `{uid}` added.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Usage: /adduser <telegram_user_id>
+Example: /adduser 123456789")
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
+        if uid == ADMIN_ID:
+            await update.message.reply_text("❌ Admin khud ko remove nahi kar sakta.")
+            return
         remove_user_db(uid)
         await update.message.reply_text(f"🗑 User `{uid}` removed.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Usage: /removeuser <telegram_user_id>
+Example: /removeuser 123456789")
 
 async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id): return
@@ -4189,11 +4906,34 @@ async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id): return
     users_count = len(get_all_users())
+    jobs_n = len(JOBS)
+    sites_n = len(get_all_sites())
+    cookies_n = len(list_cookie_domains())
+    watches_n = len(watch_rows(None if update.effective_user.id == ADMIN_ID else update.effective_user.id))
+    px = "ON" if PROXY_BASE else "OFF"
+    conc = f"{SCR_CONCURRENCY}/{SCR_PAGE_CONCURRENCY}"
     await update.message.reply_text(
-        f"📊 Bot Status:\n\n"
-        f"• Authorized Users: {users_count}\n"
-        f"• Dedicated Site Extractors: 43 Sites Active\n"
-        f"• Engine Status: 24/7 Active 🟢"
+        f"📊 Bot Status
+
+"
+        f"• Users: {users_count}
+"
+        f"• Sites: {sites_n} | Cookies: {cookies_n}
+"
+        f"• Active jobs: {jobs_n}
+"
+        f"• Your watches: {watches_n}
+"
+        f"• Scrape parallel: {conc} (video/pages)
+"
+        f"• Proxy/MiniApp: {px}
+"
+        f"• curl_cffi: {'ON' if cffi_requests else 'OFF'}
+"
+        f"• Engine: 24/7 Active 🟢
+
+"
+        f"📖 /help — saari commands"
     )
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4866,8 +5606,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 # ==========================================================
 # /scr  ->  NEW-SITE FAST SCRAPER (auto domain-specific extractor)
 # ==========================================================
-SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "32"))        # parallel video-page extractions (fast)
-SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "12"))   # parallel listing-page fetches
+SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "48"))        # parallel video-page extractions (ultra-fast)
+SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "20"))   # parallel listing-page fetches (ultra-fast)
 SCR_MAX_PAGES = 30          # max pages per single run
 SCR_ALL_MAX = int(os.getenv("SCR_ALL_MAX", "300"))   # /scr <url> all : itne pages tak (jaise hi naye links band, ruk jata hai)
 _SCR_CACHE_TTL = 300        # seconds, html cache
@@ -4901,7 +5641,7 @@ def _ensure_fast_executor():
     """Bigger thread pool so asyncio.to_thread(fetch_sync) really runs in parallel."""
     global _EXECUTOR_READY
     if not _EXECUTOR_READY:
-        asyncio.get_running_loop().set_default_executor(_TPE(max_workers=64))
+        asyncio.get_running_loop().set_default_executor(_TPE(max_workers=int(os.getenv("SCR_WORKERS", "96"))))
         _EXECUTOR_READY = True
 
 
@@ -4912,8 +5652,8 @@ async def fast_fetch(url: str, referer: Optional[str] = None) -> Optional[str]:
         return hit[1]
     page = await fetch(url, referer)
     if page:
-        if len(_FETCH_CACHE) > 150:
-            for k_ in sorted(_FETCH_CACHE, key=lambda x: _FETCH_CACHE[x][0])[:50]:
+        if len(_FETCH_CACHE) > 400:
+            for k_ in sorted(_FETCH_CACHE, key=lambda x: _FETCH_CACHE[x][0])[:120]:
                 _FETCH_CACHE.pop(k_, None)
         _FETCH_CACHE[url] = (time.time(), page)
     return page
@@ -5141,6 +5881,10 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
     ordered = await verify_results(ordered, rep)
     rep["dropped"] = dropped
     rep["extracted"] = len(ordered)
+    try:
+        record_health(url, rep["links"], len(ordered))
+    except Exception:
+        pass
     return ordered, rep
 
 
@@ -5177,10 +5921,17 @@ async def scr_send_files(chat, results: List[dict], start: int, end: int, domain
         [InlineKeyboardButton(f"▶️ Continue (Pages {nxt}-{nxt + 9})", callback_data="scr_continue")],
         [InlineKeyboardButton("🛑 Stop", callback_data="scr_stop")]])
 
+        _html_full = generate_web_app_html(results, title=f"{domain} ({start}-{end})")
+    _zip_files = [
+        (f"{tag}_full.txt", full),
+        (f"{tag}_simple.txt", simple),
+        (f"{tag}_full.html", _html_full),
+        (f"{tag}_simple.html", simple_html),
+    ]
     await chat.send_document(document=mk(full, f"{tag}_full.txt"), caption=f"📁 Full TXT ({len(results)} links)")
     await chat.send_document(document=mk(simple, f"{tag}_simple.txt"), caption="📁 Simple TXT (Title: Stream Link)")
     await chat.send_document(
-        document=mk(generate_web_app_html(results, title=f"{domain} ({start}-{end})"), f"{tag}_full.html"),
+        document=mk(_html_full, f"{tag}_full.html"),
         caption="🌐 Full Web App HTML (Player UI)")
     await _send_exports(chat.send_document, results, tag)
     await chat.send_document(
@@ -5188,6 +5939,13 @@ async def scr_send_files(chat, results: List[dict], start: int, end: int, domain
         caption=(f"🌐 Simple HTML\n\nAage ke pages ({nxt}-{nxt + 9}) ke liye button dabao:" if show_next
                  else "🌐 Simple HTML (saare pages ho gaye)"),
         reply_markup=kb if show_next else None)
+    try:
+        zbuf = pack_result_zip(tag, _zip_files)
+        if zbuf:
+            await chat.send_document(document=zbuf, caption=f"📦 ZIP: saari files ek me ({len(results)} links)")
+    except Exception as _ze:
+        logger.warning(f"zip pack fail: {_ze}")
+
 
 
 async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: int):
@@ -5230,7 +5988,16 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
 
     try:
         all_mode = context.user_data.pop('scr_all', False)
-        results, rep = await scr_scrape(url, start, end, user_id, progress, auto_end=all_mode)
+        _cached = scrape_cache_get(url, start, end)
+        if _cached and not all_mode:
+            results, rep = _cached
+            try:
+                await status.edit_text(f"⚡ Cache hit (8 min): {len(results)} links — files bhej raha hoon...")
+            except Exception:
+                pass
+        else:
+            results, rep = await scr_scrape(url, start, end, user_id, progress, auto_end=all_mode)
+            scrape_cache_set(url, start, end, results, rep)
     except Exception as e:
         logger.error(f"/scr error: {e}")
         await status.edit_text(f"❌ Scraping error: {e}")
@@ -6280,6 +7047,7 @@ async def cookie_flow_step(update: Update, context: ContextTypes.DEFAULT_TYPE, c
 # ==========================================================
 import shutil
 import tempfile
+import zipfile
 
 try:   # optional: pip install yt-dlp  (hazaaron sites ke liye fallback extractor)
     import yt_dlp
@@ -6380,8 +7148,8 @@ class AdaptiveLimiter:
             self.limit = max(4, self.limit // 2)
         elif ok:
             self.ok += 1
-            if self.ok % 25 == 0 and self.limit < self.max:
-                self.limit = min(self.max, self.limit + 2)
+            if self.ok % 12 == 0 and self.limit < self.max:
+                self.limit = min(self.max, self.limit + 3)
                 self._wake()
 
 
@@ -6594,6 +7362,21 @@ async def verify_results(items: List[dict], rep: Optional[dict] = None) -> List[
 
 
 # ---------------- exports ----------------
+
+def pack_result_zip(tag: str, files: list) -> Optional[io.BytesIO]:
+    """files: list of (filename, text_or_bytes). Returns zip BytesIO or None."""
+    if not files:
+        return None
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files:
+            raw = data if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
+            zf.writestr(name, raw)
+    buf.seek(0)
+    buf.name = f"{tag}_all.zip"
+    return buf
+
+
 def build_exports(results: List[dict], tag: str, fmts: set) -> List[tuple]:
     import csv
     out = []
@@ -6623,6 +7406,38 @@ async def _send_exports(send, results: List[dict], tag: str):
 
 
 # ---------------- jobs ----------------
+
+# ---- short-lived scrape result cache (same URL+pages 8 min me dobara full scrape na ho) ----
+_SCRAPE_CACHE: Dict[str, tuple] = {}  # key -> (ts, results_list, rep_dict)
+
+
+def scrape_cache_key(url: str, start: int, end: int) -> str:
+    return f"{normalize_domain(url)}|{urlparse(url).path}|{start}-{end}"
+
+
+def scrape_cache_get(url: str, start: int, end: int, max_age: int = 480):
+    k = scrape_cache_key(url, start, end)
+    hit = _SCRAPE_CACHE.get(k)
+    if not hit:
+        return None
+    ts, results, rep = hit
+    if time.time() - ts > max_age:
+        _SCRAPE_CACHE.pop(k, None)
+        return None
+    return results, rep
+
+
+def scrape_cache_set(url: str, start: int, end: int, results, rep):
+    if not results:
+        return
+    if len(_SCRAPE_CACHE) > 80:
+        # drop oldest
+        oldest = sorted(_SCRAPE_CACHE.items(), key=lambda kv: kv[1][0])[:20]
+        for k, _ in oldest:
+            _SCRAPE_CACHE.pop(k, None)
+    _SCRAPE_CACHE[scrape_cache_key(url, start, end)] = (time.time(), results, rep)
+
+
 JOBS: Dict[int, dict] = {}
 _JOB_SEQ = [0]
 
@@ -7325,6 +8140,141 @@ async def _post_init(app):
                              asyncio.create_task(_sb_loop(app))]
 
 
+
+# ==========================================================
+# EXTRA ADMIN / UTILITY COMMANDS (add-only)
+#   /restart  /cleanup_backups  /updatewithoutrestart
+#   aliases: /adscr=/addscr  /mini=/app  /commands=/help
+# ==========================================================
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/restart — bot process soft-restart (admin). Polling dubara start."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        "♻️ Restart request...\n"
+        "• DB / cookies / rules disk par safe hain\n"
+        "• Process exit → Render/host auto-restart karega\n"
+        "• Local: process manager se dobara chalao")
+    logger.warning(f"Admin {ADMIN_ID} ne /restart trigger kiya")
+    # graceful: stop jobs, then exit so supervisor restarts
+    for v in list(JOBS.values()):
+        STOP_PROCESS[v.get("user", 0)] = True
+    async def _die():
+        await asyncio.sleep(1.2)
+        os._exit(0)
+    asyncio.create_task(_die())
+
+
+async def cleanup_backups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cleanup_backups — temp DB snapshots, purani health rows, expire shares saaf."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    removed_files = 0
+    notes = []
+    # temp bot_data_*.db / sb_*.db / restore_*.db
+    try:
+        import glob
+        patterns = [
+            os.path.join(tempfile.gettempdir(), "bot_data_*.db"),
+            os.path.join(tempfile.gettempdir(), "sb_up_*.db"),
+            os.path.join(tempfile.gettempdir(), "sb_down_*.db"),
+            os.path.join(tempfile.gettempdir(), "restore_*.db"),
+        ]
+        for pat in patterns:
+            for f in glob.glob(pat):
+                try:
+                    os.remove(f)
+                    removed_files += 1
+                except Exception:
+                    pass
+        notes.append(f"🗑 Temp DB files: {removed_files}")
+    except Exception as e:
+        notes.append(f"Temp clean error: {e}")
+
+    # old site_health (>30d already in record_health; force 14d trim)
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.execute("DELETE FROM site_health WHERE ts < ?", (time.time() - 14 * 86400,))
+        hdel = cur.rowcount
+        # expired mini_shares
+        cur = conn.execute("DELETE FROM mini_shares WHERE expires IS NOT NULL AND expires < ?", (time.time(),))
+        sdel = cur.rowcount
+        # orphan watch_seen (watch deleted)
+        cur = conn.execute(
+            "DELETE FROM watch_seen WHERE watch_id NOT IN (SELECT id FROM watches)")
+        wdel = cur.rowcount
+        conn.commit()
+        conn.close()
+        notes.append(f"🩺 site_health rows: {hdel}")
+        notes.append(f"🔗 expired shares: {sdel}")
+        notes.append(f"👁 orphan watch_seen: {wdel}")
+    except Exception as e:
+        notes.append(f"DB clean error: {e}")
+
+    # in-memory caches
+    try:
+        n1 = len(globals().get("_FETCH_CACHE", {}))
+        n2 = len(globals().get("_STREAM_CACHE", {}))
+        n3 = len(globals().get("_SCRAPE_CACHE", {}))
+        globals().get("_FETCH_CACHE", {}).clear()
+        globals().get("_STREAM_CACHE", {}).clear()
+        globals().get("_SCRAPE_CACHE", {}).clear()
+        globals()["_COOKIE_CACHE"] = None
+        globals()["_RULES_CACHE"] = None
+        notes.append(f"⚡ Caches cleared (fetch={n1}, stream={n2}, scrape={n3})")
+    except Exception as e:
+        notes.append(f"Cache clear: {e}")
+
+    await update.message.reply_text("✅ Cleanup done:\n" + "\n".join(notes))
+
+
+async def updatewithoutrestart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/updatewithoutrestart — DB se settings/cookies/rules/prefers reload, process mat maro."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        init_db()
+        load_settings()
+        load_prefers()
+        load_env_cookies()
+        globals()["_COOKIE_CACHE"] = None
+        globals()["_RULES_CACHE"] = None
+        globals().get("_FETCH_CACHE", {}).clear()
+        globals().get("_STREAM_CACHE", {}).clear()
+        if "_SCRAPE_CACHE" in globals():
+            globals()["_SCRAPE_CACHE"].clear()
+        msg = (
+            "✅ Live reload OK (bina restart):\n"
+            f"• Cookies: {len(list_cookie_domains())}\n"
+            f"• Rules: {len(list_rule_domains())}\n"
+            f"• Users: {len(get_all_users())}\n"
+            f"• Sites: {len(get_all_sites())}\n"
+            f"• Watches: {len(watch_rows())}\n"
+            f"• Settings: {', '.join(k+'='+(get_setting(k) or '-') for k in list(_SETTING_DEFAULTS)[:6])}...\n\n"
+            "Naya Python code deploy ke liye ab bhi host restart chahiye.\n"
+            "Sirf DB/env data is command se turant apply."
+        )
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Reload fail: {str(e)[:200]}")
+
+
+async def adscr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias: /adscr -> /addscr"""
+    return await addscr_command(update, context)
+
+
+async def mini_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias: /mini -> /app (Mini App)"""
+    return await app_command(update, context)
+
+
+async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias: /commands -> /help"""
+    return await help_command(update, context)
+
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN environment variable set nahi hai. "
@@ -7342,7 +8292,10 @@ def main():
            .concurrent_updates(True).post_init(_post_init).build())
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("turbo", turbo_command))
     app.add_handler(CommandHandler("app", app_command))
+    app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("debug", debug_command))
@@ -7373,6 +8326,14 @@ def main():
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
     app.add_handler(CommandHandler("userlist", userlist_command))
+
+    app.add_handler(CommandHandler("restart", restart_command))
+    app.add_handler(CommandHandler("cleanup_backups", cleanup_backups_command))
+    app.add_handler(CommandHandler("updatewithoutrestart", updatewithoutrestart_command))
+    app.add_handler(CommandHandler("adscr", adscr_command))
+    app.add_handler(CommandHandler("mini", mini_command))
+    app.add_handler(CommandHandler("commands", commands_command))
+
 
     # /scr buttons MUST be registered before the generic callback handler
     app.add_handler(CallbackQueryHandler(scr_callback, pattern=r"^scr_"))
