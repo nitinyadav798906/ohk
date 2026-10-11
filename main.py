@@ -2043,12 +2043,17 @@ def link_stats(html: str, page_url: str) -> str:
             if _root_host(urlparse(urljoin(page_url, h)).netloc) == root]
     shapes = Counter(_shape(urlparse(urljoin(page_url, h))) for h in same)
     title = re.search(r'<title>(.*?)</title>', html, re.I | re.S)
+    # Precompute outside f-string: Python <3.12 disallows backslash inside f-string {}
+    n_img = len(re.findall(r'<img\b', html, re.I))
+    n_script = len(re.findall(r'<script', html, re.I))
+    title_s = title.group(1).strip()[:80] if title else "none"
     return (
-        f"📄 Title: {(title.group(1).strip()[:80] if title else 'none')}\n"
-        f"🔢 <a> tags: {len(hrefs)} | same-site: {len(same)} | <img>: {len(re.findall(r'<img\b', html, re.I))}\n"
+        f"📄 Title: {title_s}\n"
+        f"🔢 <a> tags: {len(hrefs)} | same-site: {len(same)} | <img>: {n_img}\n"
         f"🧩 Top URL shapes: {shapes.most_common(4)}\n"
-        f"⚙️ <script> blocks: {len(re.findall(r'<script', html, re.I))} "
-        f"(zyada script + kam <a> = JS-rendered listing)")
+        f"⚙️ <script> blocks: {n_script} "
+        f"(zyada script + kam <a> = JS-rendered listing)"
+    )
 
 
 def _looks_like_single_video(url: str) -> bool:
