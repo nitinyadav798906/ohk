@@ -63,8 +63,92 @@ SKY_PASSWORD = os.getenv("SKY_PASSWORD", "7989")
 DB_FILE = os.getenv("DB_FILE", "bot_data.db")
 PROXY_URL = os.getenv("PROXY_URL", "").strip()  # e.g. http://user:pass@host:port (optional)
 
+# ---- NEW: Multi-proxy pool rotation ----
+_PROXY_POOL: List[str] = []
+_PROXY_IDX = [0]
+_PROXY_FAILS: Dict[str, int] = {}
+
+def _init_proxy_pool():
+    global _PROXY_POOL
+    seen, out = set(), []
+    for raw in (os.getenv("PROXY_URLS", "") + "," + PROXY_URL).split(","):
+        p = (raw or "").strip()
+        if p and p not in seen:
+            seen.add(p); out.append(p)
+    _PROXY_POOL = out
+
+def get_active_proxy() -> str:
+    if not _PROXY_POOL:
+        _init_proxy_pool()
+    if not _PROXY_POOL:
+        return PROXY_URL or ""
+    n = len(_PROXY_POOL)
+    for _ in range(n):
+        i = _PROXY_IDX[0] % n
+        _PROXY_IDX[0] = i + 1
+        p = _PROXY_POOL[i]
+        if _PROXY_FAILS.get(p, 0) < 8:
+            return p
+    _PROXY_FAILS.clear()
+    return _PROXY_POOL[0]
+
+def mark_proxy_fail(proxy: str = ""):
+    p = proxy or get_active_proxy()
+    if p:
+        _PROXY_FAILS[p] = _PROXY_FAILS.get(p, 0) + 1
+
+def mark_proxy_ok(proxy: str = ""):
+    p = proxy or get_active_proxy()
+    if p and p in _PROXY_FAILS:
+        _PROXY_FAILS[p] = max(0, _PROXY_FAILS[p] - 1)
+
+def proxy_dict() -> Optional[dict]:
+    p = get_active_proxy()
+    return {"http": p, "https": p} if p else None
+
+_init_proxy_pool()
+
 STOP_PROCESS: Dict[int, bool] = {}
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+# ---- NEW: Daily quota + scrape queue ----
+_DAILY_USAGE: Dict[str, Dict[int, int]] = {}
+SCRAPE_QUEUE: Dict[int, list] = {}
+SCRAPE_QUEUE_RUNNING: Dict[int, bool] = {}
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+def daily_used(uid: int) -> int:
+    return _DAILY_USAGE.get(_today(), {}).get(uid, 0)
+
+def daily_limit() -> int:
+    try:
+        return int(get_setting("daily_limit") or "0")
+    except Exception:
+        return 0
+
+def daily_ok(uid: int, pages: int = 1) -> bool:
+    lim = daily_limit()
+    if lim <= 0 or uid == ADMIN_ID:
+        return True
+    return daily_used(uid) + pages <= lim
+
+def daily_add(uid: int, pages: int = 1):
+    d = _today()
+    if d not in _DAILY_USAGE:
+        _DAILY_USAGE.clear()
+        _DAILY_USAGE[d] = {}
+    _DAILY_USAGE[d][uid] = _DAILY_USAGE[d].get(uid, 0) + pages
+
+def queue_add(uid: int, url: str, start: int, end: int) -> int:
+    q = SCRAPE_QUEUE.setdefault(uid, [])
+    q.append({"url": url, "start": start, "end": end, "t": time.time()})
+    return len(q)
+
+def queue_len(uid: int) -> int:
+    return len(SCRAPE_QUEUE.get(uid) or [])
+
 
 # Cloudscraper Instance
 scraper = cloudscraper.create_scraper(
@@ -901,15 +985,24 @@ def normalize_setting(key: str, val: str) -> str:
     key, val = (key or "").lower(), (val or "").strip()
     if key not in _SETTING_DEFAULTS:
         raise ValueError(f"Unknown setting: {key}")
-    if key in ("verify", "ytdlp", "keep_preview"):
+    if key in ("verify", "ytdlp", "keep_preview", "auto_m3u", "skip_preview_strict"):
         return "1" if val.lower() in ("on", "1", "yes", "true") else "0"
     if key == "proxy":
-        return val.lower() if val.lower() in ("auto", "on", "off") else "auto"
-    if key == "min_quality":
+        # auto = only for IP-lock/acctoken; on/force = always bot-proxy; off/direct = never;
+        # mtproto = reserved (Telegram MTProto not used for media streams — falls back to auto)
+        v = val.lower().strip()
+        if v in ("auto", "on", "off", "force", "direct", "mtproto", "bot"):
+            if v == "direct": return "off"
+            if v == "bot": return "on"
+            if v == "force": return "on"
+            if v == "mtproto": return "auto"
+            return v
+        return "auto"
+    if key in ("min_quality", "min_duration", "max_duration", "daily_limit"):
         if val.lower() in ("", "off", "0", "none"):
             return "0"
         if not val.isdigit():
-            raise ValueError("min_quality number do (jaise 720)")
+            raise ValueError(f"{key} number do")
         return val
     if key == "export":
         return ",".join(x for x in re.split(r'[,\s]+', val.lower()) if x in ("m3u", "json", "csv"))
@@ -2060,9 +2153,9 @@ VIDEO_PATTERNS = [
     # KVS engine: video_url: 'function/0/https://site/get_file/...mp4/'
     r'(?:video_url|video_alt_url\d*)\s*[:=]\s*["\']([^"\']+)["\']',
     r'(?:file|src|source|stream_url|videoUrl|hls|mp4|m3u8)["\']?\s*[:=]\s*'
-    r'["\']([^"\']+\.(?:m3u8|mp4)[^"\']*)["\']',
-    r'data-(?:src|video|file)=["\']([^"\']+\.(?:m3u8|mp4)[^"\']*)',
-    r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:mp4\.m3u8|m3u8|mp4)(?:\?[^\s"\'<>]*)?)',
+    r'["\']([^"\']+\.(?:m3u8|mp4|mkv|avi|wmv|webm|mov|flv|hevc|h265)[^"\']*)["\']',
+    r'data-(?:src|video|file)=["\']([^"\']+\.(?:m3u8|mp4|mkv|avi|wmv|webm)[^"\']*)',
+    r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:mp4\.m3u8|m3u8|mp4|mkv|avi|wmv|webm|mov|flv|hevc)(?:\?[^\s"\'<>]*)?)',
 ]
 
 
@@ -2151,7 +2244,7 @@ def stream_score(u: str, page_url: str = "") -> float:
     s_ = 0.0
     if '.m3u8' in path:
         s_ += 6
-    elif re.search(r'\.(?:mp4|webm|mkv|mov|m4v|flv)(?:$|\?)', low) or 'get_file' in low:
+    elif re.search(r'\.(?:mp4|webm|mkv|mov|m4v|flv|avi|wmv|hevc|h265|mpg|mpeg|ts|m2ts)(?:$|\?)', low) or 'get_file' in low:
         s_ += 4
     if _SIGNED_RX.search(low):
         s_ += 3
@@ -3180,6 +3273,17 @@ html:has(body.amb-on){scrollbar-width:none}
 html:has(body.amb-on)::-webkit-scrollbar{display:none}
 .amb-on .top{box-shadow:var(--hsh,none)}
 .amb-on .desc,.amb-on .act{background:color-mix(in srgb,var(--bg2) 75%,transparent)}
+.amb-on .player::before{content:"";position:absolute;inset:-48px;z-index:-2;pointer-events:none;
+  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.42) 0%,transparent 72%);
+  filter:blur(48px);transition:background .35s}
+#statsN{position:absolute;top:10px;left:10px;z-index:8;background:rgba(0,0,0,.78);color:#0f0;font:12px/1.45 ui-monospace,Consolas,monospace;
+  padding:8px 10px;border-radius:8px;max-width:min(92%,360px);white-space:pre;pointer-events:none;display:none}
+#statsN.on{display:block}
+.dtap{position:absolute;top:0;bottom:54px;width:40%;z-index:2;pointer-events:auto}
+.dtap.l{left:0}.dtap.r{right:0}
+.dtap .rip2{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);opacity:0;color:#fff;font-size:28px;font-weight:700;
+  text-shadow:0 2px 8px #000;transition:opacity .2s;pointer-events:none}
+.dtap .rip2.on{opacity:1}
 .player video,.player #imgv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
 .player:fullscreen{max-height:none;background:#000}.player:fullscreen .pin{border-radius:0}.player:fullscreen .ambc{display:none}
 .aud{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:90px;color:#555}
@@ -3316,7 +3420,7 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 <section id="watch" hidden>
  <div class="wl">
   <div class="wmain">
-   <div class="player paused" id="pl"><canvas id="amb" class="ambc"></canvas><div class="pin">
+   <div class="player paused" id="pl"><canvas id="amb" class="ambc"></canvas><div id="statsN"></div><div class="dtap l" id="dtL"><span class="rip2" id="dtLr">-10s</span></div><div class="dtap r" id="dtR"><span class="rip2" id="dtRr">+10s</span></div><div class="pin">
      <video id="v" playsinline preload="auto"></video>
      <img id="imgv" hidden alt="">
      <div class="aud" id="aud" hidden>&#9835;</div>
@@ -3398,23 +3502,35 @@ function grad(t){var h=hnum(t||"x")%360;return ["hsl("+h+",55%,38%)","hsl("+((h+
 function pathOf(u){return u.split("#")[0].split("?")[0].toLowerCase()}
 function extOf(u){var m=pathOf(u).match(/\.([a-z0-9]{2,5})$/);return m?m[1]:""}
 var AUDIO_EXT=["mp3","m4a","aac","wav","ogg","oga","opus","flac","wma"];
+var CONTAINER_EXT=["mkv","avi","wmv","mov","m4v","webm","flv","ts","m2ts","mp4","mpg","mpeg"];
+var CODEC_HINT={"hevc":"HEVC","h265":"HEVC","h.265":"HEVC","av1":"AV1","vp9":"VP9","x265":"HEVC","x264":"H264"};
 function fmtOf(it){
   var u=it.u.toLowerCase();
   if(it.eng==="hls")return "HLS";if(it.eng==="dash")return "DASH";
   if(u.indexOf(".m3u8")>-1)return "HLS";
+  for(var c in CODEC_HINT){if(u.indexOf(c)>-1)return CODEC_HINT[c]}
   var e=extOf(u);
   if(e==="mpd")return "DASH";
-  if(e==="m4v")return "MP4";
+  if(e==="m4v"||e==="mp4")return "MP4";
+  if(e==="mkv")return "MKV";
+  if(e==="avi")return "AVI";
+  if(e==="wmv")return "WMV";
+  if(e==="hevc"||e==="h265")return "HEVC";
   if(e)return e.toUpperCase();
   return it.k||"VIDEO";
 }
 function isAudio(it){return it.k==="AUDIO"||AUDIO_EXT.indexOf(extOf(it.u))>-1}
+function isContainerHard(it){
+  var e=extOf(it.u),u=it.u.toLowerCase();
+  return e==="mkv"||e==="avi"||e==="wmv"||e==="hevc"||u.indexOf("hevc")>-1||u.indexOf("h265")>-1;
+}
 function engineOf(it){
   var u=it.u.toLowerCase(),e=extOf(u);
   if(it.eng)return it.eng;
   if(u.indexOf(".m3u8")>-1)return "hls";
   if(e==="mpd")return "dash";
   if(e==="ts"||e==="flv"||e==="m2ts")return "mpegts";
+  if(isContainerHard(it))return "external";
   return "native";
 }
 var _sc={};
@@ -3743,7 +3859,13 @@ function toggleStats(){
       }catch(e){}
     }
     if(CUR&&CUR.u)lines.push((CUR.u||"").slice(0,90));
-    box.textContent=lines.join("\\n");
+    try{
+      var q=V.getVideoPlaybackQuality?V.getVideoPlaybackQuality():null;
+      if(q)lines.push("Frames: drop "+(q.droppedVideoFrames||0)+" / total "+(q.totalVideoFrames||0));
+    }catch(e){}
+    try{if(typeof amN!=="undefined")lines.push("Ambient frames: "+amN+" | Shuffle: "+(typeof SHUFFLE!=="undefined"&&SHUFFLE?"ON":"OFF"))}catch(e){}
+    try{if(typeof amLastColors!=="undefined"&&amLastColors)lines.push("Amb RGB: "+amLastColors.r+","+amLastColors.g+","+amLastColors.b)}catch(e){}
+    box.textContent=lines.join("\n");
   }
   tick();STATS_T=setInterval(tick,800);
 }
@@ -4142,7 +4264,7 @@ function applyAmb(){
   var on=!!amv("enabled",true),sp=amv("spread",130)/100,bl=amv("blur",25),fs=amv("spreadFadeStart",20),fc=amv("spreadFadeCurve",20);
   document.body.classList.toggle("amb-on",on);amCv.hidden=!on;
   amCv.style.width=(sp*100)+"%";amCv.style.height=(sp*100)+"%";amCv.style.left=((1-sp)*50)+"%";amCv.style.top=((1-sp)*50)+"%";
-  amCv.style.filter="blur("+Math.round(bl*1.6)+"px) saturate(1.35)";
+  amCv.style.filter="blur("+Math.round(bl*1.6)+"px) saturate("+amv("saturation",1.45)+") brightness("+amv("brightness",1.05)+")";
   var m="radial-gradient(ellipse closest-side,#000 "+Math.max(0,100-fs-fc)+"%,rgba(0,0,0,0) 100%)";
   amCv.style.webkitMaskImage=m;amCv.style.maskImage=m;amCv.style.opacity=amv("intensity",90)/100;
   document.documentElement.style.setProperty("--hsh","0 0 "+amv("headerShadowSize",25)+"px rgba(0,0,0,"+(amv("headerShadowOpacity",30)/100)+")");
@@ -4157,19 +4279,34 @@ function detectBars(vw,vh){
     amBars={t:t/36,b:b/36,on:true};
   }catch(e){amBars={t:0,b:0,on:false}}
 }
+var amLastColors=null;
 function ambDraw(){
-  if(!amCx){amCv.width=128;amCv.height=72;try{amCx=amCv.getContext("2d")}catch(e){}if(!amCx)return}
+  if(!amCx){amCv.width=160;amCv.height=90;try{amCx=amCv.getContext("2d",{willReadFrequently:true})}catch(e){try{amCx=amCv.getContext("2d")}catch(e2){}}if(!amCx)return}
   var vw=V.videoWidth,vh=V.videoHeight;if(!vw||!vh||V.readyState<2)return;
-  if(amv("detectHorizontalBarSizeEnabled",true)&&amBars.on!==false&&amN%45===0)detectBars(vw,vh);
+  if(amv("detectHorizontalBarSizeEnabled",true)&&amBars.on!==false&&amN%30===0)detectBars(vw,vh);
   var sy=Math.round(vh*amBars.t),sh=Math.max(1,Math.round(vh*(1-amBars.t-amBars.b)));
-  try{amCx.drawImage(V,0,sy,vw,sh,0,0,128,72);amN++}catch(e){}
+  try{
+    amCx.drawImage(V,0,sy,vw,sh,0,0,160,90);amN++;
+    if(amN%3===0){
+      var d=amCx.getImageData(0,0,160,90).data,r=0,g=0,b=0,n=0;
+      for(var i=0;i<d.length;i+=20){r+=d[i];g+=d[i+1];b+=d[i+2];n++}
+      if(n){r=Math.round(r/n);g=Math.round(g/n);b=Math.round(b/n);
+        var sm=+amv("smoothing",0.62);if(amLastColors){r=Math.round(amLastColors.r*sm+r*(1-sm));g=Math.round(amLastColors.g*sm+g*(1-sm));b=Math.round(amLastColors.b*sm+b*(1-sm))}
+        amLastColors={r:r,g:g,b:b};
+        document.documentElement.style.setProperty("--amb-r",r);
+        document.documentElement.style.setProperty("--amb-g",g);
+        document.documentElement.style.setProperty("--amb-b",b);
+        document.documentElement.style.setProperty("--amb-rgb",r+","+g+","+b);
+      }
+    }
+  }catch(e){}
 }
 function ambFrame(ts){
   amRaf=0;
   if(!amv("enabled",true)||$("#watch").hidden||document.hidden)return;
-  var fps=Math.min(60,Math.max(5,amv("framerateLimit",60)));
+  var fps=Math.min(60,Math.max(5,amv("framerateLimit",30)));
   if(ts-amLast>=1000/fps){amLast=ts;amTry++;ambDraw()}
-  if(amTry<400&&(!V.paused||amN<3||!amv("energySaver",true)))amRaf=requestAnimationFrame(ambFrame);   /* data na ho to bhi bounded */   /* paused: 2-3 frame ke baad ruk jao */
+  if(amTry<400&&(!V.paused||amN<3||!amv("energySaver",true)))amRaf=requestAnimationFrame(ambFrame);
 }
 function ambStart(){if(!amRaf&&amv("enabled",true)&&!$("#watch").hidden){amTry=0;amRaf=requestAnimationFrame(ambFrame)}}
 document.addEventListener("visibilitychange",function(){if(!document.hidden){amN=0;ambStart()}});
@@ -4383,6 +4520,8 @@ function renderPb(level){
     if(rl.length)rowBtn("\uD83D\uDD04  Refresh all links ("+rl.length+")","Poori list ki links dobara nikalo",function(){pbClose();refreshAll(rl,function(){LIST=[];renderGrid()})});
     rowBtn("\uD83D\uDCAC  Subtitles","File ya URL (.srt / .vtt)",function(){renderPb("subs")});
     rowBtn("\uD83D\uDCCA  Live stats","Resolution / bitrate / buffer (i key)",function(){toggleStats();renderPb("tools")});
+    rowBtn("🎲  Shuffle playlist",SHUFFLE?"ON — next random":"OFF — sequential order",function(){toggleShuffle();renderPb("tools")});
+    rowBtn("⏪  Double-tap seek","Mobile: left -10s / right +10s (always on)",function(){toast("Double-tap left/right side of video")});
     rowBtn("\uD83D\uDD0A  Audio track",(function(){var a=listAudioTracks();return a.length?(a.length+" tracks"):"Single / N/A"})(),function(){
       var a=listAudioTracks();if(!a.length){toast("Extra audio track nahi");return;}
       openMenu(a.map(function(x){return {v:x.v,l:x.l}}),-1,function(v){setAudioTrack(v)});
@@ -4415,12 +4554,64 @@ function renderPb(level){
       rs.onclick=function(){delete AMS[key];LS.set("ytb_amb",AMS);inp.value=amv(key,0);vv.textContent=fmt(+inp.value);applyAmb()};
       w.appendChild(lb);w.appendChild(inp);return w;
     }
+    function atog(label,key,defv){
+      var on=!!amv(key,defv),w=el("div","row2");w.appendChild(el("div","",(on?"\u2705 ":"\u2B1C ")+label));
+      w.onclick=function(){amset(key,!amv(key,defv));applyAmb();renderPb("amb")};return w;
+    }
+    function asec(t){var h=el("div","sub");h.style.cssText="margin:12px 0 6px;font-weight:700;opacity:.85";h.textContent=t;return h}
+    box.appendChild(asec("Quality"));
+    box.appendChild(atog("WebGL renderer (uses less power)", "webglRenderer", true));
+    box.appendChild(asl("Resolution","resolutionScale",50,100,5,function(v){return v+"%"}));
+    box.appendChild(asl("Limit framerate (per second)","framerateLimit",5,60,1,function(v){return v+" fps"}));
+    box.appendChild(atog("Save energy on static videos","energySaver",true));
+    box.appendChild(atog("Prioritize page load speed","prioritizePageLoad",true));
+    box.appendChild(atog("YouTube responsiveness fixes","youtubeResponsiveness",true));
+    box.appendChild(asec("Page header"));
+    box.appendChild(asl("Shadows size","pageHeaderShadowSize",0,80,1,pct));
+    box.appendChild(asl("Shadows opacity","pageHeaderShadowOpacity",0,100,1,pct));
+    box.appendChild(asec("Page content"));
+    box.appendChild(asl("Shadows size","pageContentShadowSize",0,40,1,pct));
+    box.appendChild(asl("Shadows opacity","pageContentShadowOpacity",0,100,1,pct));
+    box.appendChild(atog("Shadows on texts and buttons only","shadowsOnTextButtonsOnly",false));
+    box.appendChild(asl("Images opacity","imagesOpacity",0,100,1,pct));
+    box.appendChild(asl("Buttons & boxes background opacity","buttonsBoxesBgOpacity",-100,100,5,function(v){return v+"%"}));
+    box.appendChild(asl("Background greyness","backgroundGreyness",0,100,1,pct));
+    box.appendChild(atog("Hide everything in theater mode","hideEverythingTheater",false));
+    box.appendChild(atog("Related videos as scrollable list","relatedAsScrollList",false));
+    box.appendChild(atog("Hide scrollbar","hideScrollbar",true));
+    box.appendChild(asec("Video"));
+    box.appendChild(asl("Size (in small view)","videoSizeSmall",50,150,0.5,function(v){return v+"%"}));
+    box.appendChild(asl("Shadow size","videoShadowSize",0,200,5,pct));
+    box.appendChild(asl("Shadow opacity","videoShadowOpacity",0,100,0.5,function(v){return v+"%"}));
+    box.appendChild(asl("Debanding (noise)","debandingNoise",0,100,1,pct));
+    box.appendChild(atog("Sync video with ambient light","syncVideoAmbient",true));
+    box.appendChild(asl("Sync video disable threshold","syncDisableThreshold",0,100,1,pct));
+    box.appendChild(atog("Video jitter workaround","videoJitterWorkaround",false));
+    box.appendChild(atog("Video artifacts workaround","videoArtifactsWorkaround",true));
+    box.appendChild(atog("Remove black bars [B]","removeBlackBars",false));
+    box.appendChild(atog("Remove black sidebars [V]","removeBlackSidebars",false));
+    box.appendChild(asl("Bar size","barSize",0,50,1,function(v){return v+"%"}));
+    box.appendChild(asl("Sidebars size","sidebarsSize",0,50,1,function(v){return v+"%"}));
+    box.appendChild(atog("Reset bars next video","resetBarsNextVideo",false));
+    box.appendChild(atog("Fill video to removed bars [H]","fillVideoRemovedBars",true));
+    box.appendChild(asec("Filters"));
+    box.appendChild(asl("Brightness","filterBrightness",50,150,1,pct));
+    box.appendChild(asl("Contrast","filterContrast",50,150,1,pct));
+    box.appendChild(asl("Colors","filterColors",50,150,1,pct));
+    box.appendChild(asl("Saturation","filterSaturation",50,200,1,pct));
+    box.appendChild(asec("Ambient light core"));
     box.appendChild(asl("Blur","blur",0,100,1,pct));
+    box.appendChild(asl("Edge size","edge",0,60,1,pct));
     box.appendChild(asl("Spread","spread",100,200,5,pct));
+    box.appendChild(asl("Spread fade start","spreadFadeStart",0,60,5,pct));
+    box.appendChild(asl("Spread fade curve","spreadFadeCurve",0,60,5,pct));
     box.appendChild(asl("Glow intensity","intensity",0,100,5,pct));
-    box.appendChild(asl("Fade start","spreadFadeStart",0,60,5,pct));
-    box.appendChild(asl("Fade curve","spreadFadeCurve",0,60,5,pct));
-    box.appendChild(asl("Frame rate limit","framerateLimit",5,60,5,function(v){return v+" fps"}));
+    box.appendChild(atog("Fixed position (ignore scroll)","fixedPosition",false));
+    box.appendChild(asec("View modes"));
+    box.appendChild(atog("Picture in picture","pictureInPicture",false));
+    box.appendChild(atog("Embedded videos","embeddedVideos",true));
+    box.appendChild(atog("VR/360 videos","vr360Videos",true));
+    box.appendChild(atog("Ambient enabled","enabled",true));
     var rr2=el("div","row2");rr2.appendChild(el("div","","Reset to ambient.json defaults"));rr2.onclick=function(){AMS={};LS.set("ytb_amb",AMS);applyAmb();renderPb("amb")};box.appendChild(rr2);
   }else if(PBLEVEL==="color"){
     box.appendChild(hd("Advanced color","play"));
@@ -4564,7 +4755,7 @@ function renderAdmin(tab){
     Object.keys(ADM.settings).forEach(function(k){
       var v=ADM.settings[k],r=row(k+": ",[]);
       if(["verify","ytdlp","keep_preview"].indexOf(k)>-1){r.appendChild(btn(v==="1"||(k==="ytdlp"&&v!=="0")?"ON":"OFF",function(){var on=(v==="1")||(k==="ytdlp"&&v!=="0");admDo("/api/admin/setting",{key:k,value:on?"off":"on"},k+" updated")}))}
-      else if(k==="proxy"){var sl=el("select");["auto","on","off"].forEach(function(o){var op=el("option","",o);op.value=o;if(o===(v||"auto"))op.selected=true;sl.appendChild(op)});sl.onchange=function(){admDo("/api/admin/setting",{key:k,value:sl.value},"proxy = "+sl.value)};r.appendChild(sl)}
+      else if(k==="proxy"){var sl=el("select");[["auto","auto (IP-lock/acctoken only)"],["on","on / bot-proxy always"],["off","off / direct no proxy"],["force","force bot-proxy"],["mtproto","mtproto (falls to auto)"]].forEach(function(o){var op=el("option","",o[1]);op.value=o[0];if(o[0]===(v||"auto"))op.selected=true;sl.appendChild(op)});sl.onchange=function(){admDo("/api/admin/setting",{key:k,value:sl.value},"proxy = "+sl.value)};r.appendChild(sl)}
       else{var inp=el("input");inp.value=v;r.appendChild(inp);r.appendChild(btn("Save",function(){admDo("/api/admin/setting",{key:k,value:inp.value},k+" saved")}))}
     });
     Object.keys(ADM.prefer).forEach(function(d){row("\u2B50 prefer "+d+": "+ADM.prefer[d].join(", "),[btn("Clear",function(){admDo("/api/admin/prefer",{site:d,host:"off"},"prefer clear")})])});
@@ -4601,6 +4792,66 @@ function initMini(){
   });
   document.addEventListener("visibilitychange",function(){if(document.hidden)pushNow()});
 }
+
+
+/* ========== SUPER POWER PACK (add-only) ========== */
+var SHUFFLE=false,_lastTap=0,_tapSide="";
+function shuffleList(arr){
+  var a=arr.slice();
+  for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1));var t=a[i];a[i]=a[j];a[j]=t}
+  return a;
+}
+function toggleShuffle(){
+  SHUFFLE=!SHUFFLE;
+  toast(SHUFFLE?"Shuffle ON (S)":"Shuffle OFF");
+  return SHUFFLE;
+}
+function nextShuffled(dir){
+  if(!SHUFFLE||!ALL||!ALL.length)return null;
+  var pool=ALL.filter(function(x){return x&&x!==CUR});
+  if(!pool.length)return null;
+  return pool[Math.floor(Math.random()*pool.length)];
+}
+function skipRel(sec){
+  if(!V)return;
+  var d=isFinite(V.duration)?V.duration:1e9;
+  V.currentTime=Math.max(0,Math.min(d-0.25,(V.currentTime||0)+sec));
+}
+function bindDoubleTap(){
+  function flash(id){var n=$(id);if(!n)return;n.classList.add("on");setTimeout(function(){n.classList.remove("on")},350)}
+  function onTap(side,e){
+    var now=Date.now();
+    if(_tapSide===side&&now-_lastTap<280){
+      if(e&&e.preventDefault)e.preventDefault();
+      if(e&&e.stopPropagation)e.stopPropagation();
+      if(side==="L"){skipRel(-10);flash("#dtLr")}else{skipRel(10);flash("#dtRr")}
+      _lastTap=0;_tapSide="";
+    }else{_lastTap=now;_tapSide=side}
+  }
+  var l=$("#dtL"),r=$("#dtR");
+  if(l){l.addEventListener("click",function(e){onTap("L",e)});l.addEventListener("touchend",function(e){onTap("L",e)},{passive:false})}
+  if(r){r.addEventListener("click",function(e){onTap("R",e)});r.addEventListener("touchend",function(e){onTap("R",e)},{passive:false})}
+}
+document.addEventListener("keydown",function(e){
+  if(e.target&&(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA"))return;
+  if($("#watch")&&$("#watch").hidden)return;
+  var k=e.key;
+  if(k==="s"||k==="S"){e.preventDefault();toggleShuffle()}
+  if(k==="." ){e.preventDefault();V.playbackRate=Math.min(3,Math.round(((V.playbackRate||1)+0.25)*100)/100);toast(V.playbackRate+"x")}
+  if(k==="," ){e.preventDefault();V.playbackRate=Math.max(0.25,Math.round(((V.playbackRate||1)-0.25)*100)/100);toast(V.playbackRate+"x")}
+});
+(function(){
+  if(typeof nextItem==="function"){
+    var _ni=nextItem;
+    nextItem=function(dir){
+      if(SHUFFLE&&dir===1){var n=nextShuffled(dir);if(n)return n}
+      return _ni(dir);
+    };
+  }
+})();
+setTimeout(bindDoubleTap,50);
+window.__super={toggleShuffle:toggleShuffle,shuffle:function(){return SHUFFLE},skipRel:skipRel};
+/* ========== end SUPER POWER PACK ========== */
 
 /* ---------- init ---------- */
 function start(){
@@ -4643,10 +4894,29 @@ window.__ytb={refresh:refreshItem,applyFresh:applyFresh,parseLinks:parseLinks,sr
 
 
 AMBIENT_DEFAULT = {
-    "enabled": True, "blur": 25, "edge": 20, "spread": 130, "spreadFadeStart": 20, "spreadFadeCurve": 20,
-    "framerateLimit": 60, "energySaver": True, "enableInPictureInPicture": True,
-    "detectHorizontalBarSizeEnabled": True, "headerShadowOpacity": 30, "headerShadowSize": 25,
-    "surroundingContentFillOpacity": -25, "hideScrollbar": True, "intensity": 90}
+    # Core ambient (YouTube-style glow)
+    "enabled": True, "blur": 28, "edge": 20, "spread": 145, "spreadFadeStart": 22, "spreadFadeCurve": 28,
+    "framerateLimit": 30, "energySaver": True, "enableInPictureInPicture": True,
+    "detectHorizontalBarSizeEnabled": True, "headerShadowOpacity": 35, "headerShadowSize": 30,
+    "surroundingContentFillOpacity": -25, "hideScrollbar": True, "intensity": 88,
+    "smoothing": 0.62, "saturation": 1.45, "brightness": 1.05,
+    # Extra options matching Ambient Light / quality panel screenshots
+    "webglRenderer": True, "resolutionScale": 100, "syncMode": "video",
+    "prioritizePageLoad": True, "youtubeResponsiveness": True, "debandingOptimize": "lcd",
+    "pageHeaderShadowSize": 25, "pageHeaderShadowOpacity": 30,
+    "pageContentShadowSize": 5, "pageContentShadowOpacity": 5,
+    "shadowsOnTextButtonsOnly": False, "imagesOpacity": 100, "buttonsBoxesBgOpacity": -25,
+    "backgroundGreyness": 100, "hideEverythingTheater": False, "relatedAsScrollList": False,
+    "videoSizeSmall": 100.9, "videoShadowSize": 100, "videoShadowOpacity": 15.2,
+    "debandingNoise": 100, "syncVideoAmbient": True, "syncDisableThreshold": 100,
+    "videoJitterWorkaround": False, "videoArtifactsWorkaround": True,
+    "removeBlackBars": False, "removeBlackSidebars": False, "barSize": 0, "sidebarsSize": 0,
+    "resetBarsNextVideo": False, "fillVideoRemovedBars": True,
+    "filterBrightness": 100, "filterContrast": 100, "filterColors": 100, "filterSaturation": 103,
+    "fixedPosition": False, "viewModeLayouts": "all",
+    "pictureInPicture": False, "embeddedVideos": True, "vr360Videos": True,
+    "appearanceTheme": "default",
+}
 
 
 def load_ambient_cfg() -> dict:
@@ -4693,6 +4963,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
                 .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
     cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK, "amb": load_ambient_cfg(), "px": bool(PROXY_BASE),
+           "pxMode": (get_setting("proxy") or "auto"),
            "hash": hashlib.sha256(SKY_PASSWORD.encode("utf-8")).hexdigest() if SKY_PASSWORD else ""}
     if mini:
         cfg.update(mini=True, hash="")      # Mini App: login Telegram se hota hai, password nahi
@@ -7044,7 +7315,9 @@ except Exception:
 # ---------------- settings (DB me save, /settings se badlo) ----------------
 _SETTINGS: Dict[str, str] = {}
 _SETTING_DEFAULTS = {"verify": "0", "min_quality": "0", "include": "", "exclude": "",
-                     "export": "", "ytdlp": "1", "keep_preview": "0", "proxy": "auto"}
+                     "export": "", "ytdlp": "1", "keep_preview": "0", "proxy": "auto",
+                     "min_duration": "0", "max_duration": "0", "daily_limit": "0",
+                     "auto_m3u": "0", "skip_preview_strict": "0"}
 
 
 def load_settings():
@@ -7266,15 +7539,31 @@ def apply_filters(items: List[dict]) -> List[dict]:
         minq = int(get_setting("min_quality") or 0)
     except ValueError:
         minq = 0
+    try:
+        mind = int(get_setting("min_duration") or 0)
+    except ValueError:
+        mind = 0
+    try:
+        maxd = int(get_setting("max_duration") or 0)
+    except ValueError:
+        maxd = 0
     inc = [w.strip().lower() for w in get_setting("include").split(",") if w.strip()]
     exc = [w.strip().lower() for w in get_setting("exclude").split(",") if w.strip()]
-    if not (minq or inc or exc):
+    strict_prev = get_setting("skip_preview_strict") == "1"
+    if not (minq or mind or maxd or inc or exc or strict_prev):
         return items
     out = []
     for it in items:
         t = (it.get("title") or "").lower()
         q = stream_quality(it["download_link"])
+        dur = int(it.get("duration") or 0)
         if minq and q is not None and q < minq:
+            continue
+        if mind and dur and dur < mind:
+            continue
+        if maxd and dur and dur > maxd:
+            continue
+        if strict_prev and it.get("preview_only"):
             continue
         if inc and not any(w in t for w in inc):
             continue
@@ -7528,7 +7817,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• ytdlp (fallback extractor): {'ON' if get_setting('ytdlp') != '0' else 'OFF'}"
         f"{'' if yt_dlp else '  (yt-dlp install nahi hai)'}\n"
         f"• keep_preview (sirf 0.5s clip wale items bhi rakho): {'ON' if get_setting('keep_preview') == '1' else 'OFF'}\n"
-        f"• proxy (player ko bot ke through stream: auto/on/off): {get_setting('proxy') or 'auto'} | PROXY_BASE: {PROXY_BASE or 'SET NAHI'}\n"
+        f"• proxy (player stream: auto=IP-lock/acctoken | on/force=always bot-proxy | off/direct=no proxy | mtproto→auto): {get_setting('proxy') or 'auto'} | PROXY_BASE: {PROXY_BASE or 'SET NAHI'}\n"
         f"• min_quality: {get_setting('min_quality')}\n"
         f"• include (title me ye words): {show('include')}\n"
         f"• exclude (title me ye words nahi): {show('exclude')}\n"
@@ -8262,6 +8551,185 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+# ==========================================================
+# NEW FEATURES: version / proxy / quota / queue / ping / mirrors
+# ==========================================================
+BOT_VERSION = "2.2-ambient-proxy"
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_user_allowed(update.effective_user.id):
+        return
+    flags = [
+        f"curl_cffi: {'ON' if cffi_requests else 'OFF'}",
+        f"yt-dlp: {'ON' if yt_dlp else 'OFF'}",
+        f"Proxy pool: {len(_PROXY_POOL)}",
+        f"PROXY_BASE: {'SET' if PROXY_BASE else 'NO'}",
+        f"Supabase: {'ON' if sb_enabled() else 'OFF'}",
+        f"Daily limit: {daily_limit() or 'unlimited'}",
+    ]
+    await update.message.reply_text(
+        f"🤖 Bot version: <b>{BOT_VERSION}</b>\n👑 {BOT_OWNER_NAME}\n\n" + "\n".join(f"• {x}" for x in flags),
+        parse_mode="HTML")
+
+
+async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args or []
+    if args and args[0].lower() == "reload":
+        _init_proxy_pool()
+        _PROXY_FAILS.clear()
+        await update.message.reply_text(f"🔄 Proxy pool reloaded: {len(_PROXY_POOL)} proxies")
+        return
+    if not _PROXY_POOL:
+        await update.message.reply_text(
+            "ℹ️ Proxy pool empty.\nSet PROXY_URL or PROXY_URLS=url1,url2\n"
+            f"Current PROXY_URL: {'SET' if PROXY_URL else 'empty'}")
+        return
+    lines = ["🌐 Proxy pool:"]
+    for i, p in enumerate(_PROXY_POOL):
+        fails = _PROXY_FAILS.get(p, 0)
+        mask = re.sub(r':[^:@/]+@', ':***@', p)
+        if len(mask) > 60:
+            mask = mask[:28] + "..." + mask[-20:]
+        lines.append(f"  {i+1}. {mask}  fails={fails}")
+    lines.append(f"\nActive next: #{(_PROXY_IDX[0] % len(_PROXY_POOL)) + 1}")
+    lines.append("Reload: /proxy reload")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    lim = daily_limit()
+    used = daily_used(uid)
+    if lim <= 0:
+        msg = f"📊 Daily quota: unlimited\nAaj use: {used} pages"
+    else:
+        msg = f"📊 Daily quota: {used}/{lim} pages\nBache: {max(0, lim - used)}"
+    if uid == ADMIN_ID:
+        msg += "\n(Admin: limit apply nahi hoti)\nSet: /settings daily_limit 50"
+    await update.message.reply_text(msg)
+
+
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    args = context.args or []
+    if args and args[0].lower() == "clear":
+        SCRAPE_QUEUE[uid] = []
+        await update.message.reply_text("🗑 Queue clear ho gayi.")
+        return
+    if args and args[0].lower() == "run":
+        return await queue_run_command(update, context)
+    if args and re.match(r'^https?://', args[0], re.I):
+        url = args[0]
+        start, end = 1, 5
+        if len(args) >= 2:
+            m = re.match(r'^(\d+)-(\d+)$', args[1])
+            if m:
+                start, end = int(m.group(1)), int(m.group(2))
+            elif args[1].isdigit():
+                start = end = int(args[1])
+        if not daily_ok(uid, end - start + 1):
+            await update.message.reply_text(f"❌ Daily limit. /quota  ({daily_used(uid)}/{daily_limit()})")
+            return
+        pos = queue_add(uid, url, start, end)
+        await update.message.reply_text(
+            f"✅ Queue #{pos}\n{url}\npages {start}-{end}\nPending: {queue_len(uid)}\n/queue run")
+        return
+    q = SCRAPE_QUEUE.get(uid) or []
+    if not q:
+        await update.message.reply_text(
+            "📭 Queue khali.\n/queue <url> [1-10]\n/queue run\n/queue clear")
+        return
+    lines = [f"📋 Queue ({len(q)}):"]
+    for i, j in enumerate(q[:15], 1):
+        lines.append(f"{i}. {j['start']}-{j['end']} | {normalize_domain(j['url'])}")
+    lines.append("\n/queue run  |  /queue clear")
+    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
+async def queue_run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    if SCRAPE_QUEUE_RUNNING.get(uid):
+        await update.message.reply_text("⏳ Queue already running. /stop")
+        return
+    q = SCRAPE_QUEUE.get(uid) or []
+    if not q:
+        await update.message.reply_text("📭 Queue khali. /queue <url>")
+        return
+    SCRAPE_QUEUE_RUNNING[uid] = True
+    status = await update.message.reply_text(f"🚀 Queue start: {len(q)} jobs...")
+    try:
+        done = 0
+        while SCRAPE_QUEUE.get(uid):
+            if STOP_PROCESS.get(uid):
+                await status.edit_text(f"🛑 Stop. Done {done}, left {queue_len(uid)}")
+                break
+            job = SCRAPE_QUEUE[uid].pop(0)
+            if not daily_ok(uid, job["end"] - job["start"] + 1):
+                SCRAPE_QUEUE[uid].insert(0, job)
+                await update.message.reply_text("❌ Daily limit — queue pause")
+                break
+            try:
+                await status.edit_text(f"⏳ {done+1}: p{job['start']}-{job['end']}\n{job['url'][:80]}")
+            except Exception:
+                pass
+            try:
+                chat = update.effective_chat
+                if "scr_run" in globals() and callable(scr_run):
+                    await scr_run(chat, context, uid, job["url"], job["start"], job["end"])
+                elif "run_scrape_chunk" in globals():
+                    await run_scrape_chunk(update, context, job["url"], job["start"], job["end"])
+                else:
+                    await update.message.reply_text(f"⚠️ runner missing: {job['url']}")
+                daily_add(uid, job["end"] - job["start"] + 1)
+                done += 1
+            except Exception as e:
+                logger.error(f"queue error: {e}")
+                await update.message.reply_text(f"❌ {str(e)[:120]}")
+        else:
+            await status.edit_text(f"✅ Queue complete: {done} jobs")
+    finally:
+        SCRAPE_QUEUE_RUNNING[uid] = False
+        STOP_PROCESS[uid] = False
+
+
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t0 = time.time()
+    m = await update.message.reply_text("🏓 pong...")
+    ms = int((time.time() - t0) * 1000)
+    try:
+        await m.edit_text(f"🏓 pong — {ms} ms\n🤖 {BOT_VERSION}")
+    except Exception:
+        pass
+
+
+async def mirrors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_user_allowed(update.effective_user.id):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /mirrors xhamster")
+        return
+    kw = args[0].lower().strip()
+    hits = [d for d in get_all_sites() if kw in d.lower()]
+    for k in SITES_KEYWORD:
+        if kw in k.lower() and k not in hits:
+            hits.append(k)
+    if not hits:
+        await update.message.reply_text(f"No match: {kw}")
+        return
+    await update.message.reply_text("🔗 Matches:\n" + "\n".join(f"• {h}" for h in hits[:40]))
+
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN environment variable set nahi hai. "
@@ -8320,7 +8788,13 @@ def main():
     app.add_handler(CommandHandler("adscr", adscr_command))
     app.add_handler(CommandHandler("mini", mini_command))
     app.add_handler(CommandHandler("commands", commands_command))
-
+    app.add_handler(CommandHandler("version", version_command))
+    app.add_handler(CommandHandler("proxy", proxy_command))
+    app.add_handler(CommandHandler("quota", quota_command))
+    app.add_handler(CommandHandler("queue", queue_command))
+    app.add_handler(CommandHandler("qrun", queue_run_command))
+    app.add_handler(CommandHandler("ping", ping_command))
+    app.add_handler(CommandHandler("mirrors", mirrors_command))
 
     # /scr buttons MUST be registered before the generic callback handler
     app.add_handler(CallbackQueryHandler(scr_callback, pattern=r"^scr_"))
