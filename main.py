@@ -2048,8 +2048,7 @@ def link_stats(html: str, page_url: str) -> str:
         f"🔢 <a> tags: {len(hrefs)} | same-site: {len(same)} | <img>: {len(re.findall(r'<img\b', html, re.I))}\n"
         f"🧩 Top URL shapes: {shapes.most_common(4)}\n"
         f"⚙️ <script> blocks: {len(re.findall(r'<script', html, re.I))} "
-        f"(zyada script + kam <a> = JS-rendered listing)"
-    )
+        f"(zyada script + kam <a> = JS-rendered listing)")
 
 
 def _looks_like_single_video(url: str) -> bool:
