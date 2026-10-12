@@ -3271,15 +3271,27 @@ a{color:inherit}
 .wmain{position:relative;z-index:0}
 .player{position:relative;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);user-select:none}
 .pin{position:absolute;inset:0;overflow:hidden;background:#000;border-radius:12px}
-.ambc{position:absolute;z-index:-1;pointer-events:none;transition:opacity .4s}
+.ambc{position:absolute;z-index:-1;pointer-events:none;transition:opacity .4s;object-fit:fill}
+/* Full-page ambient wash (YouTube-style) — fixed behind everything */
+#ambPage{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .5s ease;
+  background:radial-gradient(ellipse 90% 70% at 50% 35%,rgba(var(--amb-rgb,20,20,20),.55) 0%,rgba(var(--amb-rgb,20,20,20),.18) 45%,transparent 78%)}
+#ambPage.on{opacity:1}
+#ambPage canvas{position:absolute;inset:-8%;width:116%;height:116%;object-fit:fill;
+  filter:blur(72px) saturate(1.5) brightness(1.05);opacity:.85;transform:scale(1.05)}
 body.amb-on{overflow-x:hidden}
+body.amb-on #watch,body.amb-on .wl,body.amb-on .wmain{position:relative;z-index:1}
+body.amb-on .top{position:relative;z-index:60}
 html:has(body.amb-on){scrollbar-width:none}
 html:has(body.amb-on)::-webkit-scrollbar{display:none}
 .amb-on .top{box-shadow:var(--hsh,none)}
 .amb-on .desc,.amb-on .act{background:color-mix(in srgb,var(--bg2) 75%,transparent)}
-.amb-on .player::before{content:"";position:absolute;inset:-48px;z-index:-2;pointer-events:none;
-  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.42) 0%,transparent 72%);
-  filter:blur(48px);transition:background .35s}
+/* Player-local glow (around the video) */
+.amb-on .player::before{content:"";position:absolute;inset:-56px;z-index:-2;pointer-events:none;
+  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.55) 0%,rgba(var(--amb-rgb,20,20,20),.22) 40%,transparent 72%);
+  filter:blur(52px);transition:background .3s}
+/* Soft page background tint from video colors */
+body.amb-on #watch{background:radial-gradient(ellipse 100% 80% at 50% 20%,rgba(var(--amb-rgb,20,20,20),.28) 0%,var(--bg) 70%)}
+body.amb-on .upn,body.amb-on .meta{background:color-mix(in srgb,var(--bg) 88%,rgb(var(--amb-rgb,20,20,20)) 12%)}
 #statsN{position:absolute;top:10px;left:10px;z-index:8;background:rgba(0,0,0,.78);color:#0f0;font:12px/1.45 ui-monospace,Consolas,monospace;
   padding:8px 10px;border-radius:8px;max-width:min(92%,360px);white-space:pre;pointer-events:none;display:none}
 #statsN.on{display:block}
@@ -3400,6 +3412,8 @@ html:has(body.amb-on)::-webkit-scrollbar{display:none}
 </style>
 </head>
 <body>
+<!-- Full-page ambient glow layer (YouTube-style page wash) -->
+<div id="ambPage" aria-hidden="true"><canvas id="ambPageCv"></canvas></div>
 <div id="lock" hidden><div class="lbox"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><h3>Protected</h3><input id="pw" type="password" placeholder="Password" autocomplete="off"><button id="pwb">Unlock</button><div id="lerr"></div><div class="own2" id="lockOwn"></div></div></div>
 <div id="app" hidden>
 <header class="top">
@@ -4260,19 +4274,39 @@ function setSession(it){
   }catch(e){}
 }
 
-/* ---------- Ambient light (YouTube jaisa glow; settings = ambient.json) ---------- */
+/* ---------- Ambient light (YouTube jaisa: player glow + full-page wash) ---------- */
 var AM=CFG.amb||{},AMS=LS.get("ytb_amb",{}),amCv=$("#amb"),amCx=null,amRaf=0,amLast=0,amN=0,amTry=0,amBars={t:0,b:0,on:true};
+var amPage=$("#ambPage"),amPageCv=$("#ambPageCv"),amPageCx=null,amLastColors=null;
 function amv(k,d){return AMS[k]!==undefined?AMS[k]:(AM[k]!==undefined?AM[k]:d)}
 function amset(k,v){AMS[k]=v;LS.set("ytb_amb",AMS);applyAmb()}
 function applyAmb(){
-  var on=!!amv("enabled",true),sp=amv("spread",130)/100,bl=amv("blur",25),fs=amv("spreadFadeStart",20),fc=amv("spreadFadeCurve",20);
-  document.body.classList.toggle("amb-on",on);amCv.hidden=!on;
-  amCv.style.width=(sp*100)+"%";amCv.style.height=(sp*100)+"%";amCv.style.left=((1-sp)*50)+"%";amCv.style.top=((1-sp)*50)+"%";
-  amCv.style.filter="blur("+Math.round(bl*1.6)+"px) saturate("+amv("saturation",1.45)+") brightness("+amv("brightness",1.05)+")";
-  var m="radial-gradient(ellipse closest-side,#000 "+Math.max(0,100-fs-fc)+"%,rgba(0,0,0,0) 100%)";
-  amCv.style.webkitMaskImage=m;amCv.style.maskImage=m;amCv.style.opacity=amv("intensity",90)/100;
+  var on=!!amv("enabled",true),sp=amv("spread",145)/100,bl=amv("blur",28),fs=amv("spreadFadeStart",22),fc=amv("spreadFadeCurve",28);
+  var watchOpen=!$("#watch").hidden;
+  document.body.classList.toggle("amb-on",on&&watchOpen);
+  if(amCv){
+    amCv.hidden=!on;
+    amCv.style.width=(sp*100)+"%";amCv.style.height=(sp*100)+"%";amCv.style.left=((1-sp)*50)+"%";amCv.style.top=((1-sp)*50)+"%";
+    amCv.style.filter="blur("+Math.round(bl*1.6)+"px) saturate("+amv("saturation",1.45)+") brightness("+amv("brightness",1.05)+")";
+    var m="radial-gradient(ellipse closest-side,#000 "+Math.max(0,100-fs-fc)+"%,rgba(0,0,0,0) 100%)";
+    amCv.style.webkitMaskImage=m;amCv.style.maskImage=m;amCv.style.opacity=amv("intensity",88)/100;
+  }
+  if(amPage){
+    amPage.classList.toggle("on",on&&watchOpen);
+    if(amPageCv){
+      var edge=amv("edge",20);
+      amPageCv.style.filter="blur("+Math.max(40,Math.round(bl*2.4))+"px) saturate("+amv("saturation",1.45)+") brightness("+amv("brightness",1.05)+")";
+      amPageCv.style.opacity=Math.min(1,(amv("intensity",88)/100)*0.95);
+      amPage.style.opacity=on&&watchOpen?String(Math.min(1,0.35+amv("intensity",88)/200)):"";
+    }
+  }
   document.documentElement.style.setProperty("--hsh","0 0 "+amv("headerShadowSize",25)+"px rgba(0,0,0,"+(amv("headerShadowOpacity",30)/100)+")");
-  if(on)ambStart();
+  if(on&&watchOpen)ambStart();
+  else ambStop();
+}
+function ambStop(){
+  if(amRaf){cancelAnimationFrame(amRaf);amRaf=0}
+  if(amPage)amPage.classList.remove("on");
+  document.body.classList.remove("amb-on");
 }
 function detectBars(vw,vh){
   try{
@@ -4283,36 +4317,57 @@ function detectBars(vw,vh){
     amBars={t:t/36,b:b/36,on:true};
   }catch(e){amBars={t:0,b:0,on:false}}
 }
-var amLastColors=null;
+function ambPushColors(r,g,b){
+  var sm=+amv("smoothing",0.62);
+  if(amLastColors){r=Math.round(amLastColors.r*sm+r*(1-sm));g=Math.round(amLastColors.g*sm+g*(1-sm));b=Math.round(amLastColors.b*sm+b*(1-sm))}
+  amLastColors={r:r,g:g,b:b};
+  document.documentElement.style.setProperty("--amb-r",r);
+  document.documentElement.style.setProperty("--amb-g",g);
+  document.documentElement.style.setProperty("--amb-b",b);
+  document.documentElement.style.setProperty("--amb-rgb",r+","+g+","+b);
+  /* page-wash gradient also follows live colors via CSS vars */
+  if(amPage){
+    amPage.style.background="radial-gradient(ellipse 90% 70% at 50% 35%,rgba("+r+","+g+","+b+",.58) 0%,rgba("+r+","+g+","+b+",.20) 45%,transparent 78%)";
+  }
+}
 function ambDraw(){
   if(!amCx){amCv.width=160;amCv.height=90;try{amCx=amCv.getContext("2d",{willReadFrequently:true})}catch(e){try{amCx=amCv.getContext("2d")}catch(e2){}}if(!amCx)return}
+  if(amPageCv&&!amPageCx){
+    amPageCv.width=48;amPageCv.height=27;
+    try{amPageCx=amPageCv.getContext("2d",{willReadFrequently:true})}catch(e){try{amPageCx=amPageCv.getContext("2d")}catch(e2){}}
+  }
   var vw=V.videoWidth,vh=V.videoHeight;if(!vw||!vh||V.readyState<2)return;
   if(amv("detectHorizontalBarSizeEnabled",true)&&amBars.on!==false&&amN%30===0)detectBars(vw,vh);
   var sy=Math.round(vh*amBars.t),sh=Math.max(1,Math.round(vh*(1-amBars.t-amBars.b)));
   try{
-    amCx.drawImage(V,0,sy,vw,sh,0,0,160,90);amN++;
-    if(amN%3===0){
+    amCx.drawImage(V,0,sy,vw,sh,0,0,160,90);
+    if(amPageCx){
+      try{amPageCx.drawImage(amCv,0,0,160,90,0,0,48,27)}catch(e3){try{amPageCx.drawImage(V,0,sy,vw,sh,0,0,48,27)}catch(e4){}}
+    }
+    amN++;
+    if(amN%2===0){
       var d=amCx.getImageData(0,0,160,90).data,r=0,g=0,b=0,n=0;
-      for(var i=0;i<d.length;i+=20){r+=d[i];g+=d[i+1];b+=d[i+2];n++}
-      if(n){r=Math.round(r/n);g=Math.round(g/n);b=Math.round(b/n);
-        var sm=+amv("smoothing",0.62);if(amLastColors){r=Math.round(amLastColors.r*sm+r*(1-sm));g=Math.round(amLastColors.g*sm+g*(1-sm));b=Math.round(amLastColors.b*sm+b*(1-sm))}
-        amLastColors={r:r,g:g,b:b};
-        document.documentElement.style.setProperty("--amb-r",r);
-        document.documentElement.style.setProperty("--amb-g",g);
-        document.documentElement.style.setProperty("--amb-b",b);
-        document.documentElement.style.setProperty("--amb-rgb",r+","+g+","+b);
-      }
+      for(var i=0;i<d.length;i+=16){r+=d[i];g+=d[i+1];b+=d[i+2];n++}
+      if(n)ambPushColors(Math.round(r/n),Math.round(g/n),Math.round(b/n));
     }
   }catch(e){}
 }
 function ambFrame(ts){
   amRaf=0;
+  /* Sync band nahi hota jab tak watch page open + ambient enabled */
   if(!amv("enabled",true)||$("#watch").hidden||document.hidden)return;
+  if(amv("syncVideoAmbient",true)===false&&V.paused&&amN>8)return;
   var fps=Math.min(60,Math.max(5,amv("framerateLimit",30)));
+  /* energySaver: paused pe slow sample, lekin band nahi */
+  if(V.paused&&amv("energySaver",true))fps=Math.min(fps,6);
   if(ts-amLast>=1000/fps){amLast=ts;amTry++;ambDraw()}
-  if(amTry<400&&(!V.paused||amN<3||!amv("energySaver",true)))amRaf=requestAnimationFrame(ambFrame);
+  /* Keep looping the entire time watch is open (no 400-frame hard stop) */
+  amRaf=requestAnimationFrame(ambFrame);
 }
-function ambStart(){if(!amRaf&&amv("enabled",true)&&!$("#watch").hidden){amTry=0;amRaf=requestAnimationFrame(ambFrame)}}
+function ambStart(){
+  if(!amv("enabled",true)||$("#watch").hidden)return;
+  if(!amRaf){amTry=0;amRaf=requestAnimationFrame(ambFrame)}
+}
 document.addEventListener("visibilitychange",function(){if(!document.hidden){amN=0;ambStart()}});
 
 /* ---------- end screen (YouTube jaisa: replay + up next countdown + suggestions) ---------- */
@@ -4666,7 +4721,7 @@ function showWatch(i){
   $("#dimT").textContent=it.t||"";pbClose();renderMeta(it);renderUpnext(it);loadItem(it);setSession(it);applyAmb();window.scrollTo(0,0);showCtl();
 }
 function showHome(){
-  if(!$("#watch").hidden){hideEnd();pbClose();cancelAnimationFrame(amRaf);amRaf=0;destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title+(CFG.owner?" | "+CFG.owner:"")}
+  if(!$("#watch").hidden){hideEnd();pbClose();ambStop();amLastColors=null;destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title+(CFG.owner?" | "+CFG.owner:"")}
   $("#home").hidden=false;chipsEl.hidden=false;tgBack(false);renderGrid();updChips();
 }
 function route(){var m=location.hash.match(/^#\/w\/(\d+)/);if(m)showWatch(+m[1]);else showHome()}
@@ -8559,7 +8614,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "2.2-ambient-proxy"
+BOT_VERSION = "2.3-yt-ambient"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
