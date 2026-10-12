@@ -3272,32 +3272,36 @@ a{color:inherit}
 .player{position:relative;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);user-select:none;overflow:visible}
 .pin{position:absolute;inset:0;overflow:hidden;background:#000;border-radius:12px;z-index:1}
 /* Player-local ambient canvas — blurred video behind/around player */
-.ambc{position:absolute;z-index:0;pointer-events:none;opacity:0;object-fit:fill;left:-20%;top:-20%;width:140%;height:140%;
-  filter:blur(52px) saturate(1.65) brightness(1.1);transform:scale(1.04);transition:opacity .35s}
-body.amb-on .ambc{opacity:var(--amb-op,.92)}
-/* Full-page ambient — fixed layer, full HTML viewport (YouTube style) */
-#ambPage{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0;overflow:hidden;
+.ambc{position:absolute;z-index:0;pointer-events:none!important;opacity:0;object-fit:fill;left:-16%;top:-16%;width:132%;height:132%;
+  filter:blur(46px) saturate(1.5) brightness(1.06);transform:scale(1.02);transition:opacity .35s}
+body.amb-on .ambc{opacity:var(--amb-op,.82)}
+/* Full-page ambient — fixed layer behind page content */
+#ambPage{position:fixed;inset:0;z-index:0;pointer-events:none!important;opacity:0;overflow:hidden;
   transition:opacity .4s ease;background:rgb(var(--amb-rgb,12,12,12))}
 #ambPage.on{opacity:1}
-#ambPage canvas{position:absolute;left:50%;top:40%;width:160vmax;height:160vmax;max-width:none;
-  transform:translate(-50%,-50%);filter:blur(90px) saturate(1.75) brightness(1.12);opacity:.95}
-/* Ambient ON: body/app transparent so full-page glow is visible everywhere */
+#ambPage canvas{position:absolute;left:50%;top:40%;width:140vmax;height:140vmax;max-width:none;
+  transform:translate(-50%,-50%);filter:blur(80px) saturate(1.55) brightness(1.08);opacity:.88;pointer-events:none!important}
 body.amb-on{overflow-x:hidden;background:transparent!important}
 body.amb-on #app{background:transparent!important}
 body.amb-on #home{background:transparent}
 body.amb-on #watch,body.amb-on .wl,body.amb-on .wmain{position:relative;z-index:2}
-body.amb-on .top{position:relative;z-index:60;background:color-mix(in srgb,var(--bg) 80%,transparent)}
-body.amb-on .chips{background:color-mix(in srgb,var(--bg) 80%,transparent)}
+body.amb-on .top{position:relative;z-index:60;background:color-mix(in srgb,var(--bg) 85%,transparent)}
+body.amb-on .chips{background:color-mix(in srgb,var(--bg) 85%,transparent)}
 html:has(body.amb-on){scrollbar-width:none;background:#000}
 html:has(body.amb-on)::-webkit-scrollbar{display:none}
 .amb-on .top{box-shadow:var(--hsh,none)}
-.amb-on .desc,.amb-on .act{background:color-mix(in srgb,var(--bg2) 70%,transparent)}
-.amb-on .player::after{content:"";position:absolute;inset:-36px;z-index:-1;pointer-events:none;border-radius:18px;
-  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.55) 0%,rgba(var(--amb-rgb,20,20,20),.18) 55%,transparent 75%);
-  filter:blur(24px)}
+.amb-on .desc,.amb-on .act{background:color-mix(in srgb,var(--bg2) 75%,transparent)}
+.amb-on .player::after{content:"";position:absolute;inset:-24px;z-index:0;pointer-events:none!important;border-radius:14px;
+  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.4) 0%,rgba(var(--amb-rgb,20,20,20),.12) 55%,transparent 75%);
+  filter:blur(18px)}
 body.amb-on .upn,body.amb-on .meta,body.amb-on .wside{
-  background:color-mix(in srgb,var(--bg) 75%,rgb(var(--amb-rgb,20,20,20)) 25%)}
-body.amb-on .wside .c,body.amb-on .up{background:color-mix(in srgb,var(--bg2) 68%,transparent)}
+  background:color-mix(in srgb,var(--bg) 82%,rgb(var(--amb-rgb,20,20,20)) 18%)}
+body.amb-on .wside .c,body.amb-on .up{background:color-mix(in srgb,var(--bg2) 75%,transparent)}
+/* Settings + controls above ambient always */
+.pbm{z-index:40!important;pointer-events:auto!important}
+.ctl{z-index:25!important;pointer-events:auto!important}
+.ov{z-index:15}
+.err,.endsc{z-index:35}
 #statsN{position:absolute;top:10px;left:10px;z-index:8;background:rgba(0,0,0,.78);color:#0f0;font:12px/1.45 ui-monospace,Consolas,monospace;
   padding:8px 10px;border-radius:8px;max-width:min(92%,360px);white-space:pre;pointer-events:none;display:none}
 #statsN.on{display:block}
@@ -3307,8 +3311,15 @@ body.amb-on .wside .c,body.amb-on .up{background:color-mix(in srgb,var(--bg2) 68
   text-shadow:0 2px 8px #000;transition:opacity .2s;pointer-events:none}
 .dtap .rip2.on{opacity:1}
 .player video,.player #imgv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
-.player:fullscreen{max-height:none;background:#000}.player:fullscreen .pin{border-radius:0}.player:fullscreen .ambc{display:none}
-body:has(.player:fullscreen) #ambPage{opacity:0!important}
+.player:fullscreen,.player:-webkit-full-screen{max-height:none;background:#000;overflow:visible}
+.player:fullscreen .pin,.player:-webkit-full-screen .pin{border-radius:0;z-index:1}
+/* Fullscreen ambient: keep local canvas, hide page layer (outside FS element) */
+.player:fullscreen .ambc,.player:-webkit-full-screen .ambc{
+  display:block!important;opacity:var(--amb-op,.85)!important;left:-25%;top:-25%;width:150%;height:150%;
+  filter:blur(56px) saturate(1.55) brightness(1.08);z-index:0;pointer-events:none!important}
+.player:fullscreen .pbm,.player:-webkit-full-screen .pbm{z-index:50!important}
+.player:fullscreen .ctl,.player:-webkit-full-screen .ctl{z-index:30!important}
+body:has(.player:fullscreen) #ambPage,body:has(.player:-webkit-full-screen) #ambPage{opacity:0!important;pointer-events:none!important}
 .aud{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:90px;color:#555}
 .ov{position:absolute;inset:0 0 54px 0;z-index:3}
 .big{position:absolute;left:50%;top:50%;width:68px;height:68px;margin:-34px;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;font-size:30px;display:flex;align-items:center;justify-content:center;opacity:0;transition:.2s;pointer-events:none}
@@ -4382,6 +4393,8 @@ function ambStart(){
   if(!amRaf)amRaf=requestAnimationFrame(ambFrame);
 }
 document.addEventListener("visibilitychange",function(){if(!document.hidden)ambStart()});
+document.addEventListener("fullscreenchange",function(){amN=0;if(!$("#watch").hidden){applyAmb();ambStart()}});
+document.addEventListener("webkitfullscreenchange",function(){amN=0;if(!$("#watch").hidden){applyAmb();ambStart()}});
 
 /* ---------- end screen (YouTube jaisa: replay + up next countdown + suggestions) ---------- */
 function hideEnd(){clearInterval(endT);endT=null;ENDSHOWN=false;var e=$("#endsc");if(e){e.hidden=true;e.textContent=""}}
@@ -4694,8 +4707,20 @@ function renderPb(level){
     rr.onclick=function(){["bright","contrast","sat","warm"].forEach(function(k){pbset(k,PBDEF[k])});applyVideoFx();renderPb("color")};box.appendChild(rr);
   }
 }
-$("#bMore").onclick=function(e){e.stopPropagation();if(!$("#pbm").hidden){pbClose();return}renderPb("main");showCtl()};
-document.addEventListener("pointerdown",function(e){var b=$("#pbm");if(!b.hidden&&!e.target.closest("#pbm")&&!e.target.closest("#bMore"))pbClose()});
+$("#bMore").onclick=function(e){
+  e.preventDefault();e.stopPropagation();
+  PL.classList.add("show");clearTimeout(hideT);
+  var b=$("#pbm");
+  if(!b.hidden){pbClose();return}
+  try{renderPb("main")}catch(err){console.error("settings panel",err);toast("Settings error")}
+  showCtl();
+};
+$("#bMore").onpointerdown=function(e){e.stopPropagation()};
+document.addEventListener("pointerdown",function(e){
+  var b=$("#pbm");if(!b||b.hidden)return;
+  if(e.target.closest("#pbm")||e.target.closest("#bMore")||e.target.closest(".ctl"))return;
+  pbClose();
+});
 
 /* ---------- watch page ---------- */
 function actBtn(txt,fn,on){var b=el("button","act"+(on?" on":""),txt);b.onclick=fn;return b}
@@ -8627,7 +8652,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "2.4-full-ambient"
+BOT_VERSION = "2.5-fs-settings"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
