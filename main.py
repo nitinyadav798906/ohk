@@ -71,7 +71,8 @@ _PROXY_FAILS: Dict[str, int] = {}
 def _init_proxy_pool():
     global _PROXY_POOL
     seen, out = set(), []
-    for raw in (os.getenv("PROXY_URLS", "") + "," + PROXY_URL).split(","):
+    _extra = ((globals().get("_SETTINGS") or {}).get("proxy_extra", "") or "").replace("\n", ",")
+    for raw in (os.getenv("PROXY_URLS", "") + "," + PROXY_URL + "," + _extra).split(","):
         p = (raw or "").strip()
         if p and p not in seen:
             seen.add(p); out.append(p)
@@ -773,6 +774,128 @@ def health_overview() -> list:
     return sorted(out, key=lambda x: x["last"])
 
 
+# ==========================================================
+# PROXY PLUS (add-only): player se custom upstream proxy, server pool, MTProto links
+# ==========================================================
+_PX_SCHEMES = ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+
+
+def _px_clean_proxy(raw: str) -> str:
+    """Player se aaya custom upstream proxy validate karo. Galat / unsafe ho to '' (SSRF guard: private host nahi)."""
+    raw = (raw or "").strip()
+    if not raw or len(raw) > 400 or os.getenv("PX_ALLOW_CUSTOM", "1") == "0":
+        return ""
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        pu = urlsplit(raw)
+        scheme = (pu.scheme or "").lower()
+        host, port = pu.hostname, pu.port
+    except ValueError:
+        return ""
+    if scheme not in _PX_SCHEMES or not host or not port:
+        return ""
+    if not _px_host_ok(host):
+        return ""
+    if scheme == "socks5":        # remote DNS (DNS-block / geo se bachne ke liye)
+        raw = "socks5h" + raw[len("socks5"):]
+    elif scheme == "socks4":
+        raw = "socks4a" + raw[len("socks4"):]
+    return raw
+
+
+def _px_pool_pick() -> str:
+    """Server pool se sticky (rotate nahi) proxy: IP-lock stream me IP badalna nahi chahiye."""
+    if not _PROXY_POOL:
+        _init_proxy_pool()
+    for p in _PROXY_POOL:
+        if _PROXY_FAILS.get(p, 0) < 8:
+            return p
+    return _PROXY_POOL[0] if _PROXY_POOL else (PROXY_URL or "")
+
+
+def _px_pick_proxies(q: dict, default):
+    """/p?...&cp=<proxy url> (user ka apna proxy) ya &pp=1 (server pool). Dono na ho to purana behaviour."""
+    cp = (q.get("cp") or [""])[0]
+    if cp:
+        p = _px_clean_proxy(cp)
+        if not p:
+            raise ValueError("bad custom proxy")
+        return {"http": p, "https": p}
+    if (q.get("pp") or [""])[0] == "1":
+        p = _px_pool_pick()
+        if p:
+            return {"http": p, "https": p}
+    return default
+
+
+def _px_carry(body: bytes, q: dict) -> bytes:
+    """m3u8 / mpd ke andar rewrite hue segment links me bhi wahi proxy param (cp / pp) jodo."""
+    extra = ""
+    cp = (q.get("cp") or [""])[0]
+    if cp:
+        extra = "&cp=" + quote(cp, safe="")
+    elif (q.get("pp") or [""])[0] == "1":
+        extra = "&pp=1"
+    if not extra:
+        return body
+    txt = body.decode("utf-8", "ignore")
+    txt = re.sub(r'(/p\?u=[^&\s"\'<>]+&r=[^&\s"\'<>]*&s=[0-9a-f]{32})', lambda m: m.group(1) + extra, txt)
+    return txt.encode("utf-8")
+
+
+# ---- MTProto (Telegram proxy) links: sirf Telegram app ke liye, HTTP stream ke liye nahi ----
+_MT_KEY = "mtproto_list"
+_MT_HOST_RE = re.compile(r'^[A-Za-z0-9.\-]{1,253}$')
+_MT_SECRET_RE = re.compile(r'^[A-Za-z0-9_\-=+/%]{16,400}$')
+
+
+def mt_parse(raw: str) -> str:
+    """tg://proxy?server=..&port=..&secret=.. | https://t.me/proxy?... | 'host port secret' | 'host:port:secret'
+    -> https://t.me/proxy?server=..&port=..&secret=.. (galat ho to '')."""
+    raw = (raw or "").strip()
+    server = port = secret = ""
+    if re.search(r'[?&]server=', raw, re.I):
+        q = parse_qs(urlsplit(raw).query)
+        server = (q.get("server") or [""])[0]
+        port = (q.get("port") or [""])[0]
+        secret = (q.get("secret") or [""])[0]
+    else:
+        m = re.match(r'^([^:\s]+)[:\s]+(\d{2,5})[:\s]+(\S+)$', raw)
+        if m:
+            server, port, secret = m.groups()
+    if not (_MT_HOST_RE.match(server or "") and port.isdigit() and 0 < int(port) < 65536 and _MT_SECRET_RE.match(secret or "")):
+        return ""
+    return f"https://t.me/proxy?server={quote(server, safe='')}&port={port}&secret={quote(secret, safe='')}"
+
+
+def mt_db_list() -> List[str]:
+    out: List[str] = []
+    for ln in (get_setting(_MT_KEY) or "").split("\n"):
+        l = mt_parse(ln)
+        if l and l not in out:
+            out.append(l)
+    return out
+
+
+def mt_list() -> List[str]:
+    out: List[str] = []
+    for ln in re.split(r'[\n,;]+', os.getenv("MTPROTO_PROXIES", "")) + mt_db_list():
+        l = mt_parse(ln)
+        if l and l not in out:
+            out.append(l)
+    return out
+
+
+def mt_label(link: str) -> str:
+    q = parse_qs(urlsplit(link).query)
+    return f"{(q.get('server') or ['?'])[0]}:{(q.get('port') or ['?'])[0]}"
+
+
+def mt_public() -> list:
+    return [{"n": mt_label(l), "l": l} for l in mt_list()]
+
+
 def px_handle(h, head: bool = False):
     q = parse_qs(urlsplit(h.path).query)
     u = (q.get("u") or [""])[0]
@@ -801,6 +924,10 @@ def px_handle(h, head: bool = False):
     if h.headers.get("Range"):
         hdrs["Range"] = h.headers["Range"]
     proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    try:
+        proxies = _px_pick_proxies(q, proxies)      # NEW: &cp=<user proxy> / &pp=1 (server pool)
+    except ValueError:
+        return deny(403)
     root0, cur, resp = _root_host(urlparse(u).netloc), u, None
     try:
         for _ in range(6):
@@ -836,6 +963,7 @@ def px_handle(h, head: bool = False):
             else:
                 body = px_rewrite_m3u8(txt, cur, r).encode("utf-8")
                 ctype = "application/vnd.apple.mpegurl"
+            body = _px_carry(body, q)                       # NEW: segments bhi same proxy se
             h.send_response(200)
             h.send_header("Content-Type", ctype)
             h.send_header("Content-Length", str(len(body)))
@@ -988,16 +1116,7 @@ def normalize_setting(key: str, val: str) -> str:
     if key in ("verify", "ytdlp", "keep_preview", "auto_m3u", "skip_preview_strict"):
         return "1" if val.lower() in ("on", "1", "yes", "true") else "0"
     if key == "proxy":
-        # auto = only for IP-lock/acctoken; on/force = always bot-proxy; off/direct = never;
-        # mtproto = reserved (Telegram MTProto not used for media streams — falls back to auto)
-        v = val.lower().strip()
-        if v in ("auto", "on", "off", "force", "direct", "mtproto", "bot"):
-            if v == "direct": return "off"
-            if v == "bot": return "on"
-            if v == "force": return "on"
-            if v == "mtproto": return "auto"
-            return v
-        return "auto"
+        return val.lower() if val.lower() in ("auto", "on", "off") else "auto"
     if key in ("min_quality", "min_duration", "max_duration", "daily_limit"):
         if val.lower() in ("", "off", "0", "none"):
             return "0"
@@ -1243,6 +1362,8 @@ class DummyPortServer(BaseHTTPRequestHandler):
             return px_handle(self)
         if self.path.startswith("/r?"):
             return rf_handle(self)
+        if self.path.startswith("/t?"):
+            return tc_handle(self)
         if self.path.split("?")[0] in ("/app", "/app/"):
             return mini_page(self)
         if self.path.startswith("/api/"):
@@ -1254,6 +1375,8 @@ class DummyPortServer(BaseHTTPRequestHandler):
     def do_HEAD(self):
         if self.path.startswith("/p?"):
             return px_handle(self, head=True)
+        if self.path.startswith("/t?"):
+            return tc_handle(self, head=True)
         self.send_response(200)
         self.end_headers()
 
@@ -2043,15 +2166,11 @@ def link_stats(html: str, page_url: str) -> str:
             if _root_host(urlparse(urljoin(page_url, h)).netloc) == root]
     shapes = Counter(_shape(urlparse(urljoin(page_url, h))) for h in same)
     title = re.search(r'<title>(.*?)</title>', html, re.I | re.S)
-    # Precompute outside f-string: Python <3.12 disallows backslash inside f-string {}
-    n_img = len(re.findall(r'<img\b', html, re.I))
-    n_script = len(re.findall(r'<script', html, re.I))
-    title_s = title.group(1).strip()[:80] if title else "none"
     return (
-        f"📄 Title: {title_s}\n"
-        f"🔢 <a> tags: {len(hrefs)} | same-site: {len(same)} | <img>: {n_img}\n"
+        f"📄 Title: {(title.group(1).strip()[:80] if title else 'none')}\n"
+        f"🔢 <a> tags: {len(hrefs)} | same-site: {len(same)} | <img>: {len(re.findall(r'<img\b', html, re.I))}\n"
         f"🧩 Top URL shapes: {shapes.most_common(4)}\n"
-        f"⚙️ <script> blocks: {n_script} "
+        f"⚙️ <script> blocks: {len(re.findall(r'<script', html, re.I))} "
         f"(zyada script + kam <a> = JS-rendered listing)"
     )
 
@@ -2157,9 +2276,9 @@ VIDEO_PATTERNS = [
     # KVS engine: video_url: 'function/0/https://site/get_file/...mp4/'
     r'(?:video_url|video_alt_url\d*)\s*[:=]\s*["\']([^"\']+)["\']',
     r'(?:file|src|source|stream_url|videoUrl|hls|mp4|m3u8)["\']?\s*[:=]\s*'
-    r'["\']([^"\']+\.(?:m3u8|mp4|mkv|avi|wmv|webm|mov|flv|hevc|h265)[^"\']*)["\']',
-    r'data-(?:src|video|file)=["\']([^"\']+\.(?:m3u8|mp4|mkv|avi|wmv|webm)[^"\']*)',
-    r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:mp4\.m3u8|m3u8|mp4|mkv|avi|wmv|webm|mov|flv|hevc)(?:\?[^\s"\'<>]*)?)',
+    r'["\']([^"\']+\.(?:m3u8|mp4)[^"\']*)["\']',
+    r'data-(?:src|video|file)=["\']([^"\']+\.(?:m3u8|mp4)[^"\']*)',
+    r'((?:https?:)?(?:\\?/){2}[^\s"\'<>]+?\.(?:mp4\.m3u8|m3u8|mp4)(?:\?[^\s"\'<>]*)?)',
 ]
 
 
@@ -2248,7 +2367,7 @@ def stream_score(u: str, page_url: str = "") -> float:
     s_ = 0.0
     if '.m3u8' in path:
         s_ += 6
-    elif re.search(r'\.(?:mp4|webm|mkv|mov|m4v|flv|avi|wmv|hevc|h265|mpg|mpeg|ts|m2ts)(?:$|\?)', low) or 'get_file' in low:
+    elif re.search(r'\.(?:mp4|webm|mkv|mov|m4v|flv|avi|wmv|asf|mpe?g|hevc|h265)(?:$|\?)', low) or 'get_file' in low:
         s_ += 4
     if _SIGNED_RX.search(low):
         s_ += 3
@@ -3506,35 +3625,23 @@ function grad(t){var h=hnum(t||"x")%360;return ["hsl("+h+",55%,38%)","hsl("+((h+
 function pathOf(u){return u.split("#")[0].split("?")[0].toLowerCase()}
 function extOf(u){var m=pathOf(u).match(/\.([a-z0-9]{2,5})$/);return m?m[1]:""}
 var AUDIO_EXT=["mp3","m4a","aac","wav","ogg","oga","opus","flac","wma"];
-var CONTAINER_EXT=["mkv","avi","wmv","mov","m4v","webm","flv","ts","m2ts","mp4","mpg","mpeg"];
-var CODEC_HINT={"hevc":"HEVC","h265":"HEVC","h.265":"HEVC","av1":"AV1","vp9":"VP9","x265":"HEVC","x264":"H264"};
 function fmtOf(it){
   var u=it.u.toLowerCase();
   if(it.eng==="hls")return "HLS";if(it.eng==="dash")return "DASH";
   if(u.indexOf(".m3u8")>-1)return "HLS";
-  for(var c in CODEC_HINT){if(u.indexOf(c)>-1)return CODEC_HINT[c]}
   var e=extOf(u);
   if(e==="mpd")return "DASH";
-  if(e==="m4v"||e==="mp4")return "MP4";
-  if(e==="mkv")return "MKV";
-  if(e==="avi")return "AVI";
-  if(e==="wmv")return "WMV";
-  if(e==="hevc"||e==="h265")return "HEVC";
+  if(e==="m4v")return "MP4";
   if(e)return e.toUpperCase();
   return it.k||"VIDEO";
 }
 function isAudio(it){return it.k==="AUDIO"||AUDIO_EXT.indexOf(extOf(it.u))>-1}
-function isContainerHard(it){
-  var e=extOf(it.u),u=it.u.toLowerCase();
-  return e==="mkv"||e==="avi"||e==="wmv"||e==="hevc"||u.indexOf("hevc")>-1||u.indexOf("h265")>-1;
-}
 function engineOf(it){
   var u=it.u.toLowerCase(),e=extOf(u);
   if(it.eng)return it.eng;
   if(u.indexOf(".m3u8")>-1)return "hls";
   if(e==="mpd")return "dash";
   if(e==="ts"||e==="flv"||e==="m2ts")return "mpegts";
-  if(isContainerHard(it))return "external";
   return "native";
 }
 var _sc={};
@@ -4558,64 +4665,12 @@ function renderPb(level){
       rs.onclick=function(){delete AMS[key];LS.set("ytb_amb",AMS);inp.value=amv(key,0);vv.textContent=fmt(+inp.value);applyAmb()};
       w.appendChild(lb);w.appendChild(inp);return w;
     }
-    function atog(label,key,defv){
-      var on=!!amv(key,defv),w=el("div","row2");w.appendChild(el("div","",(on?"\u2705 ":"\u2B1C ")+label));
-      w.onclick=function(){amset(key,!amv(key,defv));applyAmb();renderPb("amb")};return w;
-    }
-    function asec(t){var h=el("div","sub");h.style.cssText="margin:12px 0 6px;font-weight:700;opacity:.85";h.textContent=t;return h}
-    box.appendChild(asec("Quality"));
-    box.appendChild(atog("WebGL renderer (uses less power)", "webglRenderer", true));
-    box.appendChild(asl("Resolution","resolutionScale",50,100,5,function(v){return v+"%"}));
-    box.appendChild(asl("Limit framerate (per second)","framerateLimit",5,60,1,function(v){return v+" fps"}));
-    box.appendChild(atog("Save energy on static videos","energySaver",true));
-    box.appendChild(atog("Prioritize page load speed","prioritizePageLoad",true));
-    box.appendChild(atog("YouTube responsiveness fixes","youtubeResponsiveness",true));
-    box.appendChild(asec("Page header"));
-    box.appendChild(asl("Shadows size","pageHeaderShadowSize",0,80,1,pct));
-    box.appendChild(asl("Shadows opacity","pageHeaderShadowOpacity",0,100,1,pct));
-    box.appendChild(asec("Page content"));
-    box.appendChild(asl("Shadows size","pageContentShadowSize",0,40,1,pct));
-    box.appendChild(asl("Shadows opacity","pageContentShadowOpacity",0,100,1,pct));
-    box.appendChild(atog("Shadows on texts and buttons only","shadowsOnTextButtonsOnly",false));
-    box.appendChild(asl("Images opacity","imagesOpacity",0,100,1,pct));
-    box.appendChild(asl("Buttons & boxes background opacity","buttonsBoxesBgOpacity",-100,100,5,function(v){return v+"%"}));
-    box.appendChild(asl("Background greyness","backgroundGreyness",0,100,1,pct));
-    box.appendChild(atog("Hide everything in theater mode","hideEverythingTheater",false));
-    box.appendChild(atog("Related videos as scrollable list","relatedAsScrollList",false));
-    box.appendChild(atog("Hide scrollbar","hideScrollbar",true));
-    box.appendChild(asec("Video"));
-    box.appendChild(asl("Size (in small view)","videoSizeSmall",50,150,0.5,function(v){return v+"%"}));
-    box.appendChild(asl("Shadow size","videoShadowSize",0,200,5,pct));
-    box.appendChild(asl("Shadow opacity","videoShadowOpacity",0,100,0.5,function(v){return v+"%"}));
-    box.appendChild(asl("Debanding (noise)","debandingNoise",0,100,1,pct));
-    box.appendChild(atog("Sync video with ambient light","syncVideoAmbient",true));
-    box.appendChild(asl("Sync video disable threshold","syncDisableThreshold",0,100,1,pct));
-    box.appendChild(atog("Video jitter workaround","videoJitterWorkaround",false));
-    box.appendChild(atog("Video artifacts workaround","videoArtifactsWorkaround",true));
-    box.appendChild(atog("Remove black bars [B]","removeBlackBars",false));
-    box.appendChild(atog("Remove black sidebars [V]","removeBlackSidebars",false));
-    box.appendChild(asl("Bar size","barSize",0,50,1,function(v){return v+"%"}));
-    box.appendChild(asl("Sidebars size","sidebarsSize",0,50,1,function(v){return v+"%"}));
-    box.appendChild(atog("Reset bars next video","resetBarsNextVideo",false));
-    box.appendChild(atog("Fill video to removed bars [H]","fillVideoRemovedBars",true));
-    box.appendChild(asec("Filters"));
-    box.appendChild(asl("Brightness","filterBrightness",50,150,1,pct));
-    box.appendChild(asl("Contrast","filterContrast",50,150,1,pct));
-    box.appendChild(asl("Colors","filterColors",50,150,1,pct));
-    box.appendChild(asl("Saturation","filterSaturation",50,200,1,pct));
-    box.appendChild(asec("Ambient light core"));
     box.appendChild(asl("Blur","blur",0,100,1,pct));
-    box.appendChild(asl("Edge size","edge",0,60,1,pct));
     box.appendChild(asl("Spread","spread",100,200,5,pct));
-    box.appendChild(asl("Spread fade start","spreadFadeStart",0,60,5,pct));
-    box.appendChild(asl("Spread fade curve","spreadFadeCurve",0,60,5,pct));
     box.appendChild(asl("Glow intensity","intensity",0,100,5,pct));
-    box.appendChild(atog("Fixed position (ignore scroll)","fixedPosition",false));
-    box.appendChild(asec("View modes"));
-    box.appendChild(atog("Picture in picture","pictureInPicture",false));
-    box.appendChild(atog("Embedded videos","embeddedVideos",true));
-    box.appendChild(atog("VR/360 videos","vr360Videos",true));
-    box.appendChild(atog("Ambient enabled","enabled",true));
+    box.appendChild(asl("Fade start","spreadFadeStart",0,60,5,pct));
+    box.appendChild(asl("Fade curve","spreadFadeCurve",0,60,5,pct));
+    box.appendChild(asl("Frame rate limit","framerateLimit",5,60,5,function(v){return v+" fps"}));
     var rr2=el("div","row2");rr2.appendChild(el("div","","Reset to ambient.json defaults"));rr2.onclick=function(){AMS={};LS.set("ytb_amb",AMS);applyAmb();renderPb("amb")};box.appendChild(rr2);
   }else if(PBLEVEL==="color"){
     box.appendChild(hd("Advanced color","play"));
@@ -4759,7 +4814,7 @@ function renderAdmin(tab){
     Object.keys(ADM.settings).forEach(function(k){
       var v=ADM.settings[k],r=row(k+": ",[]);
       if(["verify","ytdlp","keep_preview"].indexOf(k)>-1){r.appendChild(btn(v==="1"||(k==="ytdlp"&&v!=="0")?"ON":"OFF",function(){var on=(v==="1")||(k==="ytdlp"&&v!=="0");admDo("/api/admin/setting",{key:k,value:on?"off":"on"},k+" updated")}))}
-      else if(k==="proxy"){var sl=el("select");[["auto","auto (IP-lock/acctoken only)"],["on","on / bot-proxy always"],["off","off / direct no proxy"],["force","force bot-proxy"],["mtproto","mtproto (falls to auto)"]].forEach(function(o){var op=el("option","",o[1]);op.value=o[0];if(o[0]===(v||"auto"))op.selected=true;sl.appendChild(op)});sl.onchange=function(){admDo("/api/admin/setting",{key:k,value:sl.value},"proxy = "+sl.value)};r.appendChild(sl)}
+      else if(k==="proxy"){var sl=el("select");["auto","on","off"].forEach(function(o){var op=el("option","",o);op.value=o;if(o===(v||"auto"))op.selected=true;sl.appendChild(op)});sl.onchange=function(){admDo("/api/admin/setting",{key:k,value:sl.value},"proxy = "+sl.value)};r.appendChild(sl)}
       else{var inp=el("input");inp.value=v;r.appendChild(inp);r.appendChild(btn("Save",function(){admDo("/api/admin/setting",{key:k,value:inp.value},k+" saved")}))}
     });
     Object.keys(ADM.prefer).forEach(function(d){row("\u2B50 prefer "+d+": "+ADM.prefer[d].join(", "),[btn("Clear",function(){admDo("/api/admin/prefer",{site:d,host:"off"},"prefer clear")})])});
@@ -4857,6 +4912,641 @@ setTimeout(bindDoubleTap,50);
 window.__super={toggleShuffle:toggleShuffle,shuffle:function(){return SHUFFLE},skipRel:skipRel};
 /* ========== end SUPER POWER PACK ========== */
 
+/* ========== AMBIENT PLUS + PROXY MODES (add-only: purana code wahi hai, ye sirf upar se jodta hai) ========== */
+(function(){
+var AXB={t:0,b:0,l:0,r:0},axScrollT=0,axScrolling=false,axWarm=false,axWarmT=0,axFrameOk=false,axRv=0,axQ=-1,axLastLayout="";
+var axGl=null,axGlProg=null,axGlFail=false,axSc=null,axSx=null,axNoiseURL="",axSd=0,axSdrop=0,axSyncOff=false,axBarFail=false;
+function U(k){return AMS[k]!==undefined}
+function G(k,d){return amv(k,d)}
+function pc(v){return (Math.round(v*10)/10)+"%"}
+function secs(v){return v?v+"s":"Off"}
+
+/* ---------- extra CSS (sirf naye selectors; default look same rehta hai) ---------- */
+var axCss=
+".pbm .pbsec{margin:12px -14px 4px;padding:6px 14px;background:#2a2a2a;font-weight:700;font-size:12px;color:#ddd;letter-spacing:.3px}"+
+".pbm input.axi{width:100%;box-sizing:border-box;padding:9px 12px;border-radius:10px;border:1px solid #444;background:#1c1c1c;color:#fff;font-size:13px;margin:4px 0;outline:0}"+
+".pbm .row2.axon small{color:#6fd16f}.pbm .row2.axon:after{content:\"\\2713\";color:#6fd16f;font-weight:700}"+
+".pbm .axbtn{padding:9px 14px;border-radius:20px;background:#2f7fff;color:#fff;font-weight:600;text-align:center;margin:8px 0;cursor:pointer}"+
+".pbm .axnote{font-size:12px;color:#9a9a9a;margin:6px 0 2px;line-height:1.4}"+
+".axn{position:absolute;pointer-events:none;mix-blend-mode:overlay;background-repeat:repeat;background-size:96px 96px}#axVN{inset:0;z-index:1}#axAN{z-index:-1}"+
+".top img,.top svg,.top .lg{opacity:var(--ax-himg,1)}"+
+"body.ax-hbg.ax-scrolled .top{background:color-mix(in srgb,var(--bg) var(--ax-hbg,100%),transparent)}"+
+"body.ax-cs .card .thumb,body.ax-cs .up .thumb{box-shadow:0 0 calc(var(--ax-csh,5)*.6px) rgba(0,0,0,var(--ax-cso,.05))}"+
+"body.ax-txtsh .thumb{box-shadow:none!important}body.ax-txtsh .ttl,body.ax-txtsh .act,body.ax-txtsh .meta{text-shadow:0 0 calc(var(--ax-csh,5)*.4px) rgba(0,0,0,var(--ax-cso,.05))}"+
+".card .thumb,.up .thumb{opacity:var(--ax-cimg,1)}"+
+"body.amb-on.ax-fill .desc,body.amb-on.ax-fill .act{background:color-mix(in srgb,var(--bg2) var(--ax-fill,75%),transparent)}"+
+"body.ax-grey{background:color-mix(in srgb,var(--bg) var(--ax-grey,100%),rgb(var(--amb-rgb,20,20,20)))}"+
+"body.ax-hideth.theater .top,body.ax-hideth.theater .chips,body.ax-hideth.theater .wside,body.ax-hideth.theater .wmain>*:not(.player){display:none}"+
+"body.ax-rel .wside{max-height:calc(100vh - var(--hh) - 16px);overflow:auto;position:sticky;top:calc(var(--hh) + 8px);align-self:start}"+
+"html:has(body.ax-sb){scrollbar-width:auto!important}html:has(body.ax-sb)::-webkit-scrollbar{display:block!important;width:auto!important}"+
+".pin{box-shadow:0 0 var(--ax-vsh,0px) rgba(0,0,0,var(--ax-vso,0))}"+
+"body.ax-jit #v{transform:translateZ(0);will-change:transform}body.ax-art #v{-webkit-backface-visibility:hidden;backface-visibility:hidden;isolation:isolate}body.ax-art .pin{contain:paint}";
+(function(){var s=document.createElement("style");s.id="axcss";s.textContent=axCss;document.head.appendChild(s)})();
+
+/* ---------- helpers ---------- */
+function axLayout(){return (document.fullscreenElement||document.webkitFullscreenElement)?"full":(document.body.classList.contains("theater")?"theater":"small")}
+function axAllowed(){
+  var l=G("layouts","all");if(l!=="all"&&l!==axLayout())return false;
+  if(G("embedded",true)===false&&window.self!==window.top)return false;
+  if(G("enableInPictureInPicture",true)===false&&document.pictureInPictureElement)return false;
+  if(G("vr",true)===false&&CUR&&/\b360\b|vr\s?180|equirect/i.test(CUR.t||""))return false;
+  return true;
+}
+function axNoise(){
+  if(axNoiseURL)return axNoiseURL;
+  try{var c=document.createElement("canvas");c.width=c.height=96;var x=c.getContext("2d"),id=x.createImageData(96,96),d=id.data;
+    for(var i=0;i<d.length;i+=4){var v=(Math.random()*255)|0;d[i]=d[i+1]=d[i+2]=v;d[i+3]=255}
+    x.putImageData(id,0,0);axNoiseURL=c.toDataURL("image/png")}catch(e){axNoiseURL=""}
+  return axNoiseURL;
+}
+function axNoiseEl(id,parent,before){var e=$("#"+id);if(!e){e=document.createElement("div");e.id=id;e.className="axn";parent.insertBefore(e,before||null)}return e}
+
+/* ---------- black bars / sidebars (video ko fill karna) ---------- */
+function axXform(){
+  if(!V)return;
+  var s=1,tx=0,ty=0;
+  if(U("vSize")&&axLayout()!=="full")s=G("vSize",100)/100;
+  if((G("rmBars",false)||G("rmSide",false))&&G("fillBars",true)){
+    var t=AXB.t,b=AXB.b,l=AXB.l,r=AXB.r,k=Math.max(1/Math.max(.4,1-t-b),1/Math.max(.4,1-l-r));
+    k=Math.min(k,2);s*=k;tx=(r-l)/2*s*100;ty=(b-t)/2*s*100;
+  }
+  V.style.scale=(s===1)?"":String(s);
+  V.style.translate=(tx||ty)?(tx.toFixed(2)+"% "+ty.toFixed(2)+"%"):"";
+}
+function axDetect(){
+  if(!V||!V.videoWidth||V.readyState<2||axBarFail)return;
+  var rb=G("rmBars",false),rs=G("rmSide",false),W=64,H=36;
+  if(!rb&&!rs)return;
+  try{
+    axSx=axSx||document.createElement("canvas");axSx.width=W;axSx.height=H;
+    var x=axSx.getContext("2d",{willReadFrequently:true});x.drawImage(V,0,0,W,H);
+    var d=x.getImageData(0,0,W,H).data;
+    var rowL=function(r){var s=0;for(var i=0;i<W;i++){var p=(r*W+i)*4;s+=d[p]*.3+d[p+1]*.59+d[p+2]*.11}return s/W};
+    var colL=function(c){var s=0;for(var j=0;j<H;j++){var p=(j*W+c)*4;s+=d[p]*.3+d[p+1]*.59+d[p+2]*.11}return s/H};
+    var t=0,b=0,l=0,r=0;
+    if(rb){var bs=G("barSize",0);if(bs>0){t=b=bs/100}else{while(t<10&&rowL(t)<14)t++;while(b<10&&rowL(H-1-b)<14)b++;t/=H;b/=H}}
+    if(rs){var ss=G("sideSize",0);if(ss>0){l=r=ss/100}else{while(l<14&&colL(l)<14)l++;while(r<14&&colL(W-1-r)<14)r++;l/=W;r/=W}}
+    AXB={t:t,b:b,l:l,r:r};axXform();
+  }catch(e){axBarFail=true;toast("CORS: black bars detect nahi ho sakta")}
+}
+setInterval(function(){
+  var w=$("#watch");if(!w||w.hidden||document.hidden||V.paused)return;
+  if(G("rmBars",false)||G("rmSide",false))axDetect();
+},900);
+
+/* ---------- WebGL ambient renderer (CORS/GPU issue par khud 2D par fallback) ---------- */
+function axGlEnsure(){
+  if(axGl)return true;
+  try{
+    var c=document.createElement("canvas");c.className="ambc";c.id="ambgl";c.width=160;c.height=90;
+    var g=c.getContext("webgl",{alpha:true,antialias:false,premultipliedAlpha:true,preserveDrawingBuffer:true});
+    if(!g)throw 0;
+    var sh=function(t,s){var o=g.createShader(t);g.shaderSource(o,s);g.compileShader(o);if(!g.getShaderParameter(o,g.COMPILE_STATUS))throw 1;return o};
+    var p=g.createProgram();
+    g.attachShader(p,sh(g.VERTEX_SHADER,"attribute vec2 p;uniform vec4 c;varying vec2 t;void main(){gl_Position=vec4(p,0.,1.);vec2 u=p*.5+.5;t=vec2(mix(c.x,c.z,u.x),mix(c.w,c.y,u.y));}"));
+    g.attachShader(p,sh(g.FRAGMENT_SHADER,"precision mediump float;varying vec2 t;uniform sampler2D s;uniform float a;void main(){gl_FragColor=vec4(texture2D(s,t).rgb*a,a);}"));
+    g.linkProgram(p);if(!g.getProgramParameter(p,g.LINK_STATUS))throw 2;g.useProgram(p);
+    var b=g.createBuffer();g.bindBuffer(g.ARRAY_BUFFER,b);g.bufferData(g.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),g.STATIC_DRAW);
+    var l=g.getAttribLocation(p,"p");g.enableVertexAttribArray(l);g.vertexAttribPointer(l,2,g.FLOAT,false,0,0);
+    var tx=g.createTexture();g.bindTexture(g.TEXTURE_2D,tx);
+    g.texParameteri(g.TEXTURE_2D,g.TEXTURE_WRAP_S,g.CLAMP_TO_EDGE);g.texParameteri(g.TEXTURE_2D,g.TEXTURE_WRAP_T,g.CLAMP_TO_EDGE);
+    g.texParameteri(g.TEXTURE_2D,g.TEXTURE_MIN_FILTER,g.LINEAR);g.texParameteri(g.TEXTURE_2D,g.TEXTURE_MAG_FILTER,g.LINEAR);
+    g.enable(g.BLEND);g.blendFunc(g.ONE,g.ONE_MINUS_SRC_ALPHA);
+    axGlProg={g:g,c:g.getUniformLocation(p,"c"),a:g.getUniformLocation(p,"a")};
+    amCv.parentNode.insertBefore(c,amCv.nextSibling);axGl=c;return true;
+  }catch(e){axGlFail=true;axGl=null;return false}
+}
+function axColors(vw,vh,sy,sh){
+  axSc=axSc||document.createElement("canvas");axSc.width=32;axSc.height=18;
+  var x=axSc.getContext("2d",{willReadFrequently:true});x.drawImage(V,0,sy,vw,sh,0,0,32,18);
+  var d=x.getImageData(0,0,32,18).data,r=0,g=0,b=0,n=0;
+  for(var i=0;i<d.length;i+=16){r+=d[i];g+=d[i+1];b+=d[i+2];n++}
+  if(!n)return;r=Math.round(r/n);g=Math.round(g/n);b=Math.round(b/n);
+  var sm=+amv("smoothing",0.62);
+  if(amLastColors){r=Math.round(amLastColors.r*sm+r*(1-sm));g=Math.round(amLastColors.g*sm+g*(1-sm));b=Math.round(amLastColors.b*sm+b*(1-sm))}
+  amLastColors={r:r,g:g,b:b};
+  var S=document.documentElement.style;
+  S.setProperty("--amb-r",r);S.setProperty("--amb-g",g);S.setProperty("--amb-b",b);S.setProperty("--amb-rgb",r+","+g+","+b);
+}
+function axSize(){var res=G("resolution",100);return [Math.max(16,Math.round(160*res/100)),Math.max(9,Math.round(90*res/100))]}
+function axGlDraw(al){
+  if(!axGlEnsure()||!axGl){axGlFail=true;applyAmb();return false}
+  var vw=V.videoWidth,vh=V.videoHeight;if(!vw||!vh||V.readyState<2)return true;
+  var z=axSize(),w=z[0],h=z[1];
+  if(axGl.width!==w||axGl.height!==h){axGl.width=w;axGl.height=h}
+  if(G("detectHorizontalBarSizeEnabled",true)&&amBars.on!==false&&amN%30===0)detectBars(vw,vh);
+  var g=axGlProg.g;
+  try{
+    g.viewport(0,0,w,h);g.uniform4f(axGlProg.c,0,amBars.t,1,1-amBars.b);g.uniform1f(axGlProg.a,al);
+    g.texImage2D(g.TEXTURE_2D,0,g.RGBA,g.RGBA,g.UNSIGNED_BYTE,V);
+    g.drawArrays(g.TRIANGLE_STRIP,0,4);amN++;
+    if(amN%3===0){try{axColors(vw,vh,Math.round(vh*amBars.t),Math.max(1,Math.round(vh*(1-amBars.t-amBars.b))))}catch(e){}}
+    return true;
+  }catch(e){axGlFail=true;toast("WebGL ambient: CORS/GPU issue - 2D mode on");applyAmb();return false}
+}
+function axDraw2(al){
+  var vw=V.videoWidth,vh=V.videoHeight;if(!vw||!vh||V.readyState<2)return;
+  var z=axSize(),w=z[0],h=z[1];
+  if(amCv.width!==w||amCv.height!==h||!amCx){amCv.width=w;amCv.height=h;try{amCx=amCv.getContext("2d",{willReadFrequently:true})}catch(e){amCx=amCv.getContext("2d")}}
+  if(!amCx)return;
+  if(G("detectHorizontalBarSizeEnabled",true)&&amBars.on!==false&&amN%30===0)detectBars(vw,vh);
+  var sy=Math.round(vh*amBars.t),sh=Math.max(1,Math.round(vh*(1-amBars.t-amBars.b)));
+  try{amCx.globalAlpha=al;amCx.drawImage(V,0,sy,vw,sh,0,0,w,h);amN++;if(amN%3===0)axColors(vw,vh,sy,sh)}catch(e){}
+}
+function axNewFrame(mode){
+  if(mode==="video"&&V.requestVideoFrameCallback){
+    if(!axRv){axRv=1;(function loop(){try{V.requestVideoFrameCallback(function(){axFrameOk=true;loop()})}catch(e){axRv=0}})()}
+    if(axFrameOk){axFrameOk=false;return true}
+    return false;
+  }
+  try{var n=V.getVideoPlaybackQuality().totalVideoFrames;if(n!==axQ){axQ=n;return true}return false}catch(e){return true}
+}
+
+/* ---------- wrappers (purane functions ko call karke upar se kuch add) ---------- */
+var _ambDraw0=ambDraw,_ambStart0=ambStart,_applyAmb0=applyAmb,_renderPb0=renderPb,_PXON0=PXON,_loadItem0=loadItem;
+
+ambDraw=function(){
+  if(!axAllowed())return;
+  if(G("scrollFix",false)&&axScrolling)return;
+  var t0=performance.now();
+  var mode=G("sync","display");if(G("syncVideo",false)&&mode==="display")mode="video";
+  if(axSyncOff)mode="display";
+  if(mode!=="display"&&!axNewFrame(mode))return;
+  var al=1,fl=G("flicker",0);
+  if(fl>0)al=Math.min(al,1-fl/100*0.85);
+  if(G("smoothMotion",false))al=Math.min(al,0.5);
+  var done=false;
+  if(G("webgl",false)&&!axGlFail)done=axGlDraw(al);
+  if(!done){
+    if(G("resolution",100)!==100)axDraw2(al);
+    else{if(amCx&&(amCv.width!==160||amCv.height!==90)){amCv.width=160;amCv.height=90}if(amCx)amCx.globalAlpha=al;_ambDraw0()}
+  }
+  var dt=performance.now()-t0,fps=Math.min(60,Math.max(5,G("framerateLimit",30)));
+  axSd++;if(dt>1000/fps)axSdrop++;
+  if(axSd>=60){
+    var pr=axSdrop/axSd*100,th=G("syncThreshold",100);
+    if(mode!=="display"&&th<100&&pr>th){axSyncOff=true;toast("Ambient sync band (zyada frames drop)")}
+    axSd=axSdrop=0;
+  }
+};
+ambStart=function(){
+  if(G("fastLoad",false)&&!axWarm){
+    if(!axWarmT)axWarmT=setTimeout(function(){axWarm=true;axWarmT=0;_ambStart0()},V.paused?250:1500);
+    return;
+  }
+  _ambStart0();
+};
+applyAmb=function(){_applyAmb0();try{axApply()}catch(e){}};
+
+function axApply(){
+  var st=document.documentElement.style,cl=document.body.classList;
+  var pv=function(n,k,f){if(U(k))st.setProperty(n,f(G(k)));else st.removeProperty(n)};
+  /* page header */
+  pv("--ax-himg","hImgOpacity",function(v){return v/100});
+  pv("--ax-hbg","hBgOpacity",function(v){return v+"%"});cl.toggle("ax-hbg",U("hBgOpacity"));
+  cl.toggle("ax-scrolled",(window.scrollY||0)>8);
+  /* page content */
+  var ts=!!G("txtShadow",false);
+  pv("--ax-csh","cShadowSize",function(v){return v});pv("--ax-cso","cShadowOpacity",function(v){return v/100});
+  cl.toggle("ax-cs",U("cShadowSize")||U("cShadowOpacity")||ts);cl.toggle("ax-txtsh",ts);
+  pv("--ax-cimg","cImgOpacity",function(v){return v/100});
+  pv("--ax-fill","surroundingContentFillOpacity",function(v){return Math.max(0,Math.min(100,100+v))+"%"});cl.toggle("ax-fill",U("surroundingContentFillOpacity"));
+  pv("--ax-grey","bgGrey",function(v){return v+"%"});cl.toggle("ax-grey",U("bgGrey")&&G("bgGrey",100)<100);
+  cl.toggle("ax-hideth",!!G("hideTheater",false));cl.toggle("ax-rel",!!G("relScroll",false));
+  cl.toggle("ax-sb",G("hideScrollbar",true)===false);
+  /* video */
+  if(U("vShadowSize")||U("vShadowOpacity")){st.setProperty("--ax-vsh",(G("vShadowSize",0)*0.5)+"px");st.setProperty("--ax-vso",G("vShadowOpacity",15)/100)}
+  else{st.removeProperty("--ax-vsh");st.removeProperty("--ax-vso")}
+  cl.toggle("ax-jit",!!G("vJitter",false));cl.toggle("ax-art",!!G("vArtifacts",false));
+  var vn=G("vDeband",0),nz=(vn>0||G("aDeband",0)>0)?axNoise():"",e1=$("#axVN");
+  if(V&&V.parentNode&&vn>0&&nz){e1=axNoiseEl("axVN",V.parentNode,V.nextSibling);e1.style.backgroundImage="url("+nz+")";e1.style.opacity=Math.min(1,vn/100*0.12)}
+  else if(e1)e1.remove();
+  if(!G("rmBars",false)&&!G("rmSide",false))AXB={t:0,b:0,l:0,r:0};
+  axXform();
+  /* ambient glow: layouts / filters / edge / fade / fixed */
+  if(!axAllowed())amCv.hidden=true;
+  var f=amCv.style.filter||"";
+  if(U("aContrast"))f+=" contrast("+G("aContrast",1)+")";
+  if(U("aColors"))f+=" grayscale("+(1-G("aColors",1))+")";
+  amCv.style.filter=f.trim();
+  if(U("edge")){
+    var fs=G("spreadFadeStart",20),fc=G("spreadFadeCurve",20),m="radial-gradient(ellipse closest-side,#000 "+Math.max(0,100-fs-fc-(G("edge",20)-20)/2)+"%,rgba(0,0,0,0) 100%)";
+    amCv.style.webkitMaskImage=m;amCv.style.maskImage=m;
+  }
+  amCv.style.transition=(U("fadeIn")&&G("fadeIn",0)>0)?("opacity "+G("fadeIn",0)+"s"):"";
+  if(G("fixedPos",false)){amCv.style.position="fixed";amCv.style.left="0";amCv.style.top="0";amCv.style.width="100vw";amCv.style.height="100vh"}
+  else amCv.style.position="";
+  var useGl=!!G("webgl",false)&&!axGlFail;
+  amCv.style.visibility="";
+  if(useGl&&axGlEnsure()&&axGl){axGl.style.cssText=amCv.style.cssText;axGl.hidden=amCv.hidden;amCv.style.visibility="hidden"}
+  else if(axGl)axGl.hidden=true;
+  var an=G("aDeband",0),mul=1+G("debandMode",0)/100,e2=$("#axAN");
+  if(PL&&an>0&&nz){
+    e2=axNoiseEl("axAN",PL,amCv.nextSibling);e2.style.backgroundImage="url("+nz+")";e2.style.opacity=Math.min(1,an/100*0.12*mul);
+    ["left","top","width","height","webkitMaskImage","maskImage","position"].forEach(function(p){e2.style[p]=amCv.style[p]});
+    if(!amCv.style.position)e2.style.position="absolute";e2.hidden=amCv.hidden;
+  }else if(e2)e2.remove();
+}
+
+/* ---------- events ---------- */
+V.addEventListener("loadstart",function(){
+  axWarm=false;axSyncOff=false;axSd=axSdrop=0;axQ=-1;axBarFail=false;
+  if(G("resetBars",false)){AXB={t:0,b:0,l:0,r:0};axXform()}
+  if(U("fadeIn")&&G("fadeIn",0)>0){amCv.style.opacity=0;setTimeout(function(){applyAmb()},60)}
+});
+V.addEventListener("enterpictureinpicture",function(){applyAmb()});
+V.addEventListener("leavepictureinpicture",function(){applyAmb()});
+document.addEventListener("fullscreenchange",function(){applyAmb()});
+document.addEventListener("webkitfullscreenchange",function(){applyAmb()});
+try{new MutationObserver(function(){var l=axLayout();if(l!==axLastLayout){axLastLayout=l;applyAmb()}}).observe(document.body,{attributes:true,attributeFilter:["class"]})}catch(e){}
+window.addEventListener("scroll",function(){
+  if(G("scrollFix",false)){axScrolling=true;clearTimeout(axScrollT);axScrollT=setTimeout(function(){axScrolling=false;ambStart()},180)}
+  if(U("hBgOpacity"))document.body.classList.toggle("ax-scrolled",(window.scrollY||0)>8);
+},{passive:true});
+document.addEventListener("keydown",function(e){
+  var t=e.target;if(t&&(t.tagName==="INPUT"||t.tagName==="TEXTAREA"||t.tagName==="SELECT"))return;
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  var w=$("#watch");if(!w||w.hidden)return;
+  var k=(e.key||"").toLowerCase();
+  if(k==="g"){amset("enabled",!G("enabled",true));toast("Ambient "+(G("enabled",true)?"ON":"OFF"))}
+  else if(k==="b"){amset("rmBars",!G("rmBars",false));toast("Remove black bars "+(G("rmBars",false)?"ON":"OFF"))}
+  else if(k==="v"){amset("rmSide",!G("rmSide",false));toast("Remove sidebars "+(G("rmSide",false)?"ON":"OFF"))}
+  else if(k==="h"){amset("fillBars",!G("fillBars",true));toast("Fill to removed bars "+(G("fillBars",true)?"ON":"OFF"))}
+});
+
+/* ---------- Ambient settings UI (extension jaisa: Quality / Header / Content / Video / Bars / Filters / View modes / General) ---------- */
+function sec(box,t){box.appendChild(el("div","pbsec",t))}
+function swr(box,label,sub,key,def){
+  var r=el("div","row2"),t=el("div");t.appendChild(el("div","",label));if(sub)t.appendChild(el("small","",sub));
+  var s=el("div","sw"+(G(key,def)?" on":""));r.appendChild(t);r.appendChild(s);
+  r.onclick=function(){amset(key,!G(key,def));s.className="sw"+(G(key,def)?" on":"")};
+  box.appendChild(r);
+}
+function slr(box,label,key,min,max,step,fmt,def,sc,sub){
+  sc=sc||1;
+  var w=el("div","sl"),lb=el("div","lb"),cur=G(key,def/sc)*sc,vv=el("span","",fmt(cur)),rs=el("button","","\u00D7"),right=el("div");
+  right.appendChild(vv);right.appendChild(rs);lb.appendChild(el("div","",label));lb.appendChild(right);w.appendChild(lb);
+  if(sub){var sm=el("small","",sub);sm.style.cssText="display:block;color:#9a9a9a;font-size:12px;margin:-2px 0 4px";w.appendChild(sm)}
+  var inp=el("input");inp.type="range";inp.min=min;inp.max=max;inp.step=step;inp.value=cur;
+  inp.oninput=function(){var v=+inp.value;amset(key,v/sc);vv.textContent=fmt(v)};
+  rs.onclick=function(){delete AMS[key];LS.set("ytb_amb",AMS);var nv=G(key,def/sc)*sc;inp.value=nv;vv.textContent=fmt(nv);applyAmb()};
+  w.appendChild(inp);box.appendChild(w);
+}
+function chr(box,label,key,opts,def,cb){
+  var w=el("div","sl"),lb=el("div","lb");lb.appendChild(el("div","",label));w.appendChild(lb);
+  var chips=el("div","chips2");
+  opts.forEach(function(o){
+    var c=el("div","chip2"+(G(key,def)===o[0]?" on":""),o[1]);
+    c.onclick=function(){amset(key,o[0]);[].forEach.call(chips.children,function(x){x.className="chip2"});c.className="chip2 on";if(cb)cb(o[0])};
+    chips.appendChild(c);
+  });
+  w.appendChild(chips);box.appendChild(w);
+}
+function axTheme(v){
+  var t=v;
+  if(t==="default")t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";
+  document.documentElement.setAttribute("data-theme",t);LS.set("ytb_theme",t);
+}
+function axBuild(box){
+  sec(box,"Quality");
+  swr(box,"WebGL renderer (uses less power)","CORS block ho to khud 2D par fallback","webgl",false);
+  slr(box,"Resolution","resolution",25,200,5,pc,100);
+  chr(box,"Synchronization","sync",[["decoded","Decoded"],["display","Display"],["video","Video framerate"]],"display");
+  swr(box,"Save energy on static videos","Paused video par ambient draw band","energySaver",true);
+  swr(box,"Prioritize page load speed","Video chalne ke baad ambient start hoga","fastLoad",false);
+  swr(box,"Responsiveness fix","Scroll ke dauran ambient draw pause","scrollFix",false);
+  slr(box,"Optimize debanding for (LCD \u2194 OLED)","debandMode",0,100,10,pc,0,1,"0% = LCD (normal) \u2022 100% = OLED (overlay)");
+  sec(box,"Page header");
+  slr(box,"Shadows size","headerShadowSize",0,100,5,pc,25);
+  slr(box,"Shadows opacity","headerShadowOpacity",0,100,5,pc,30);
+  slr(box,"Images opacity","hImgOpacity",0,100,5,pc,100);
+  slr(box,"Background opacity","hBgOpacity",0,100,5,pc,100,1,"Only applies when scrolled down");
+  sec(box,"Page content");
+  slr(box,"Shadows size","cShadowSize",0,50,1,pc,5);
+  slr(box,"Shadows opacity","cShadowOpacity",0,100,1,pc,5);
+  swr(box,"Shadows on texts and buttons only","Scrolling & video stutter kam karta hai","txtShadow",false);
+  slr(box,"Images opacity","cImgOpacity",0,100,5,pc,100);
+  slr(box,"Buttons & boxes background opacity","surroundingContentFillOpacity",-100,0,5,pc,-25);
+  slr(box,"Background greyness","bgGrey",0,100,5,pc,100);
+  swr(box,"Hide everything in theater mode",null,"hideTheater",false);
+  swr(box,"Related videos as scrollable list","Up next list alag scroll hoti hai","relScroll",false);
+  swr(box,"Hide scrollbar",null,"hideScrollbar",true);
+  sec(box,"Video");
+  slr(box,"Size (in small view)","vSize",80,120,0.1,pc,100);
+  slr(box,"Shadow size","vShadowSize",0,100,5,pc,0);
+  slr(box,"Shadow opacity","vShadowOpacity",0,100,0.5,pc,15);
+  slr(box,"Debanding (noise)","vDeband",0,100,5,pc,0);
+  swr(box,"Sync video with ambient light","Ambient sirf nayi video frame par update hoga","syncVideo",false);
+  slr(box,"Sync video disable threshold","syncThreshold",0,100,5,pc,100,1,"Itne % frames drop hon to sync band");
+  swr(box,"Video jitter workaround","Uses: CPU & GPU power","vJitter",false);
+  swr(box,"Video artifacts workaround","NVIDIA RTX VSR ke saath disable rakho","vArtifacts",false);
+  sec(box,"Remove black & colored bars");
+  swr(box,"Remove black bars [B]","Uses: CPU power","rmBars",false);
+  swr(box,"Remove black sidebars [V]","Uses: CPU power","rmSide",false);
+  slr(box,"Bar size","barSize",0,25,1,pc,0,1,"0% = auto detect");
+  slr(box,"Sidebars size","sideSize",0,25,1,pc,0,1,"0% = auto detect");
+  swr(box,"Reset bars next video",null,"resetBars",false);
+  swr(box,"Fill video to removed bars [H]",null,"fillBars",true);
+  sec(box,"Filters (ambient glow)");
+  slr(box,"Brightness","brightness",50,200,5,pc,105,100);
+  slr(box,"Contrast","aContrast",50,200,5,pc,100,100);
+  slr(box,"Colors","aColors",0,100,5,pc,100,100);
+  slr(box,"Saturation","saturation",0,300,1,pc,145,100);
+  sec(box,"Ambient light (more)");
+  slr(box,"Edge size","edge",0,100,5,pc,20);
+  slr(box,"Debanding (noise)","aDeband",0,100,5,pc,0);
+  slr(box,"Fade in duration","fadeIn",0,3,0.5,secs,0,1,"Uses: GPU memory");
+  slr(box,"Flicker reduction","flicker",0,100,5,pc,0);
+  swr(box,"Smooth motion (frame blending)","Uses: GPU power. \"Sync video\" ke saath bhi chalta hai","smoothMotion",false);
+  swr(box,"Fixed position","Page ki scroll position ignore","fixedPos",false);
+  sec(box,"View modes");
+  chr(box,"Enable in layouts","layouts",[["all","All"],["small","Small"],["theater","Theater"],["full","Fullscreen"]],"all");
+  swr(box,"Picture in picture",null,"enableInPictureInPicture",true);
+  swr(box,"Embedded videos",null,"embedded",true);
+  swr(box,"VR/360 videos",null,"vr",true);
+  sec(box,"General");
+  chr(box,"Appearance (theme)","theme",[["light","Light"],["default","Default"],["dark","Dark"]],"default",axTheme);
+  swr(box,"Enabled [G]",null,"enabled",true);
+}
+
+/* ========== PROXY MODES: Auto / Direct / Bot proxy / Add proxy / Server pool / URL template / MTProto ========== */
+var PXK="ytb_pxm";
+function pxs(){var s=LS.get(PXK,null);if(!s||typeof s!=="object")s={};if(!s.mode)s.mode="auto";if(!s.list)s.list=[];if(!s.mt)s.mt=[];return s}
+function pxsave(s){LS.set(PXK,s)}
+function pxMode(){return pxs().mode}
+function pxSel(){var s=pxs();for(var i=0;i<s.list.length;i++)if(s.list[i].id===s.sel)return s.list[i];return null}
+function pxSuffix(){
+  var m=pxMode();
+  if(m==="custom"){var p=pxSel();if(p)return "&cp="+encodeURIComponent(p.u)}
+  else if(m==="pool")return "&pp=1";
+  return "";
+}
+function pxDeco(it){if(it&&it.x)it.x=it.x.replace(/&(?:cp|pp)=[^&]*/g,"")+pxSuffix()}
+function pxTplApply(t,u){
+  if(/\{url\}/.test(t))return t.replace(/\{url\}/g,u);
+  if(/\{(?:urlenc|enc)\}/.test(t))return t.replace(/\{(?:urlenc|enc)\}/g,encodeURIComponent(u));
+  return t+encodeURIComponent(u);
+}
+function pxParse(raw,type){
+  raw=(raw||"").trim();if(!raw)return "";
+  var out="",mm;
+  if(/^[a-z0-9+.\-]+:\/\//i.test(raw))out=raw;
+  else if((mm=raw.match(/^([^:\s@]+):(\d{2,5}):([^:\s]+):(.+)$/)))out=type+"://"+encodeURIComponent(mm[3])+":"+encodeURIComponent(mm[4])+"@"+mm[1]+":"+mm[2];
+  else if((mm=raw.match(/^(.+@)?([^:\s@]+):(\d{2,5})$/)))out=type+"://"+(mm[1]||"")+mm[2]+":"+mm[3];
+  else return "";
+  try{var u=new URL(out);if(!/^(https?|socks4a?|socks5h?):$/.test(u.protocol)||!u.hostname||!u.port)return ""}catch(e){return ""}
+  return out;
+}
+function pxMask(u){return (u||"").replace(/\/\/([^:@\/]+):[^@\/]*@/,"//$1:***@")}
+function pxName(u){try{var x=new URL(u);return x.protocol.replace(":","")+" "+x.hostname+":"+x.port}catch(e){return u}}
+function mtParse(raw){
+  raw=(raw||"").trim();var sv="",pt="",sc="",m;
+  if((m=raw.match(/[?&]server=([^&\s]+)/i))){
+    sv=decodeURIComponent(m[1]);var p=raw.match(/[?&]port=(\d+)/i),s=raw.match(/[?&]secret=([^&\s]+)/i);
+    if(p)pt=p[1];if(s)sc=decodeURIComponent(s[1]);
+  }else if((m=raw.match(/^([^:\s]+)[:\s]+(\d{2,5})[:\s]+(\S+)$/))){sv=m[1];pt=m[2];sc=m[3]}
+  if(!sv||!pt||!sc||!/^[A-Za-z0-9.\-]+$/.test(sv)||!/^[A-Za-z0-9_\-=+\/%]+$/.test(sc))return "";
+  return "https://t.me/proxy?server="+encodeURIComponent(sv)+"&port="+pt+"&secret="+encodeURIComponent(sc);
+}
+function pxOpen(l){
+  var T=window.Telegram&&Telegram.WebApp;
+  try{if(T&&T.initData&&T.openTelegramLink){T.openTelegramLink(l);return}}catch(e){}
+  window.open(l,"_blank","noopener");
+}
+function pxApplyCur(){if(CUR&&$("#watch")&&!$("#watch").hidden)loadItem(CUR,{keepQ:true,at:V.currentTime||0})}
+function pxTest(){
+  if(!CUR){toast("Pehle koi video kholo");return}
+  var m=pxMode(),u;
+  if(m==="tpl"){var tp=pxs().tpl;if(!tp){toast("Template set nahi hai");return}u=pxTplApply(tp,CUR.u)}
+  else{pxDeco(CUR);u=CUR.x;if(!u){toast("Bot proxy (PROXY_BASE) set nahi hai");return}}
+  toast("Testing...");var t0=Date.now();
+  fetch(u,{headers:{Range:"bytes=0-1"}}).then(function(r){toast((r.ok||r.status===206?"\u2705 ":"\u274C ")+"HTTP "+r.status+" ("+(Date.now()-t0)+" ms)")}).catch(function(){toast("\u274C Fail (network / CORS)")});
+}
+
+PXON=function(it){
+  if(PXS[it.u]!==undefined)return PXS[it.u];
+  var m=pxMode();
+  if(m==="direct"||m==="tpl")return false;
+  if(m==="bot"||m==="custom"||m==="pool")return !!it.x;
+  return _PXON0(it);
+};
+loadItem=function(it,opt){
+  opt=opt||{};
+  try{
+    pxDeco(it);
+    if(pxMode()==="tpl"&&!opt.url&&it&&it.u&&PXS[it.u]===undefined&&it.k!=="IMAGE"&&it.k!=="PDF"){
+      var tp=pxs().tpl;
+      if(tp){if(!it.eng){var e0=engineOf({u:it.u,k:it.k});if(e0&&e0!=="native")it.eng=e0}opt.url=pxTplApply(tp,it.u)}
+    }
+  }catch(e){}
+  return _loadItem0(it,opt);
+};
+
+function hd2(box,txt,back){var h=el("div","hd");h.appendChild(el("span","","\u2039"));h.appendChild(el("span","",txt));h.onclick=function(){renderPb(back)};box.appendChild(h)}
+function row(box,label,sub,fn,on){
+  var r=el("div","row2"+(on?" axon":"")),t=el("div");t.appendChild(el("div","",label));if(sub)t.appendChild(el("small","",sub));
+  r.appendChild(t);r.onclick=fn;box.appendChild(r);return r;
+}
+function delBtn(r,fn){var d=el("button","","\uD83D\uDDD1");d.style.cssText="color:#f66;font-size:16px;flex:none";d.onclick=function(e){e.stopPropagation();fn()};r.appendChild(d)}
+function pxMainRow(box){
+  var names={auto:"Auto",direct:"Direct (no proxy)",bot:"Bot proxy always",custom:"My proxy",pool:"Server pool",tpl:"URL template"};
+  var r=el("div","row2"),t=el("div");t.appendChild(el("div","","\uD83C\uDF10  Proxy / Network"));
+  t.appendChild(el("small","","Mode: "+(names[pxMode()]||"Auto")+" | Bot, Add proxy, MTProto, Direct"));
+  r.appendChild(t);r.appendChild(el("span","arrow","\u203A"));r.onclick=function(){renderPb("pxs")};
+  var kids=[].slice.call(box.children),ref=null,i,tx;
+  for(i=0;i<kids.length;i++){tx=kids[i].textContent||"";if(/Bot proxy \(acctoken/.test(tx))ref=kids[i]}
+  if(!ref)for(i=0;i<kids.length;i++){tx=kids[i].textContent||"";if(/More tools/.test(tx))ref=kids[i]}
+  if(ref&&ref.nextSibling)box.insertBefore(r,ref.nextSibling);else box.appendChild(r);
+}
+function pxPage(box){
+  var s=pxs(),m=s.mode;hd2(box,"Proxy / Network","main");
+  var setM=function(x){s.mode=x;pxsave(s);if((x==="bot"||x==="custom"||x==="pool")&&!CFG.px&&!pxs().base)toast("Bot proxy (PROXY_BASE) set nahi hai");pxApplyCur();renderPb("pxs")};
+  row(box,"\uD83C\uDF10  Auto (default)","Bot proxy sirf acctoken / IP-lock links par",function(){setM("auto")},m==="auto");
+  row(box,"\uD83D\uDEAB  Direct - no proxy","Sab kuch seedha browser se",function(){setM("direct")},m==="direct");
+  row(box,"\uD83D\uDEE1  Bot proxy (acctoken + IP-lock) - always","Har link bot ke through (same IP + Referer)"+(CFG.px?"":" | PROXY_BASE set nahi"),function(){setM("bot")},m==="bot");
+  var sel=pxSel();
+  if(CFG.pxc!==false)row(box,"\u2795  Add proxy (HTTP / SOCKS5)","Bot ye proxy use karke stream laayega"+(sel?" | "+sel.n:""),function(){renderPb("pxa")},m==="custom");
+  if(CFG.pxp)row(box,"\uD83D\uDDC2  Server proxy pool","Admin ke proxies (PROXY_URLS / /addproxy)",function(){setM("pool")},m==="pool");
+  row(box,"\uD83D\uDD17  URL template (Worker / CORS proxy)",s.tpl?s.tpl:"https://worker.dev/?url={url}",function(){renderPb("pxt")},m==="tpl");
+  row(box,"\u2708  MTProto (Telegram)","Telegram ke liye proxy (video stream ke liye nahi)",function(){renderPb("mtp")},false);
+  row(box,"\uD83E\uDDEA  Test current link","Proxy se 1 byte fetch karke dekho",pxTest,false);
+  box.appendChild(el("div","axnote","DASH (.mpd) streams player ki purani limit ke hisaab se direct chalti hain. Auto mode purane jaisa hi kaam karta hai."));
+}
+function pxAdd(box){
+  hd2(box,"Add proxy","pxs");
+  var s=pxs(),type="http",chips=el("div","chips2");
+  [["http","HTTP"],["https","HTTPS"],["socks5","SOCKS5"],["socks4","SOCKS4"]].forEach(function(o){
+    var c=el("div","chip2"+(o[0]===type?" on":""),o[1]);
+    c.onclick=function(){type=o[0];[].forEach.call(chips.children,function(x){x.className="chip2"});c.className="chip2 on"};chips.appendChild(c);
+  });
+  box.appendChild(chips);
+  var nm=el("input","axi");nm.placeholder="Name (optional)";box.appendChild(nm);
+  var ur=el("input","axi");ur.placeholder="host:port  |  user:pass@host:port  |  scheme://user:pass@host:port";ur.autocapitalize="off";ur.spellcheck=false;box.appendChild(ur);
+  var go=el("div","axbtn","Save & use");
+  go.onclick=function(){
+    var u=pxParse(ur.value,type);if(!u){toast("Proxy format galat hai");return}
+    var id=Date.now().toString(36);s.list.push({id:id,n:(nm.value.trim()||pxName(u)),u:u});s.sel=id;s.mode="custom";pxsave(s);
+    if(!CFG.px)toast("Saved - par PROXY_BASE set nahi, bot proxy off hai");else toast("Proxy saved");
+    pxApplyCur();renderPb("pxa");
+  };
+  box.appendChild(go);
+  s.list.forEach(function(p){
+    var r=row(box,p.n,pxMask(p.u),function(){s.sel=p.id;s.mode="custom";pxsave(s);pxApplyCur();renderPb("pxa")},s.mode==="custom"&&s.sel===p.id);
+    delBtn(r,function(){s.list=s.list.filter(function(x){return x.id!==p.id});if(s.sel===p.id){s.sel=null;if(s.mode==="custom")s.mode="auto"}pxsave(s);renderPb("pxa")});
+  });
+  box.appendChild(el("div","axnote","Bot (server) ye proxy use karke stream fetch karta hai. SOCKS ke liye server par: pip install \"requests[socks]\". Proxy sirf tumhare browser me save hota hai."));
+}
+function pxTplPage(box){
+  hd2(box,"URL template","pxs");
+  var s=pxs(),ti=el("input","axi");ti.value=s.tpl||"";ti.placeholder="https://my-worker.workers.dev/?url={url}";ti.autocapitalize="off";ti.spellcheck=false;box.appendChild(ti);
+  var go=el("div","axbtn","Save & use");
+  go.onclick=function(){
+    var v=ti.value.trim();if(!/^https?:\/\//i.test(v)){toast("https:// se shuru hone wali URL do");return}
+    s.tpl=v;s.mode="tpl";pxsave(s);toast("Template saved");pxApplyCur();renderPb("pxt");
+  };
+  box.appendChild(go);
+  var off=row(box,"\u2715  Template band karo","Auto mode par wapas",function(){s.mode="auto";pxsave(s);pxApplyCur();renderPb("pxs")},false);
+  box.appendChild(el("div","axnote","{url} = original link, {urlenc} = encoded link. Placeholder na ho to encoded link aakhir me jud jaati hai. Browser seedha is proxy se load karta hai, isliye proxy me CORS allow hona chahiye."));
+}
+function mtPage(box){
+  hd2(box,"MTProto (Telegram)","pxs");
+  var s=pxs();
+  box.appendChild(el("div","axnote","MTProto sirf Telegram app ke liye hai (Telegram ko unblock/fast karta hai). Isse video stream nahi chalti. Tap karte hi Telegram connect karne ko puchhega."));
+  (CFG.mt||[]).forEach(function(x){row(box,"\u2708  "+x.n,"Admin proxy - tap karke connect",function(){pxOpen(x.l)},false)});
+  s.mt.forEach(function(x,i){
+    var r=row(box,"\u2708  "+x.n,"Meri list - tap karke connect",function(){pxOpen(x.l)},false);
+    delBtn(r,function(){s.mt.splice(i,1);pxsave(s);renderPb("mtp")});
+  });
+  var mi=el("input","axi");mi.placeholder="tg://proxy?server=..&port=..&secret=..  ya  host:port:secret";mi.autocapitalize="off";mi.spellcheck=false;box.appendChild(mi);
+  var go=el("div","axbtn","Add & connect");
+  go.onclick=function(){
+    var l=mtParse(mi.value);if(!l){toast("MTProto link/format galat hai");return}
+    var m=l.match(/server=([^&]+)&port=(\d+)/);
+    s.mt.push({n:decodeURIComponent(m[1])+":"+m[2],l:l});pxsave(s);pxOpen(l);renderPb("mtp");
+  };
+  box.appendChild(go);
+}
+
+renderPb=function(level){
+  _renderPb0(level);
+  try{
+    var box=$("#pbm");
+    if(level==="amb"){var last=box.lastChild,fr=document.createDocumentFragment();axBuild(fr);box.insertBefore(fr,last)}
+    else if(level==="main")pxMainRow(box);
+    else if(level==="pxs")pxPage(box);
+    else if(level==="pxa")pxAdd(box);
+    else if(level==="pxt")pxTplPage(box);
+    else if(level==="mtp")mtPage(box);
+  }catch(e){}
+};
+
+try{axApply()}catch(e){}
+window.__axp={AXB:function(){return AXB},apply:axApply,pxs:pxs,pxParse:pxParse,mtParse:mtParse,pxTplApply:pxTplApply,pxDeco:pxDeco};
+})();
+/* ========== end AMBIENT PLUS + PROXY MODES ========== */
+
+/* ========== FORMAT SUPPORT + PROXY EXTRAS (add-only): MKV / AVI / WMV / HEVC convert, Custom PROXY_BASE ========== */
+(function(){
+var TCK="ytb_tc",TCS={},TCT={};
+function tcMode(){return LS.get(TCK,"auto")}
+function hevcName(it){return /hevc|x265|h\.?265|\.265(\?|$)/i.test((it.u||"")+" "+(it.t||""))}
+function isNative(it){return engineOf({u:it.u,k:it.k,eng:it.eng})==="native"}
+function tcWant(it){
+  var m=tcMode();if(m==="off"||!it||!it.tc||!isNative(it))return false;
+  if(TCS[it.u]!==undefined)return TCS[it.u];
+  if(m==="always")return true;
+  var e=extOf(it.u.toLowerCase());
+  if(e==="avi"&&!V.canPlayType("video/x-msvideo"))return true;
+  if((e==="wmv"||e==="asf")&&!V.canPlayType("video/x-ms-wmv"))return true;
+  if(/^(mpg|mpeg|divx|rmvb|rm|vob)$/.test(e))return true;
+  if((e==="hevc"||e==="h265"||e==="265"||hevcName(it))&&!V.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"'))return true;
+  return false;
+}
+function baseOf(){var s=LS.get("ytb_pxm",null);return (s&&s.base)?String(s.base).replace(/\/+$/,""):""}
+function fixBase(it){
+  if(!it)return;var b=baseOf();
+  if(b){
+    if(it.x&&!it.xp){var m=it.x.match(/^https?:\/\/[^\/]+(\/p\?.*)$/);if(m)it.xp=m[1]}
+    if(it.xp)it.x=b+it.xp;
+    if(it.tc&&!it.tcp){var m2=it.tc.match(/^https?:\/\/[^\/]+(\/t\?.*)$/);if(m2)it.tcp=m2[1]}
+    if(it.tcp)it.tc=b+it.tcp;
+  }
+}
+var _l1=loadItem;
+loadItem=function(it,opt){
+  opt=opt||{};
+  try{
+    fixBase(it);
+    if(!opt.url&&it&&it.k!=="IMAGE"&&it.k!=="PDF"&&tcWant(it)){opt.url=it.tc;TCT[it.u]=1}
+  }catch(e){}
+  return _l1(it,opt);
+};
+var _fail0=fail;
+fail=function(it,why){
+  try{
+    if(it&&it.tc&&tcMode()!=="off"&&!TCT[it.u]&&it.k!=="AUDIO"&&it.k!=="IMAGE"&&isNative(it)){
+      TCT[it.u]=1;TCS[it.u]=true;toast("Server se convert karke chala raha hoon...");setLoading(true);
+      loadItem(it,{keepQ:true,at:V.currentTime||0});return;
+    }
+  }catch(e){}
+  return _fail0.apply(this,arguments);
+};
+var _slim0=slim;
+slim=function(it){var o=_slim0(it);if(it.tc)o.tc=it.tc;if(it.tcp)o.tcp=it.tcp;if(it.xp)o.xp=it.xp;return o};
+
+function hd(box,txt,back){var h=el("div","hd");h.appendChild(el("span","","\u2039"));h.appendChild(el("span","",txt));h.onclick=function(){renderPb(back)};box.appendChild(h)}
+function row(box,label,sub,fn,on){var r=el("div","row2"+(on?" axon":"")),t=el("div");t.appendChild(el("div","",label));if(sub)t.appendChild(el("small","",sub));r.appendChild(t);r.onclick=fn;box.appendChild(r);return r}
+function reloadNow(){if(CUR&&$("#watch")&&!$("#watch").hidden)loadItem(CUR,{keepQ:true,at:V.currentTime||0})}
+function tcPage(box){
+  hd(box,"Format support","main");
+  var m=tcMode();
+  box.appendChild(el("div","axnote","MKV / AVI / WMV / MPEG / HEVC (H.265) jo browser seedha nahi chalata, wo bot server par ffmpeg se MP4 me badal kar chalta hai."));
+  var chips=el("div","chips2");
+  [["auto","Auto"],["always","Always"],["off","Off"]].forEach(function(o){
+    var c=el("div","chip2"+(m===o[0]?" on":""),o[1]);
+    c.onclick=function(){LS.set(TCK,o[0]);TCS={};TCT={};reloadNow();renderPb("tcs")};chips.appendChild(c);
+  });
+  box.appendChild(chips);
+  if(!CFG.tc)box.appendChild(el("div","axnote","\u26A0 Server par ffmpeg nahi mila (apt install ffmpeg) - convert abhi band hai."));
+  if(CUR){
+    row(box,"\uD83C\uDF9E  Is video ko server se convert karke chalao",CUR.tc||CUR.tcp?"Abhi wali video":"Is item ke liye convert link nahi",function(){TCS[CUR.u]=true;TCT[CUR.u]=1;pbClose();setLoading(true);loadItem(CUR,{keepQ:true,at:V.currentTime||0})},TCS[CUR.u]===true);
+    row(box,"\u21A9  Original (bina convert) chalao","Browser ka apna decoder",function(){TCS[CUR.u]=false;pbClose();loadItem(CUR,{keepQ:true,at:V.currentTime||0})},TCS[CUR.u]===false);
+  }
+  box.appendChild(el("div","axnote","Auto: AVI / WMV / MPEG / HEVC jahan browser support nahi karta wahan convert; MKV pehle seedha chalta hai, fail ho to khud convert. H.264 wali file sirf remux hoti hai (CPU kam), HEVC transcode hoti hai (CPU zyada). Seek abhi buffer hue hisse tak hi chalta hai."));
+}
+function baseRows(box){
+  var s=LS.get("ytb_pxm",null)||{};
+  box.appendChild(el("div","axnote","Custom PROXY_BASE URL"));
+  var bi=el("input","axi");bi.value=s.base||"";bi.placeholder="https://your-app.onrender.com";bi.autocapitalize="off";bi.spellcheck=false;box.appendChild(bi);
+  var go=el("div","axbtn","Save base");
+  go.onclick=function(){
+    var v=bi.value.trim().replace(/\/+$/,"");if(v&&!/^https?:\/\//i.test(v)){toast("https:// se shuru karo");return}
+    s=LS.get("ytb_pxm",null)||{};s.base=v;LS.set("ytb_pxm",s);toast(v?"Custom base saved":"Custom base hata diya");reloadNow();renderPb("pxs");
+  };
+  box.appendChild(go);
+  row(box,"Clear per-video proxy overrides","Har video ka manual proxy / direct choice reset",function(){var k;for(k in PXS)delete PXS[k];toast("Overrides clear");reloadNow()},false);
+  box.appendChild(el("div","axnote","Browser system HTTP proxy set nahi kar sakta. Ye bot stream-proxy (/p?u=...) ko control karta hai. Custom base tab kaam karta hai jab item me ready proxy URL (x) na ho."));
+}
+var _r1=renderPb;
+renderPb=function(level){
+  _r1(level);
+  try{
+    var box=$("#pbm");
+    if(level==="main"){
+      var r=el("div","row2"),t=el("div"),md={auto:"Auto",always:"Always",off:"Off"};
+      t.appendChild(el("div","","\uD83C\uDF9E  Format support (MKV / AVI / HEVC / WMV)"));
+      t.appendChild(el("small","","Server convert: "+md[tcMode()]));
+      r.appendChild(t);r.appendChild(el("span","arrow","\u203A"));r.onclick=function(){renderPb("tcs")};
+      var kids=[].slice.call(box.children),ref=null;
+      for(var i=0;i<kids.length;i++)if(/Proxy \/ Network/.test(kids[i].textContent||""))ref=kids[i];
+      if(ref&&ref.nextSibling)box.insertBefore(r,ref.nextSibling);else box.appendChild(r);
+    }else if(level==="tcs")tcPage(box);
+    else if(level==="pxs")baseRows(box);
+  }catch(e){}
+};
+})();
+/* ========== end FORMAT SUPPORT ========== */
+
 /* ---------- init ---------- */
 function start(){
   $("#lock").hidden=true;$("#app").hidden=false;
@@ -4898,29 +5588,11 @@ window.__ytb={refresh:refreshItem,applyFresh:applyFresh,parseLinks:parseLinks,sr
 
 
 AMBIENT_DEFAULT = {
-    # Core ambient (YouTube-style glow)
     "enabled": True, "blur": 28, "edge": 20, "spread": 145, "spreadFadeStart": 22, "spreadFadeCurve": 28,
     "framerateLimit": 30, "energySaver": True, "enableInPictureInPicture": True,
     "detectHorizontalBarSizeEnabled": True, "headerShadowOpacity": 35, "headerShadowSize": 30,
     "surroundingContentFillOpacity": -25, "hideScrollbar": True, "intensity": 88,
-    "smoothing": 0.62, "saturation": 1.45, "brightness": 1.05,
-    # Extra options matching Ambient Light / quality panel screenshots
-    "webglRenderer": True, "resolutionScale": 100, "syncMode": "video",
-    "prioritizePageLoad": True, "youtubeResponsiveness": True, "debandingOptimize": "lcd",
-    "pageHeaderShadowSize": 25, "pageHeaderShadowOpacity": 30,
-    "pageContentShadowSize": 5, "pageContentShadowOpacity": 5,
-    "shadowsOnTextButtonsOnly": False, "imagesOpacity": 100, "buttonsBoxesBgOpacity": -25,
-    "backgroundGreyness": 100, "hideEverythingTheater": False, "relatedAsScrollList": False,
-    "videoSizeSmall": 100.9, "videoShadowSize": 100, "videoShadowOpacity": 15.2,
-    "debandingNoise": 100, "syncVideoAmbient": True, "syncDisableThreshold": 100,
-    "videoJitterWorkaround": False, "videoArtifactsWorkaround": True,
-    "removeBlackBars": False, "removeBlackSidebars": False, "barSize": 0, "sidebarsSize": 0,
-    "resetBarsNextVideo": False, "fillVideoRemovedBars": True,
-    "filterBrightness": 100, "filterContrast": 100, "filterColors": 100, "filterSaturation": 103,
-    "fixedPosition": False, "viewModeLayouts": "all",
-    "pictureInPicture": False, "embeddedVideos": True, "vr360Videos": True,
-    "appearanceTheme": "default",
-}
+    "smoothing": 0.62, "saturation": 1.45, "brightness": 1.05}
 
 
 def load_ambient_cfg() -> dict:
@@ -4957,6 +5629,197 @@ def _player_item(it: dict) -> dict:
                  "ip": it.get("iplock") or ""}, **_px_fields(it))
 
 
+# ==========================================================
+# FORMAT SUPPORT (add-only): MKV / AVI / WMV / HEVC / MPEG etc. -> server par ffmpeg se browser-friendly MP4 stream
+# ==========================================================
+import shutil as _tc_shutil
+_TC_SEM = threading.BoundedSemaphore(max(1, int(os.getenv("TC_MAX_JOBS", "2") or 2)))
+
+
+def tc_available() -> bool:
+    return os.getenv("TC_ENABLE", "1") != "0" and bool(_tc_shutil.which("ffmpeg"))
+
+
+def tc_path(u: str, r: str = "") -> str:
+    return f"/t?u={quote(u, safe='')}&r={quote(r, safe='')}&s={px_sig(u, 'tc|' + r)}"
+
+
+def _tc_headers(url: str, ref: str) -> str:
+    hd = f"Accept: */*\r\n"
+    if ref:
+        hd += f"Referer: {ref}\r\n"
+    try:
+        ck = get_cookie_for_url(url)
+        if ck:
+            hd += f"Cookie: {ck}\r\n"
+    except Exception:
+        pass
+    return hd
+
+
+def _tc_resolve(u: str, ref: str, proxies) -> Optional[str]:
+    """Redirects khud follow (har hop par SSRF check) - ffmpeg ko final URL do."""
+    cur = u
+    hdrs = {"User-Agent": UA, "Accept": "*/*"}
+    if ref:
+        hdrs["Referer"] = ref
+    for _ in range(6):
+        if not _px_host_ok(urlparse(cur).hostname or ""):
+            return None
+        resp = requests.get(cur, headers=hdrs, stream=True, timeout=(8, 15), allow_redirects=False, proxies=proxies)
+        try:
+            if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                cur = urljoin(cur, resp.headers["Location"])
+                continue
+            return cur if resp.status_code < 400 else None
+        finally:
+            resp.close()
+    return None
+
+
+def _tc_probe(url: str, hdr: str, http_proxy: str = "") -> tuple:
+    """(video codec, audio codec) - copy ya transcode ka faisla ke liye."""
+    cmd = ["ffprobe", "-v", "error", "-user_agent", UA, "-headers", hdr]
+    if http_proxy:
+        cmd += ["-http_proxy", http_proxy]
+    cmd += ["-show_entries", "stream=codec_type,codec_name", "-of", "csv=p=0", url]
+    v = a = ""
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=25).stdout.decode("utf-8", "ignore")
+        for ln in out.splitlines():
+            parts = [x.strip().lower() for x in ln.split(",")]
+            if "video" in parts and not v:
+                v = next((x for x in parts if x != "video"), "")
+            elif "audio" in parts and not a:
+                a = next((x for x in parts if x != "audio"), "")
+    except Exception:
+        pass
+    return v, a
+
+
+def tc_handle(h, head: bool = False):
+    q = parse_qs(urlsplit(h.path).query)
+    u = (q.get("u") or [""])[0]
+    r = (q.get("r") or [""])[0]
+    sg = (q.get("s") or [""])[0]
+
+    def cors():
+        h.send_header("Access-Control-Allow-Origin", "*")
+        h.send_header("Access-Control-Expose-Headers", "Content-Length")
+
+    def deny(code=403):
+        h.send_response(code)
+        cors()
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+
+    if not u.startswith(("http://", "https://")) or not hmac.compare_digest(sg, px_sig(u, "tc|" + r)):
+        return deny(403)
+    if not tc_available():
+        return deny(501)
+    ip = (h.headers.get("X-Forwarded-For") or h.client_address[0]).split(",")[0].strip()
+    if not px_account(ip, check=True):
+        return deny(429)
+    if head:
+        h.send_response(200)
+        h.send_header("Content-Type", "video/mp4")
+        cors()
+        h.end_headers()
+        return
+    if not _TC_SEM.acquire(blocking=False):
+        return deny(503)                       # converter busy (TC_MAX_JOBS)
+    proc = None
+    try:
+        proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+        try:
+            proxies = _px_pick_proxies(q, proxies)
+        except ValueError:
+            return deny(403)
+        hp = ""
+        if proxies and str(proxies.get("http", "")).startswith(("http://", "https://")):
+            hp = proxies["http"]               # ffmpeg sirf HTTP proxy samajhta hai
+        final = _tc_resolve(u, r, proxies)
+        if not final:
+            return deny(502)
+        hdr = _tc_headers(final, r)
+        vc, ac = _tc_probe(final, hdr, hp)
+        max_h = int(os.getenv("TC_MAX_HEIGHT", "1080") or 1080)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-user_agent", UA, "-headers", hdr]
+        if hp:
+            cmd += ["-http_proxy", hp]
+        cmd += ["-i", final, "-map", "0:v:0?", "-map", "0:a:0?", "-sn", "-dn"]
+        if vc == "h264":
+            cmd += ["-c:v", "copy"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "25", "-pix_fmt", "yuv420p",
+                    "-vf", f"scale=-2:'min(ih,{max_h})'"]
+        if ac == "aac":
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", "160k", "-ac", "2"]
+        cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        first = proc.stdout.read(65536)
+        if not first:
+            return deny(502)
+        h.send_response(200)
+        h.send_header("Content-Type", "video/mp4")
+        h.send_header("Cache-Control", "no-store")
+        cors()
+        h.end_headers()
+        h.wfile.write(first)
+        px_account(ip, len(first))
+        while True:
+            ch = proc.stdout.read(65536)
+            if not ch:
+                break
+            h.wfile.write(ch)
+            px_account(ip, len(ch))
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    except Exception as e:
+        logger.warning(f"convert error {u[:80]}: {e}")
+        try:
+            deny(502)
+        except Exception:
+            pass
+    finally:
+        try:
+            if proc is not None:
+                proc.kill()
+                proc.wait(timeout=5)
+        except Exception:
+            pass
+        _TC_SEM.release()
+
+
+_player_item_base = _player_item
+
+
+def _player_item(it: dict) -> dict:
+    """NEW: har item me convert-link (tc) aur, PROXY_BASE na ho to, relative proxy path (xp/tcp) - player custom base ke saath jodta hai."""
+    d = _player_item_base(it)
+    try:
+        u = it.get("download_link") or ""
+        kind = (it.get("type") or "VIDEO")
+        pg = it.get("page_url") or ""
+        if u.startswith("http") and kind not in ("IMAGE", "PDF"):
+            mode = (get_setting("proxy") or "auto").lower()
+            if not PROXY_BASE and mode != "off":
+                d["xp"] = px_path(u, pg)
+                if mode == "on" or px_needs(u, it.get("iplock") or ""):
+                    d["xa"] = 1
+            if kind != "AUDIO" and tc_available() and not re.search(r'\.(?:m3u8|mpd)(?:$|\?)', u, re.I):
+                p = tc_path(u, pg)
+                if PROXY_BASE:
+                    d["tc"] = PROXY_BASE + p
+                else:
+                    d["tcp"] = p
+    except Exception:
+        pass
+    return d
+
+
 def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web Player", mini: bool = False) -> str:
     """Self-contained YouTube-style web player (password gate, auto thumbnails, favorites, history,
     HLS/MP4/WebM/MKV/DASH/TS/FLV/audio, external-player fallback)."""
@@ -4967,8 +5830,11 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
                 .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
     cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK, "amb": load_ambient_cfg(), "px": bool(PROXY_BASE),
-           "pxMode": (get_setting("proxy") or "auto"),
            "hash": hashlib.sha256(SKY_PASSWORD.encode("utf-8")).hexdigest() if SKY_PASSWORD else ""}
+    try:                                    # NEW: proxy menu + MTProto list ke liye
+        cfg.update(tc=tc_available(), pxp=bool(_PROXY_POOL or PROXY_URL), pxc=os.getenv("PX_ALLOW_CUSTOM", "1") != "0", mt=mt_public())
+    except Exception:
+        pass
     if mini:
         cfg.update(mini=True, hash="")      # Mini App: login Telegram se hota hai, password nahi
     return (_PLAYER_TEMPLATE.replace("__OWNER__", _html.escape(BOT_OWNER_NAME))
@@ -5078,6 +5944,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• <code>/cleanup_backups</code> — temp files + purani DB rows + caches saaf\n"
             "• <code>/adscr</code> — alias of /addscr\n"
             "• <code>/mini</code> — alias of /app (Mini App)\n"
+            "• <code>/addproxy &lt;url&gt;</code> / <code>/delproxy &lt;n&gt;</code> — server proxy pool (player: Proxy / Network)\n"
+            "• <code>/mtproto</code> — Telegram MTProto proxies | <code>/mtproto add &lt;link&gt;</code>\n"
             "• <code>/commands</code> — alias of /help\n\n"
             "⚡ Speed env (optional): <code>SCR_CONCURRENCY</code>, <code>SCR_PAGE_CONCURRENCY</code>, "
             "<code>SCR_ALL_MAX</code>, <code>PROXY_URL</code>, <code>PROXY_BASE</code>"
@@ -6834,7 +7702,7 @@ def _kind_of(url: str) -> str:
 def _title_from_url(url: str, n: int) -> str:
     pu = urlparse(url)
     name = unquote(pu.path.rstrip('/').rsplit('/', 1)[-1])
-    name = re.sub(r'(?:\.(?:mp4|mkv|webm|mov|avi|flv|ts|mpd|mp3|m4a|m3u8|ogg|wav|flac|aac|jpe?g|png|gif|webp|bmp|pdf))+$', '', name, flags=re.I)
+    name = re.sub(r'(?:\.(?:mp4|mkv|webm|mov|avi|wmv|asf|mpe?g|hevc|h265|flv|ts|mpd|mp3|m4a|m3u8|ogg|wav|flac|aac|jpe?g|png|gif|webp|bmp|pdf))+$', '', name, flags=re.I)
     name = re.sub(r'[-_.]+', ' ', name).strip()
     if len(name) < 4 or re.match(r'^\d{3,4}p\b', name):
         return f"{pu.netloc.replace('www.', '')} #{n}"
@@ -7821,7 +8689,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• ytdlp (fallback extractor): {'ON' if get_setting('ytdlp') != '0' else 'OFF'}"
         f"{'' if yt_dlp else '  (yt-dlp install nahi hai)'}\n"
         f"• keep_preview (sirf 0.5s clip wale items bhi rakho): {'ON' if get_setting('keep_preview') == '1' else 'OFF'}\n"
-        f"• proxy (player stream: auto=IP-lock/acctoken | on/force=always bot-proxy | off/direct=no proxy | mtproto→auto): {get_setting('proxy') or 'auto'} | PROXY_BASE: {PROXY_BASE or 'SET NAHI'}\n"
+        f"• proxy (player ko bot ke through stream: auto/on/off): {get_setting('proxy') or 'auto'} | PROXY_BASE: {PROXY_BASE or 'SET NAHI'}\n"
         f"• min_quality: {get_setting('min_quality')}\n"
         f"• include (title me ye words): {show('include')}\n"
         f"• exclude (title me ye words nahi): {show('exclude')}\n"
@@ -8559,7 +9427,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "2.2-ambient-proxy"
+BOT_VERSION = "2.1-power"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
@@ -8601,6 +9469,129 @@ async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"\nActive next: #{(_PROXY_IDX[0] % len(_PROXY_POOL)) + 1}")
     lines.append("Reload: /proxy reload")
     await update.message.reply_text("\n".join(lines))
+
+
+# ==========================================================
+# PROXY PLUS commands: /mtproto  /addproxy  /delproxy
+# ==========================================================
+_PX_EXTRA_KEY = "proxy_extra"
+
+
+def _px_extra_list() -> List[str]:
+    return [x.strip() for x in (get_setting(_PX_EXTRA_KEY) or "").split("\n") if x.strip()]
+
+
+async def mtproto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_allowed(uid):
+        return
+    args = context.args or []
+    sub = args[0].lower() if args else ""
+    if sub in ("add", "del", "clear"):
+        if uid != ADMIN_ID:
+            await update.message.reply_text("❌ MTProto list sirf admin badal sakta hai.")
+            return
+        db = mt_db_list()
+        if sub == "add":
+            link = mt_parse(" ".join(args[1:]))
+            if not link:
+                await update.message.reply_text(
+                    "❌ Format:\n/mtproto add tg://proxy?server=HOST&port=443&secret=XXXX\n"
+                    "ya /mtproto add HOST PORT SECRET")
+                return
+            if link not in db:
+                db.append(link)
+            set_setting(_MT_KEY, "\n".join(db))
+            await update.message.reply_text(f"✅ MTProto add: {mt_label(link)}")
+        elif sub == "del":
+            allp = mt_list()
+            if len(args) < 2 or not args[1].isdigit() or not (1 <= int(args[1]) <= len(allp)):
+                await update.message.reply_text("Use: /mtproto del <number>  (number /mtproto list se dekho)")
+                return
+            target = allp[int(args[1]) - 1]
+            if target not in db:
+                await update.message.reply_text("ℹ️ Ye proxy env (MTPROTO_PROXIES) se hai, env se hatao.")
+                return
+            db.remove(target)
+            set_setting(_MT_KEY, "\n".join(db))
+            await update.message.reply_text(f"🗑 Hataya: {mt_label(target)}")
+        else:
+            set_setting(_MT_KEY, "")
+            await update.message.reply_text("🗑 DB wali MTProto list saaf (env wali bachi hain).")
+        try:                       # secret wala message chat se hata do
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+    links = mt_list()
+    if not links:
+        await update.message.reply_text(
+            "ℹ️ Abhi koi MTProto proxy set nahi.\n"
+            "Admin: /mtproto add tg://proxy?server=HOST&port=443&secret=XXXX\n"
+            "ya env MTPROTO_PROXIES=link1,link2")
+        return
+    kb = [[InlineKeyboardButton(f"✈️ Connect #{i}  {mt_label(l)}", url=l)] for i, l in enumerate(links, 1)]
+    txt = ("✈️ MTProto proxies (Telegram ke liye)\n"
+           "Button dabao → Telegram connect karne ko puchhega.\n\n"
+           "Note: ye sirf Telegram app ko fast/unblock karta hai, video stream ke liye nahi.")
+    if uid == ADMIN_ID:
+        txt += "\n\n" + "\n".join(f"{i}. {mt_label(l)}" for i, l in enumerate(links, 1)) + \
+               "\nAdmin: /mtproto add | /mtproto del <n> | /mtproto clear"
+    await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        await update.message.reply_text(
+            "Use: /addproxy <proxy>\n"
+            "/addproxy http://user:pass@1.2.3.4:8080\n/addproxy socks5://1.2.3.4:1080\n/addproxy 1.2.3.4:8080\n"
+            "(SOCKS ke liye server par: pip install \"requests[socks]\")\n"
+            "Hatane ke liye: /delproxy <number>  (number /proxy se dekho)")
+        return
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        pu = urlsplit(raw)
+        ok = (pu.scheme or "").lower() in _PX_SCHEMES and bool(pu.hostname) and bool(pu.port)
+    except ValueError:
+        ok = False
+    if not ok:
+        await update.message.reply_text("❌ Proxy format galat. Example: http://user:pass@host:port")
+        return
+    if raw.lower().startswith("socks5://"):
+        raw = "socks5h://" + raw[len("socks5://"):]
+    lst = _px_extra_list()
+    if raw not in lst:
+        lst.append(raw)
+    set_setting(_PX_EXTRA_KEY, "\n".join(lst))
+    _init_proxy_pool()
+    try:                           # credentials wala message chat se hata do
+        await update.message.delete()
+    except Exception:
+        pass
+    await context.bot.send_message(update.effective_chat.id, f"✅ Proxy add. Pool ab: {len(_PROXY_POOL)} (player me 'Server proxy pool' se use hoga)")
+
+
+async def delproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args or []
+    if not args or not args[0].isdigit() or not (1 <= int(args[0]) <= len(_PROXY_POOL)):
+        await update.message.reply_text("Use: /delproxy <number>  (number /proxy list me dekho)")
+        return
+    target = _PROXY_POOL[int(args[0]) - 1]
+    extras = _px_extra_list()
+    if target not in extras:
+        await update.message.reply_text("ℹ️ Ye proxy env (PROXY_URL / PROXY_URLS) se hai, env se hatao.")
+        return
+    extras.remove(target)
+    set_setting(_PX_EXTRA_KEY, "\n".join(extras))
+    _PROXY_FAILS.pop(target, None)
+    _init_proxy_pool()
+    await update.message.reply_text(f"🗑 Proxy hataya. Pool ab: {len(_PROXY_POOL)}")
 
 
 async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8743,6 +9734,7 @@ def main():
         logger.info(f"Supabase restore at startup: {_r}")
     init_db()
     load_settings()
+    _init_proxy_pool()          # NEW: /addproxy se jude proxies
     load_env_cookies()
     threading.Thread(target=run_dummy_server, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
@@ -8794,6 +9786,9 @@ def main():
     app.add_handler(CommandHandler("commands", commands_command))
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("proxy", proxy_command))
+    app.add_handler(CommandHandler("addproxy", addproxy_command))
+    app.add_handler(CommandHandler("delproxy", delproxy_command))
+    app.add_handler(CommandHandler("mtproto", mtproto_command))
     app.add_handler(CommandHandler("quota", quota_command))
     app.add_handler(CommandHandler("queue", queue_command))
     app.add_handler(CommandHandler("qrun", queue_run_command))
