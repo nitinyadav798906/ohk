@@ -3269,29 +3269,35 @@ a{color:inherit}
 .theater .wmain{margin:0 -24px}
 .theater .wmain>*:not(.player){margin-left:24px;margin-right:24px}
 .wmain{position:relative;z-index:0}
-.player{position:relative;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);user-select:none}
-.pin{position:absolute;inset:0;overflow:hidden;background:#000;border-radius:12px}
-.ambc{position:absolute;z-index:-1;pointer-events:none;transition:opacity .4s;object-fit:fill}
-/* Full-page ambient wash (YouTube-style) — fixed behind everything */
-#ambPage{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .5s ease;
-  background:radial-gradient(ellipse 90% 70% at 50% 35%,rgba(var(--amb-rgb,20,20,20),.55) 0%,rgba(var(--amb-rgb,20,20,20),.18) 45%,transparent 78%)}
+.player{position:relative;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);user-select:none;overflow:visible}
+.pin{position:absolute;inset:0;overflow:hidden;background:#000;border-radius:12px;z-index:1}
+/* Player-local ambient canvas — blurred video behind/around player */
+.ambc{position:absolute;z-index:0;pointer-events:none;opacity:0;object-fit:fill;left:-20%;top:-20%;width:140%;height:140%;
+  filter:blur(52px) saturate(1.65) brightness(1.1);transform:scale(1.04);transition:opacity .35s}
+body.amb-on .ambc{opacity:var(--amb-op,.92)}
+/* Full-page ambient — fixed layer, full HTML viewport (YouTube style) */
+#ambPage{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0;overflow:hidden;
+  transition:opacity .4s ease;background:rgb(var(--amb-rgb,12,12,12))}
 #ambPage.on{opacity:1}
-#ambPage canvas{position:absolute;inset:-8%;width:116%;height:116%;object-fit:fill;
-  filter:blur(72px) saturate(1.5) brightness(1.05);opacity:.85;transform:scale(1.05)}
-body.amb-on{overflow-x:hidden}
-body.amb-on #watch,body.amb-on .wl,body.amb-on .wmain{position:relative;z-index:1}
-body.amb-on .top{position:relative;z-index:60}
-html:has(body.amb-on){scrollbar-width:none}
+#ambPage canvas{position:absolute;left:50%;top:40%;width:160vmax;height:160vmax;max-width:none;
+  transform:translate(-50%,-50%);filter:blur(90px) saturate(1.75) brightness(1.12);opacity:.95}
+/* Ambient ON: body/app transparent so full-page glow is visible everywhere */
+body.amb-on{overflow-x:hidden;background:transparent!important}
+body.amb-on #app{background:transparent!important}
+body.amb-on #home{background:transparent}
+body.amb-on #watch,body.amb-on .wl,body.amb-on .wmain{position:relative;z-index:2}
+body.amb-on .top{position:relative;z-index:60;background:color-mix(in srgb,var(--bg) 80%,transparent)}
+body.amb-on .chips{background:color-mix(in srgb,var(--bg) 80%,transparent)}
+html:has(body.amb-on){scrollbar-width:none;background:#000}
 html:has(body.amb-on)::-webkit-scrollbar{display:none}
 .amb-on .top{box-shadow:var(--hsh,none)}
-.amb-on .desc,.amb-on .act{background:color-mix(in srgb,var(--bg2) 75%,transparent)}
-/* Player-local glow (around the video) */
-.amb-on .player::before{content:"";position:absolute;inset:-56px;z-index:-2;pointer-events:none;
-  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.55) 0%,rgba(var(--amb-rgb,20,20,20),.22) 40%,transparent 72%);
-  filter:blur(52px);transition:background .3s}
-/* Soft page background tint from video colors */
-body.amb-on #watch{background:radial-gradient(ellipse 100% 80% at 50% 20%,rgba(var(--amb-rgb,20,20,20),.28) 0%,var(--bg) 70%)}
-body.amb-on .upn,body.amb-on .meta{background:color-mix(in srgb,var(--bg) 88%,rgb(var(--amb-rgb,20,20,20)) 12%)}
+.amb-on .desc,.amb-on .act{background:color-mix(in srgb,var(--bg2) 70%,transparent)}
+.amb-on .player::after{content:"";position:absolute;inset:-36px;z-index:-1;pointer-events:none;border-radius:18px;
+  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.55) 0%,rgba(var(--amb-rgb,20,20,20),.18) 55%,transparent 75%);
+  filter:blur(24px)}
+body.amb-on .upn,body.amb-on .meta,body.amb-on .wside{
+  background:color-mix(in srgb,var(--bg) 75%,rgb(var(--amb-rgb,20,20,20)) 25%)}
+body.amb-on .wside .c,body.amb-on .up{background:color-mix(in srgb,var(--bg2) 68%,transparent)}
 #statsN{position:absolute;top:10px;left:10px;z-index:8;background:rgba(0,0,0,.78);color:#0f0;font:12px/1.45 ui-monospace,Consolas,monospace;
   padding:8px 10px;border-radius:8px;max-width:min(92%,360px);white-space:pre;pointer-events:none;display:none}
 #statsN.on{display:block}
@@ -3302,6 +3308,7 @@ body.amb-on .upn,body.amb-on .meta{background:color-mix(in srgb,var(--bg) 88%,rg
 .dtap .rip2.on{opacity:1}
 .player video,.player #imgv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
 .player:fullscreen{max-height:none;background:#000}.player:fullscreen .pin{border-radius:0}.player:fullscreen .ambc{display:none}
+body:has(.player:fullscreen) #ambPage{opacity:0!important}
 .aud{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:90px;color:#555}
 .ov{position:absolute;inset:0 0 54px 0;z-index:3}
 .big{position:absolute;left:50%;top:50%;width:68px;height:68px;margin:-34px;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;font-size:30px;display:flex;align-items:center;justify-content:center;opacity:0;transition:.2s;pointer-events:none}
@@ -4124,11 +4131,11 @@ function updBuf(){
   try{var d=V.duration,b=V.buffered;if(b.length&&isFinite(d)&&d>0){var c=V.currentTime,e=0;for(var i=0;i<b.length;i++){if(b.start(i)<=c&&b.end(i)>=c)e=b.end(i)}$("#buf").style.width=(e/d*100)+"%"}}catch(e){}
 }
 function bindVideo(){
-V.addEventListener("play",function(){hideEnd();updPlayIcon();showCtl();amN=0;ambStart()});
-V.addEventListener("seeked",function(){amN=0;ambStart()});V.addEventListener("loadeddata",function(){amN=0;ambStart()});
+V.addEventListener("play",function(){hideEnd();updPlayIcon();showCtl();amN=0;ambStart();applyAmb()});
+V.addEventListener("seeked",function(){amN=0;ambStart()});V.addEventListener("loadeddata",function(){amN=0;ambStart();applyAmb()});
 V.addEventListener("pause",function(){updPlayIcon();showCtl()});
 V.addEventListener("waiting",function(){setLoading(true);onBufferToast()});
-V.addEventListener("playing",function(){setLoading(false);showErr("");preloadNext()});
+V.addEventListener("playing",function(){setLoading(false);showErr("");preloadNext();ambStart()});
 V.addEventListener("canplay",function(){setLoading(false)});
 V.addEventListener("progress",updBuf);
 V.addEventListener("timeupdate",function(){
@@ -4274,101 +4281,107 @@ function setSession(it){
   }catch(e){}
 }
 
-/* ---------- Ambient light (YouTube jaisa: player glow + full-page wash) ---------- */
-var AM=CFG.amb||{},AMS=LS.get("ytb_amb",{}),amCv=$("#amb"),amCx=null,amRaf=0,amLast=0,amN=0,amTry=0,amBars={t:0,b:0,on:true};
-var amPage=$("#ambPage"),amPageCv=$("#ambPageCv"),amPageCx=null,amLastColors=null;
+/* ---------- Ambient light (YouTube-style: continuous video sync + full HTML page wash) ---------- */
+var AM=CFG.amb||{},AMS=LS.get("ytb_amb",{}),amCv=$("#amb"),amCx=null,amRaf=0,amLast=0,amN=0,amBars={t:0,b:0,on:true};
+var amPage=$("#ambPage"),amPageCv=$("#ambPageCv"),amPageCx=null,amLastColors=null,amSample=null,amSampleCx=null,amCorsFail=0;
 function amv(k,d){return AMS[k]!==undefined?AMS[k]:(AM[k]!==undefined?AM[k]:d)}
 function amset(k,v){AMS[k]=v;LS.set("ytb_amb",AMS);applyAmb()}
 function applyAmb(){
-  var on=!!amv("enabled",true),sp=amv("spread",145)/100,bl=amv("blur",28),fs=amv("spreadFadeStart",22),fc=amv("spreadFadeCurve",28);
-  var watchOpen=!$("#watch").hidden;
-  document.body.classList.toggle("amb-on",on&&watchOpen);
+  var on=!!amv("enabled",true),bl=amv("blur",28),watchOpen=!$("#watch").hidden;
+  var active=on&&watchOpen;
+  document.body.classList.toggle("amb-on",active);
+  document.documentElement.style.setProperty("--amb-op",String(Math.min(1,amv("intensity",90)/100)));
+  document.documentElement.style.setProperty("--hsh","0 0 "+amv("headerShadowSize",25)+"px rgba(0,0,0,"+(amv("headerShadowOpacity",30)/100)+")");
   if(amCv){
-    amCv.hidden=!on;
-    amCv.style.width=(sp*100)+"%";amCv.style.height=(sp*100)+"%";amCv.style.left=((1-sp)*50)+"%";amCv.style.top=((1-sp)*50)+"%";
-    amCv.style.filter="blur("+Math.round(bl*1.6)+"px) saturate("+amv("saturation",1.45)+") brightness("+amv("brightness",1.05)+")";
-    var m="radial-gradient(ellipse closest-side,#000 "+Math.max(0,100-fs-fc)+"%,rgba(0,0,0,0) 100%)";
-    amCv.style.webkitMaskImage=m;amCv.style.maskImage=m;amCv.style.opacity=amv("intensity",88)/100;
+    amCv.removeAttribute("hidden");
+    var sp=amv("spread",145)/100;
+    amCv.style.left=((-sp*20)|0)+"%";amCv.style.top=((-sp*20)|0)+"%";
+    amCv.style.width=(100+sp*40)+"%";amCv.style.height=(100+sp*40)+"%";
+    amCv.style.filter="blur("+Math.max(24,Math.round(bl*1.8))+"px) saturate("+amv("saturation",1.55)+") brightness("+amv("brightness",1.08)+")";
   }
   if(amPage){
-    amPage.classList.toggle("on",on&&watchOpen);
+    amPage.classList.toggle("on",active);
     if(amPageCv){
-      var edge=amv("edge",20);
-      amPageCv.style.filter="blur("+Math.max(40,Math.round(bl*2.4))+"px) saturate("+amv("saturation",1.45)+") brightness("+amv("brightness",1.05)+")";
-      amPageCv.style.opacity=Math.min(1,(amv("intensity",88)/100)*0.95);
-      amPage.style.opacity=on&&watchOpen?String(Math.min(1,0.35+amv("intensity",88)/200)):"";
+      amPageCv.style.filter="blur("+Math.max(60,Math.round(bl*3.2))+"px) saturate("+amv("saturation",1.7)+") brightness("+amv("brightness",1.12)+")";
+      amPageCv.style.opacity=String(Math.min(1,(amv("intensity",90)/100)));
     }
   }
-  document.documentElement.style.setProperty("--hsh","0 0 "+amv("headerShadowSize",25)+"px rgba(0,0,0,"+(amv("headerShadowOpacity",30)/100)+")");
-  if(on&&watchOpen)ambStart();
-  else ambStop();
+  if(active)ambStart();else ambStop();
 }
 function ambStop(){
   if(amRaf){cancelAnimationFrame(amRaf);amRaf=0}
   if(amPage)amPage.classList.remove("on");
   document.body.classList.remove("amb-on");
 }
-function detectBars(vw,vh){
-  try{
-    var c=document.createElement("canvas");c.width=64;c.height=36;var x=c.getContext("2d");x.drawImage(V,0,0,64,36);
-    var d=x.getImageData(0,0,64,36).data;
-    function lum(r){var s=0;for(var i=0;i<64;i++){var p=(r*64+i)*4;s+=d[p]*.3+d[p+1]*.59+d[p+2]*.11}return s/64}
-    var t=0,b=0;while(t<12&&lum(t)<14)t++;while(b<12&&lum(35-b)<14)b++;
-    amBars={t:t/36,b:b/36,on:true};
-  }catch(e){amBars={t:0,b:0,on:false}}
+function ambEnsureCtx(){
+  if(amCv&&!amCx){amCv.width=320;amCv.height=180;try{amCx=amCv.getContext("2d",{willReadFrequently:true,alpha:true})}catch(e){try{amCx=amCv.getContext("2d")}catch(e2){}}}
+  if(amPageCv&&!amPageCx){amPageCv.width=64;amPageCv.height=36;try{amPageCx=amPageCv.getContext("2d",{willReadFrequently:true,alpha:true})}catch(e){try{amPageCx=amPageCv.getContext("2d")}catch(e2){}}}
+  if(!amSample){amSample=document.createElement("canvas");amSample.width=32;amSample.height=18;try{amSampleCx=amSample.getContext("2d",{willReadFrequently:true})}catch(e){try{amSampleCx=amSample.getContext("2d")}catch(e2){}}}
 }
 function ambPushColors(r,g,b){
-  var sm=+amv("smoothing",0.62);
+  var sm=+amv("smoothing",0.55);
   if(amLastColors){r=Math.round(amLastColors.r*sm+r*(1-sm));g=Math.round(amLastColors.g*sm+g*(1-sm));b=Math.round(amLastColors.b*sm+b*(1-sm))}
   amLastColors={r:r,g:g,b:b};
+  var rgb=r+","+g+","+b;
   document.documentElement.style.setProperty("--amb-r",r);
   document.documentElement.style.setProperty("--amb-g",g);
   document.documentElement.style.setProperty("--amb-b",b);
-  document.documentElement.style.setProperty("--amb-rgb",r+","+g+","+b);
-  /* page-wash gradient also follows live colors via CSS vars */
-  if(amPage){
-    amPage.style.background="radial-gradient(ellipse 90% 70% at 50% 35%,rgba("+r+","+g+","+b+",.58) 0%,rgba("+r+","+g+","+b+",.20) 45%,transparent 78%)";
-  }
+  document.documentElement.style.setProperty("--amb-rgb",rgb);
+  if(amPage)amPage.style.background="rgb("+rgb+")";
 }
 function ambDraw(){
-  if(!amCx){amCv.width=160;amCv.height=90;try{amCx=amCv.getContext("2d",{willReadFrequently:true})}catch(e){try{amCx=amCv.getContext("2d")}catch(e2){}}if(!amCx)return}
-  if(amPageCv&&!amPageCx){
-    amPageCv.width=48;amPageCv.height=27;
-    try{amPageCx=amPageCv.getContext("2d",{willReadFrequently:true})}catch(e){try{amPageCx=amPageCv.getContext("2d")}catch(e2){}}
+  ambEnsureCtx();
+  var vw=V.videoWidth,vh=V.videoHeight;
+  if(!vw||!vh||V.readyState<2)return;
+  var sy=0,sh=vh;
+  if(amBars.on&&amBars.t+amBars.b>0.02){sy=Math.round(vh*amBars.t);sh=Math.max(1,Math.round(vh*(1-amBars.t-amBars.b)))}
+  /* 1) Always paint blurred video frames (works even if canvas is CORS-tainted) */
+  try{if(amCx)amCx.drawImage(V,0,sy,vw,sh,0,0,amCv.width,amCv.height)}catch(e){}
+  try{if(amPageCx)amPageCx.drawImage(V,0,sy,vw,sh,0,0,amPageCv.width,amPageCv.height)}catch(e){}
+  amN++;
+  /* 2) Average color — may fail on cross-origin without CORS; never stop the loop */
+  if(amN%3===0&&amSampleCx){
+    try{
+      amSampleCx.drawImage(V,0,sy,vw,sh,0,0,32,18);
+      var d=amSampleCx.getImageData(0,0,32,18).data,r=0,g=0,b=0,n=0,i;
+      for(i=0;i<d.length;i+=8){r+=d[i];g+=d[i+1];b+=d[i+2];n++}
+      if(n){amCorsFail=0;ambPushColors(Math.round(r/n),Math.round(g/n),Math.round(b/n))}
+    }catch(e){
+      amCorsFail++;
+      /* CORS blocked pixel read — visual blur frames still run; keep last color or neutral */
+      if(!amLastColors)ambPushColors(40,40,48);
+    }
   }
-  var vw=V.videoWidth,vh=V.videoHeight;if(!vw||!vh||V.readyState<2)return;
-  if(amv("detectHorizontalBarSizeEnabled",true)&&amBars.on!==false&&amN%30===0)detectBars(vw,vh);
-  var sy=Math.round(vh*amBars.t),sh=Math.max(1,Math.round(vh*(1-amBars.t-amBars.b)));
-  try{
-    amCx.drawImage(V,0,sy,vw,sh,0,0,160,90);
-    if(amPageCx){
-      try{amPageCx.drawImage(amCv,0,0,160,90,0,0,48,27)}catch(e3){try{amPageCx.drawImage(V,0,sy,vw,sh,0,0,48,27)}catch(e4){}}
-    }
-    amN++;
-    if(amN%2===0){
-      var d=amCx.getImageData(0,0,160,90).data,r=0,g=0,b=0,n=0;
-      for(var i=0;i<d.length;i+=16){r+=d[i];g+=d[i+1];b+=d[i+2];n++}
-      if(n)ambPushColors(Math.round(r/n),Math.round(g/n),Math.round(b/n));
-    }
-  }catch(e){}
+  /* black-bar detect occasionally (only when pixel read works) */
+  if(amCorsFail===0&&amv("detectHorizontalBarSizeEnabled",true)&&amN%45===0){
+    try{
+      var c=document.createElement("canvas");c.width=64;c.height=36;var x=c.getContext("2d");x.drawImage(V,0,0,64,36);
+      var dd=x.getImageData(0,0,64,36).data;
+      function lum(row){var s=0,j;for(j=0;j<64;j++){var p=(row*64+j)*4;s+=dd[p]*.3+dd[p+1]*.59+dd[p+2]*.11}return s/64}
+      var t=0,bb=0;while(t<12&&lum(t)<14)t++;while(bb<12&&lum(35-bb)<14)bb++;
+      amBars={t:t/36,b:bb/36,on:true};
+    }catch(e){amBars={t:0,b:0,on:false}}
+  }
 }
 function ambFrame(ts){
   amRaf=0;
-  /* Sync band nahi hota jab tak watch page open + ambient enabled */
-  if(!amv("enabled",true)||$("#watch").hidden||document.hidden)return;
-  if(amv("syncVideoAmbient",true)===false&&V.paused&&amN>8)return;
-  var fps=Math.min(60,Math.max(5,amv("framerateLimit",30)));
-  /* energySaver: paused pe slow sample, lekin band nahi */
-  if(V.paused&&amv("energySaver",true))fps=Math.min(fps,6);
-  if(ts-amLast>=1000/fps){amLast=ts;amTry++;ambDraw()}
-  /* Keep looping the entire time watch is open (no 400-frame hard stop) */
+  if(!amv("enabled",true)||$("#watch").hidden)return;
+  if(document.hidden){amRaf=requestAnimationFrame(ambFrame);return}
+  var fps=Math.min(60,Math.max(8,amv("framerateLimit",30)|0));
+  if(V.paused&&amv("energySaver",true))fps=Math.min(fps,8);
+  if(!amv("syncVideoAmbient",true)&&V.paused&&amN>12){
+    /* sync explicitly off + paused: still keep loop alive at 2fps so it resumes instantly */
+    fps=2;
+  }
+  if(ts-amLast>=1000/fps){amLast=ts;ambDraw()}
   amRaf=requestAnimationFrame(ambFrame);
 }
 function ambStart(){
   if(!amv("enabled",true)||$("#watch").hidden)return;
-  if(!amRaf){amTry=0;amRaf=requestAnimationFrame(ambFrame)}
+  ambEnsureCtx();
+  if(!amRaf)amRaf=requestAnimationFrame(ambFrame);
 }
-document.addEventListener("visibilitychange",function(){if(!document.hidden){amN=0;ambStart()}});
+document.addEventListener("visibilitychange",function(){if(!document.hidden)ambStart()});
 
 /* ---------- end screen (YouTube jaisa: replay + up next countdown + suggestions) ---------- */
 function hideEnd(){clearInterval(endT);endT=null;ENDSHOWN=false;var e=$("#endsc");if(e){e.hidden=true;e.textContent=""}}
@@ -8614,7 +8627,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "2.3-yt-ambient"
+BOT_VERSION = "2.4-full-ambient"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
