@@ -109,6 +109,9 @@ def proxy_dict() -> Optional[dict]:
 _init_proxy_pool()
 
 STOP_PROCESS: Dict[int, bool] = {}
+# last scrape payload per user (for Files button: 2 txt + zip + html)
+_LAST_SCRAPE: Dict[int, dict] = {}
+
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 # ---- NEW: Daily quota + scrape queue ----
@@ -3269,39 +3272,24 @@ a{color:inherit}
 .theater .wmain{margin:0 -24px}
 .theater .wmain>*:not(.player){margin-left:24px;margin-right:24px}
 .wmain{position:relative;z-index:0}
-.player{position:relative;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);user-select:none;overflow:visible}
-.pin{position:absolute;inset:0;overflow:hidden;background:#000;border-radius:12px;z-index:1}
-/* Player-local ambient canvas — blurred video behind/around player */
-.ambc{position:absolute;z-index:0;pointer-events:none!important;opacity:0;object-fit:fill;left:-16%;top:-16%;width:132%;height:132%;
-  filter:blur(46px) saturate(1.5) brightness(1.06);transform:scale(1.02);transition:opacity .35s}
-body.amb-on .ambc{opacity:var(--amb-op,.82)}
-/* Full-page ambient — fixed layer behind page content */
-#ambPage{position:fixed;inset:0;z-index:0;pointer-events:none!important;opacity:0;overflow:hidden;
-  transition:opacity .4s ease;background:rgb(var(--amb-rgb,12,12,12))}
-#ambPage.on{opacity:1}
-#ambPage canvas{position:absolute;left:50%;top:40%;width:140vmax;height:140vmax;max-width:none;
-  transform:translate(-50%,-50%);filter:blur(80px) saturate(1.55) brightness(1.08);opacity:.88;pointer-events:none!important}
-body.amb-on{overflow-x:hidden;background:transparent!important}
-body.amb-on #app{background:transparent!important}
-body.amb-on #home{background:transparent}
-body.amb-on #watch,body.amb-on .wl,body.amb-on .wmain{position:relative;z-index:2}
-body.amb-on .top{position:relative;z-index:60;background:color-mix(in srgb,var(--bg) 85%,transparent)}
-body.amb-on .chips{background:color-mix(in srgb,var(--bg) 85%,transparent)}
-html:has(body.amb-on){scrollbar-width:none;background:#000}
+.player{position:relative;aspect-ratio:16/9;width:100%;max-height:calc(100vh - 110px);user-select:none}
+.pin{position:absolute;inset:0;overflow:hidden;background:#000;border-radius:12px}
+.ambc{position:absolute;z-index:-1;pointer-events:none;transition:opacity .35s;overflow:hidden}
+#ambPage{position:fixed;inset:0;z-index:0;pointer-events:none;display:none;overflow:hidden}
+#ambPage.on{display:block}
+#ambPage canvas{position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);width:140%;height:140%;filter:blur(80px) saturate(1.6) brightness(1.05);opacity:.88;will-change:transform,opacity}
+body.amb-on{overflow-x:hidden}
+body.amb-on #watch,body.amb-on #home,body.amb-on .top{position:relative;z-index:1}
+html:has(body.amb-on){scrollbar-width:none}
 html:has(body.amb-on)::-webkit-scrollbar{display:none}
-.amb-on .top{box-shadow:var(--hsh,none)}
-.amb-on .desc,.amb-on .act{background:color-mix(in srgb,var(--bg2) 75%,transparent)}
-.amb-on .player::after{content:"";position:absolute;inset:-24px;z-index:0;pointer-events:none!important;border-radius:14px;
-  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.4) 0%,rgba(var(--amb-rgb,20,20,20),.12) 55%,transparent 75%);
-  filter:blur(18px)}
-body.amb-on .upn,body.amb-on .meta,body.amb-on .wside{
-  background:color-mix(in srgb,var(--bg) 82%,rgb(var(--amb-rgb,20,20,20)) 18%)}
-body.amb-on .wside .c,body.amb-on .up{background:color-mix(in srgb,var(--bg2) 75%,transparent)}
-/* Settings + controls above ambient always */
-.pbm{z-index:40!important;pointer-events:auto!important}
-.ctl{z-index:25!important;pointer-events:auto!important}
-.ov{z-index:15}
-.err,.endsc{z-index:35}
+.amb-on .top{box-shadow:var(--hsh,none);background:color-mix(in srgb,var(--bg) 72%,transparent)!important;backdrop-filter:blur(8px)}
+.amb-on .desc,.amb-on .act,.amb-on .meta,.amb-on .wside{background:color-mix(in srgb,var(--bg2) 70%,transparent)}
+.amb-on .player{box-shadow:0 0 80px rgba(var(--amb-rgb,0,0,0),.35)}
+.amb-on .player::before{content:"";position:absolute;inset:-60px;z-index:-2;pointer-events:none;
+  background:radial-gradient(ellipse at center,rgba(var(--amb-rgb,20,20,20),.55) 0%,transparent 70%);
+  filter:blur(56px);transition:background .4s}
+.amb-on #watch{background:transparent}
+.amb-on body,body.amb-on{background:radial-gradient(ellipse 120% 80% at 50% 30%,rgba(var(--amb-rgb,15,15,15),.45) 0%,var(--bg) 62%)}
 #statsN{position:absolute;top:10px;left:10px;z-index:8;background:rgba(0,0,0,.78);color:#0f0;font:12px/1.45 ui-monospace,Consolas,monospace;
   padding:8px 10px;border-radius:8px;max-width:min(92%,360px);white-space:pre;pointer-events:none;display:none}
 #statsN.on{display:block}
@@ -3311,15 +3299,7 @@ body.amb-on .wside .c,body.amb-on .up{background:color-mix(in srgb,var(--bg2) 75
   text-shadow:0 2px 8px #000;transition:opacity .2s;pointer-events:none}
 .dtap .rip2.on{opacity:1}
 .player video,.player #imgv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
-.player:fullscreen,.player:-webkit-full-screen{max-height:none;background:#000;overflow:visible}
-.player:fullscreen .pin,.player:-webkit-full-screen .pin{border-radius:0;z-index:1}
-/* Fullscreen ambient: keep local canvas, hide page layer (outside FS element) */
-.player:fullscreen .ambc,.player:-webkit-full-screen .ambc{
-  display:block!important;opacity:var(--amb-op,.85)!important;left:-25%;top:-25%;width:150%;height:150%;
-  filter:blur(56px) saturate(1.55) brightness(1.08);z-index:0;pointer-events:none!important}
-.player:fullscreen .pbm,.player:-webkit-full-screen .pbm{z-index:50!important}
-.player:fullscreen .ctl,.player:-webkit-full-screen .ctl{z-index:30!important}
-body:has(.player:fullscreen) #ambPage,body:has(.player:-webkit-full-screen) #ambPage{opacity:0!important;pointer-events:none!important}
+.player:fullscreen,.player:-webkit-full-screen{max-height:none;background:#000;overflow:visible}.player:fullscreen .pin,.player:-webkit-full-screen .pin{border-radius:0}.player:fullscreen .ambc,.player:-webkit-full-screen .ambc{display:block!important;opacity:var(--amb-op,.85)!important;pointer-events:none!important;z-index:0}.player:fullscreen .pbm,.player:-webkit-full-screen .pbm{z-index:60!important}.player:fullscreen .ctl,.player:-webkit-full-screen .ctl{z-index:30!important}
 .aud{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:90px;color:#555}
 .ov{position:absolute;inset:0 0 54px 0;z-index:3}
 .big{position:absolute;left:50%;top:50%;width:68px;height:68px;margin:-34px;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;font-size:30px;display:flex;align-items:center;justify-content:center;opacity:0;transition:.2s;pointer-events:none}
@@ -3373,7 +3353,7 @@ body:has(.player:fullscreen) #ambPage,body:has(.player:-webkit-full-screen) #amb
 .dimov{position:absolute;inset:0;z-index:1;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;padding:18px 70px 0 18px;opacity:0;transition:opacity .25s;pointer-events:none}
 .dimov b{font-size:20px;line-height:1.3;color:#fff;text-shadow:0 1px 6px #000;max-width:80%}
 .player.dim .dimov{opacity:1}
-#vstats{position:absolute;left:10px;top:10px;z-index:9;background:rgba(0,0,0,.72);color:#0f0;font:11px/1.45 monospace;padding:8px 10px;border-radius:8px;max-width:min(340px,90%);pointer-events:none;white-space:pre;display:none}#vstats.on{display:block}.pbm{position:absolute;right:10px;bottom:64px;width:min(340px,92%);max-height:72%;overflow:auto;z-index:8;background:rgba(18,18,18,.97);color:#fff;border-radius:14px;padding:12px 14px;box-shadow:0 8px 30px rgba(0,0,0,.6);font-size:14px}
+#vstats{position:absolute;left:10px;top:10px;z-index:9;background:rgba(0,0,0,.72);color:#0f0;font:11px/1.45 monospace;padding:8px 10px;border-radius:8px;max-width:min(340px,90%);pointer-events:none;white-space:pre;display:none}#vstats.on{display:block}.pbm{position:absolute;right:10px;bottom:64px;width:min(340px,92%);max-height:72%;overflow:auto;z-index:50;background:rgba(18,18,18,.97);color:#fff;border-radius:14px;padding:12px 14px;box-shadow:0 8px 30px rgba(0,0,0,.6);font-size:14px}
 .pbm .hd{display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px;margin-bottom:10px;cursor:pointer}
 .pbm .chips2{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
 .pbm .chip2{flex:1 1 auto;padding:8px 10px;border-radius:20px;background:#2a2a2a;text-align:center;font-weight:600;min-width:52px}
@@ -3427,13 +3407,57 @@ body:has(.player:fullscreen) #ambPage,body:has(.player:-webkit-full-screen) #amb
 .pop button:hover,.pop a:hover{background:rgba(128,128,128,.25)}
 #toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#323232;color:#fff;padding:10px 18px;border-radius:8px;font-size:14px;z-index:300;opacity:0;pointer-events:none;transition:.25s}
 #toast.on{opacity:1}
+
+/* ---- Super power UI ---- */
+#helpOv{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center;padding:20px}
+#helpOv .hbox{background:var(--bg2);border-radius:16px;max-width:520px;width:100%;max-height:85vh;overflow:auto;padding:20px 22px;color:var(--tx)}
+#helpOv h3{margin:0 0 12px;font-size:18px}
+#helpOv table{width:100%;border-collapse:collapse;font-size:13px}
+#helpOv td{padding:6px 8px;border-bottom:1px solid var(--line)}
+#helpOv td:first-child{color:var(--red);font-weight:700;white-space:nowrap;width:90px}
+#miniP{position:fixed;right:14px;bottom:14px;z-index:280;width:280px;background:#111;border-radius:12px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.55);border:1px solid #333;display:none}
+#miniP.on{display:block}
+#miniP video{width:100%;display:block;aspect-ratio:16/9;background:#000}
+#miniP .mr{display:flex;gap:6px;padding:8px;align-items:center}
+#miniP .mt{flex:1;font-size:12px;color:#ddd;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#ytEmbed{position:absolute;inset:0;width:100%;height:100%;border:0;z-index:9;background:#000}
+.player.yt-mode video,#v.yt-hide{opacity:0;pointer-events:none}
+.player.yt-mode #ytEmbed{z-index:5}
+.player.yt-mode .err{z-index:6;position:relative}
+.player.yt-mode .ctl{z-index:7}
+.bm-marks{position:absolute;left:0;right:0;top:0;bottom:0;pointer-events:none}
+.bm-marks i{position:absolute;top:0;bottom:0;width:2px;background:#ff0;opacity:.85}
+.codec-badge{display:inline-block;margin-left:8px;padding:2px 7px;border-radius:6px;background:var(--chip);font-size:11px;color:var(--tx2)}
+.drop-overlay{position:fixed;inset:0;z-index:400;background:rgba(15,15,15,.88);display:none;align-items:center;justify-content:center;font-size:22px;font-weight:700;color:#fff;border:3px dashed var(--red)}
+.drop-overlay.on{display:flex}
+.grid.compact{grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px 10px}
+.eq-row{display:flex;gap:6px;align-items:flex-end;height:90px;padding:8px 0}
+.eq-row input[type=range]{writing-mode:bt-lr;-webkit-appearance:slider-vertical;width:28px;height:80px}
+
+#ytBox{position:absolute;left:0;right:0;bottom:0;z-index:10;display:none;flex-direction:column;pointer-events:none;background:linear-gradient(transparent,rgba(0,0,0,.88))}
+#ytBox.on{display:flex}
+#ytBox .ytbg{display:none}
+#ytBox .ytui{position:relative;z-index:2;padding:10px 12px;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+#ytBox .ytbtns{pointer-events:auto}
+#ytBox .ytt{font-size:16px;font-weight:700;color:#fff;text-shadow:0 1px 4px #000}
+#ytBox .ytbtns{display:flex;flex-wrap:wrap;gap:8px}
+#ytBox .ytbtns a,#ytBox .ytbtns button{flex:1;min-width:120px;padding:12px 10px;border-radius:10px;border:0;font-weight:700;font-size:14px;text-align:center;text-decoration:none;cursor:pointer;color:#fff;background:#c00}
+#ytBox .ytbtns a.g,#ytBox .ytbtns button.g{background:#333;color:#fff}
+#ytBox .ytbtns a.mx{background:#1a73e8}
+
+
+
+
 </style>
 </head>
 <body>
-<!-- Full-page ambient glow layer (YouTube-style page wash) -->
-<div id="ambPage" aria-hidden="true"><canvas id="ambPageCv"></canvas></div>
 <div id="lock" hidden><div class="lbox"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><h3>Protected</h3><input id="pw" type="password" placeholder="Password" autocomplete="off"><button id="pwb">Unlock</button><div id="lerr"></div><div class="own2" id="lockOwn"></div></div></div>
+
+<div id="helpOv" hidden><div class="hbox"><h3>Keyboard shortcuts</h3><div id="helpBody"></div><button class="act" id="helpClose" style="margin-top:14px;width:100%;padding:10px;border-radius:10px;background:var(--red);color:#fff;border:0">Close</button></div></div>
+<div id="miniP"><video id="miniV" playsinline muted></video><div class="mr"><span class="mt" id="miniT"></span><button type="button" id="miniPlay">&#9654;</button><button type="button" id="miniClose">&#10005;</button></div></div>
+<div class="drop-overlay" id="dropOv">Drop video files to play</div>
 <div id="app" hidden>
+<div id="ambPage"><canvas id="ambPageCv"></canvas></div>
 <header class="top">
   <a class="logo" href="#/"><span class="lg"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></span><b id="siteT"></b></a><a class="ownt" id="ownT" target="_blank" rel="noopener" hidden></a>
   <div class="search"><input id="q" type="search" placeholder="Search" autocomplete="off"><button id="qclr" hidden>&#10005;</button></div>
@@ -3457,7 +3481,7 @@ body:has(.player:fullscreen) #ambPage,body:has(.player:-webkit-full-screen) #amb
  <div class="wl">
   <div class="wmain">
    <div class="player paused" id="pl"><canvas id="amb" class="ambc"></canvas><div id="statsN"></div><div class="dtap l" id="dtL"><span class="rip2" id="dtLr">-10s</span></div><div class="dtap r" id="dtR"><span class="rip2" id="dtRr">+10s</span></div><div class="pin">
-     <video id="v" playsinline preload="auto"></video>
+     <video id="v" playsinline preload="auto"></video><iframe id="ytEmbed" hidden allow="accelerometer;autoplay;clipboard-write;encrypted-media;gyroscope;picture-in-picture;web-share" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe><div id="ytBox"><div class="ytbg" id="ytBg"></div><div class="ytui"><div class="ytt" id="ytTitle">YouTube</div><div class="ytbtns" id="ytBtns"></div></div></div>
      <img id="imgv" hidden alt="">
      <div class="aud" id="aud" hidden>&#9835;</div>
      <div class="dimov" id="dimov"><b id="dimT"></b></div>
@@ -3538,35 +3562,61 @@ function grad(t){var h=hnum(t||"x")%360;return ["hsl("+h+",55%,38%)","hsl("+((h+
 function pathOf(u){return u.split("#")[0].split("?")[0].toLowerCase()}
 function extOf(u){var m=pathOf(u).match(/\.([a-z0-9]{2,5})$/);return m?m[1]:""}
 var AUDIO_EXT=["mp3","m4a","aac","wav","ogg","oga","opus","flac","wma"];
-var CONTAINER_EXT=["mkv","avi","wmv","mov","m4v","webm","flv","ts","m2ts","mp4","mpg","mpeg"];
-var CODEC_HINT={"hevc":"HEVC","h265":"HEVC","h.265":"HEVC","av1":"AV1","vp9":"VP9","x265":"HEVC","x264":"H264"};
 function fmtOf(it){
   var u=it.u.toLowerCase();
   if(it.eng==="hls")return "HLS";if(it.eng==="dash")return "DASH";
   if(u.indexOf(".m3u8")>-1)return "HLS";
-  for(var c in CODEC_HINT){if(u.indexOf(c)>-1)return CODEC_HINT[c]}
   var e=extOf(u);
   if(e==="mpd")return "DASH";
-  if(e==="m4v"||e==="mp4")return "MP4";
-  if(e==="mkv")return "MKV";
-  if(e==="avi")return "AVI";
-  if(e==="wmv")return "WMV";
-  if(e==="hevc"||e==="h265")return "HEVC";
+  if(e==="m4v"||e==="m4a")return e==="m4a"?"M4A":"MP4";
+  if(e==="hevc"||e==="h265"||e==="hvc1")return "HEVC";
+  if(e==="mkv"||e==="webm")return e.toUpperCase();
+  if(e==="avi"||e==="divx"||e==="xvid")return "AVI";
+  if(e==="wmv"||e==="asf"||e==="wmc")return "WMV";
+  if(e==="mov"||e==="qt")return "MOV";
+  if(e==="3gp"||e==="3g2")return "3GP";
+  if(e==="ts"||e==="m2ts"||e==="mts")return "TS";
+  if(e==="flv"||e==="f4v")return "FLV";
+  if(e==="ogv"||e==="ogg")return "OGG";
   if(e)return e.toUpperCase();
+  if(/hevc|h\.?265|hvc1|hev1/i.test(u))return "HEVC";
   return it.k||"VIDEO";
 }
 function isAudio(it){return it.k==="AUDIO"||AUDIO_EXT.indexOf(extOf(it.u))>-1}
-function isContainerHard(it){
-  var e=extOf(it.u),u=it.u.toLowerCase();
-  return e==="mkv"||e==="avi"||e==="wmv"||e==="hevc"||u.indexOf("hevc")>-1||u.indexOf("h265")>-1;
+var HARD_EXT=["mkv","avi","wmv","asf","wmc","divx","xvid","rm","rmvb","vob","mpg","mpeg","mpe"];
+var HEVC_HINT=/hevc|h\.?265|hvc1|hev1|\.hevc|\.h265/i;
+function mimeOf(u){
+  var e=extOf(u),map={
+    mp4:"video/mp4",m4v:"video/mp4",mov:"video/quicktime",webm:"video/webm",
+    ogv:"video/ogg",ogg:"video/ogg",mkv:"video/x-matroska",avi:"video/x-msvideo",
+    wmv:"video/x-ms-wmv",asf:"video/x-ms-asf",wmc:"video/x-ms-wmv",
+    ts:"video/mp2t",m2ts:"video/mp2t",mts:"video/mp2t",flv:"video/x-flv",
+    "3gp":"video/3gpp","3g2":"video/3gpp2",mpg:"video/mpeg",mpeg:"video/mpeg",
+    hevc:"video/mp4",h265:"video/mp4",
+    mp3:"audio/mpeg",m4a:"audio/mp4",aac:"audio/aac",wav:"audio/wav",
+    flac:"audio/flac",opus:"audio/opus",oga:"audio/ogg",wma:"audio/x-ms-wma"
+  };
+  return map[e]||"";
+}
+function browserMayPlay(u){
+  try{
+    var v=document.createElement("video"),m=mimeOf(u),e=extOf(u);
+    if(HEVC_HINT.test(u)){
+      var c=[v.canPlayType('video/mp4; codecs="hvc1"'),v.canPlayType('video/mp4; codecs="hev1"'),v.canPlayType('video/mp4; codecs="hvc1.1.L63.B0"')];
+      if(c.some(function(x){return x==="probably"||x==="maybe"}))return true;
+    }
+    if(m){var t=v.canPlayType(m);if(t==="probably"||t==="maybe")return true}
+    if(e==="mp4"||e==="webm"||e==="ogv"||e==="mov"||e==="m4v")return true;
+    return false;
+  }catch(ex){return false}
 }
 function engineOf(it){
   var u=it.u.toLowerCase(),e=extOf(u);
+  if(it.eng==="youtube"||(typeof isYouTubeUrl==="function"&&isYouTubeUrl(it.u)))return "youtube";
   if(it.eng)return it.eng;
   if(u.indexOf(".m3u8")>-1)return "hls";
   if(e==="mpd")return "dash";
-  if(e==="ts"||e==="flv"||e==="m2ts")return "mpegts";
-  if(isContainerHard(it))return "external";
+  if(e==="ts"||e==="flv"||e==="m2ts"||e==="mts"||e==="f4v")return "mpegts";
   return "native";
 }
 var _sc={};
@@ -3582,9 +3632,23 @@ function copy(t){
   function fb(){var a=document.createElement("textarea");a.value=t;document.body.appendChild(a);a.select();try{document.execCommand("copy");toast("Link copied")}catch(e){toast("Copy fail")}a.remove()}
 }
 function extLinks(u){
-  var enc=encodeURIComponent(u),ua=navigator.userAgent||"",ios=/iPhone|iPad|iPod/.test(ua),and=/Android/.test(ua),a=[];
+  var enc=encodeURIComponent(u),ua=navigator.userAgent||"",ios=/iPhone|iPad|iPod/.test(ua),and=/Android/.test(ua),win=/Windows/.test(ua),a=[];
+  var isYt=typeof isYouTubeUrl==="function"&&isYouTubeUrl(u);
   a.push({n:"VLC",h:ios?"vlc-x-callback://x-callback-url/stream?url="+enc:(and?"intent:"+u+"#Intent;package=org.videolan.vlc;type=video/*;end":"vlc://"+u)});
-  if(and)a.push({n:"MX Player",h:"intent:"+u+"#Intent;package=com.mxtech.videoplayer.ad;type=video/*;end"});
+  /* MX Player — Android intent; desktop pe link copy fallback */
+  if(and||isYt){
+    a.push({n:"MX Player",h:"intent:"+(isYt?u:u)+"#Intent;scheme=https;package=com.mxtech.videoplayer.ad;type=video/*;end"});
+  }
+  if(and){
+    a.push({n:"nPlayer",h:"nplayer-"+u});
+  }
+  if(win||(!and&&!ios)){
+    a.push({n:"PotPlayer",h:"potplayer://"+u});
+    a.push({n:"KMPlayer",h:"kmplayer://"+u});
+  }
+  if(isYt){
+    a.push({n:"YouTube App",h:u});
+  }
   a.push({n:"Open link",h:u});
   return a;
 }
@@ -3798,7 +3862,19 @@ function go(it){location.hash="#/w/"+ALL.indexOf(it)}
 var V=$("#v"),PL=$("#pl"),hls=null,mp=null,dash=null,retries=0,hideT,lastSave=0,dragging=false,IMGV=$("#imgv");
 var CURQ="auto",SEEK_AT=0,CURURL="",CURENG="native",PXS={};
 var shakaPlayer=null,HOLD2X=false,HOLD_SPD=1,PRELOAD_V=null,PRELOAD_U="",BUF_TOAST_T=0;
-function PXON(it){if(PXS[it.u]!==undefined)return PXS[it.u];return !!(it.x&&it.xa)&&LS.get("ytb_px",true)}
+function PXON(it){
+  if(PXS[it.u]!==undefined)return PXS[it.u];
+  var mode=LS.get("ytb_px_mode","auto")||"auto";
+  if(mode==="off"||LS.get("ytb_px",true)===false)return false;
+  if(mode==="on")return !!(it.x||LS.get("ytb_px_base",""));
+  return !!(it.x&&it.xa);
+}
+function pxUrlFor(it,u){
+  if(it.x)return it.x;
+  var base=(LS.get("ytb_px_base","")||"").replace(/\/$/,"");
+  if(!base||!u)return "";
+  try{return base+"/p?u="+encodeURIComponent(u)+(it.p?"&r="+encodeURIComponent(it.p):"")}catch(e){return ""}
+}
 function reloadCur(at,cors){var o={keepQ:true,at:at};if(cors)o.cors=true;if(CUR&&CURURL!==CUR.x)o.url=CURURL;loadItem(CUR,o)}
 function b64u(x){x=(x||"").trim();if(/^[0-9a-fA-F]+$/.test(x)&&x.length%2===0){var s="";for(var i=0;i<x.length;i+=2)s+=String.fromCharCode(parseInt(x.substr(i,2),16));return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}return x}
 /* ---------- playback settings (3-dot menu) ---------- */
@@ -3946,6 +4022,8 @@ function showErr(msg,it){
   if(lv){var lb=el("button","","Try "+lv[0]+"p");lb.onclick=function(){CURQ=lv[0];loadItem(CUR,{url:lv[1],keepQ:true,at:V.currentTime})};box.appendChild(lb)}
   if(it){
     extLinks(it.u).forEach(function(x){var a=el("a","",x.n==="Open link"?"Open / Download":x.n);a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";box.appendChild(a)});
+    var eHard=HARD_EXT.indexOf(extOf(it.u))>-1||["HEVC","MKV","AVI","WMV"].indexOf(fmtOf(it))>-1;
+    if(eHard){var fn=el("button","","Force try in browser");fn.onclick=function(){loadItem(CUR,{keepQ:true,forceNative:true,at:V.currentTime||0})};box.appendChild(fn)}
     if(it.rf){var rb=el("button","","\uD83D\uDD04 Refresh link");rb.onclick=function(){setLoading(true);refreshItem(it,function(ok){if(ok){toast("Naya link mil gaya");loadItem(it,{keepQ:true})}else{setLoading(false);toast("Naya link nahi mila")}})};box.appendChild(rb)}
     if(it.x){var usingPx=(CURURL===it.x),pb=el("button","",usingPx?"Try direct (no proxy)":"Try via bot proxy");pb.onclick=function(){PXS[it.u]=!usingPx;loadItem(CUR,{keepQ:true,at:V.currentTime})};box.appendChild(pb)}
     var cp=el("button","","Copy link");cp.onclick=function(){copy(it.u)};box.appendChild(cp);
@@ -3959,7 +4037,13 @@ function fail(it,why){
     refreshItem(it,function(ok){if(ok&&CUR===it){toast("Naya link mil gaya");loadItem(it,{keepQ:true})}else showErr((why||"Ye stream browser me play nahi ho raha")+" ("+fmtOf(it)+"). Refresh se bhi naya link nahi mila:",it)});
     return;
   }
-  showErr((why||"Ye stream browser me play nahi ho raha")+" ("+fmtOf(it)+"). Kisi external player me kholo:",it)
+  var e=extOf(it.u),f=fmtOf(it),msg=(why||"Ye stream browser me play nahi ho raha")+" ("+f+")";
+  if(HARD_EXT.indexOf(e)>-1||f==="HEVC"||f==="WMV"||f==="AVI"||f==="MKV"){
+    msg+=". Browser aksar MKV/AVI/HEVC/WMV nahi chalata — VLC / MX / PotPlayer use karo.";
+  }else{
+    msg+=". Kisi external player me kholo:";
+  }
+  showErr(msg,it);
 }
 function hasVariants(it){return !!(it&&it.v&&it.v.length>1)}
 function qLabel(q){return q+"p"+(q>=720?" HD":"")}
@@ -4059,7 +4143,7 @@ function loadItem(it,opt){
   destroyEngines();showErr("");hideEnd();OUTRO_DONE=false;CORS_LOAD=false;amBars={t:0,b:0,on:true};amN=0;AB.a=AB.b=null;var tk0=V.querySelector("track");if(tk0)tk0.remove();retries=0;V.hidden=true;IMGV.hidden=true;$("#aud").hidden=true;$("#menu").hidden=true;
   applyVideoFx();
   if(!opt.keepQ)CURQ="auto";
-  var u0=opt.url||it.u,eng0=engineOf({u:u0,k:it.k,eng:it.eng}),u=(!opt.url&&it.x&&eng0!=="dash"&&PXON(it))?it.x:u0;CURURL=u;CURENG=eng0;SEEK_AT=opt.at||0;
+  var u0=opt.url||it.u,eng0=engineOf({u:u0,k:it.k,eng:it.eng}),u=u0;if(!opt.url&&eng0!=="dash"&&PXON(it)){var px=it.x||pxUrlFor(it,u0);if(px)u=px}CURURL=u;CURENG=eng0;SEEK_AT=opt.at||0;
   if(it.k==="IMAGE"){IMGV.hidden=false;IMGV.referrerPolicy="no-referrer";IMGV.src=it.u;setLoading(false);updQBtn();return}
   if(it.k==="PDF"){showErr("PDF file hai.",it);return}
   V.hidden=false;$("#aud").hidden=!(isAudio(it)||AUDONLY);V.style.visibility=AUDONLY?"hidden":"";setLoading(true);updQBtn();
@@ -4123,6 +4207,21 @@ function loadItem(it,opt){
   }else{
     CORS_LOAD=!!(opt.cors||GRAPH||(needFx()&&!CORS_BLOCK[u]));
     if(CORS_LOAD)V.crossOrigin="anonymous";else V.removeAttribute("crossorigin");
+    var e0=extOf(u0||u),mm=mimeOf(u0||u);
+    try{V.removeAttribute("type")}catch(ex){}
+    if(mm){try{V.setAttribute("type",mm)}catch(ex){}}
+    if(HEVC_HINT.test(u0||u)){
+      try{
+        var vv=document.createElement("video");
+        if(vv.canPlayType('video/mp4; codecs="hvc1"'))V.setAttribute("type",'video/mp4; codecs="hvc1"');
+        else if(vv.canPlayType('video/mp4; codecs="hev1"'))V.setAttribute("type",'video/mp4; codecs="hev1"');
+      }catch(ex){}
+    }
+    if(HARD_EXT.indexOf(e0)>-1&&!browserMayPlay(u0||u)&&!opt.forceNative){
+      setLoading(false);
+      fail(it,"Browser is format ko direct play nahi karta ("+fmtOf(it)+"). VLC / MX / PotPlayer me kholo, ya MP4/HLS me convert karo");
+      return;
+    }
     V.src=u;go2();
   }
 }
@@ -4142,11 +4241,11 @@ function updBuf(){
   try{var d=V.duration,b=V.buffered;if(b.length&&isFinite(d)&&d>0){var c=V.currentTime,e=0;for(var i=0;i<b.length;i++){if(b.start(i)<=c&&b.end(i)>=c)e=b.end(i)}$("#buf").style.width=(e/d*100)+"%"}}catch(e){}
 }
 function bindVideo(){
-V.addEventListener("play",function(){hideEnd();updPlayIcon();showCtl();amN=0;ambStart();applyAmb()});
-V.addEventListener("seeked",function(){amN=0;ambStart()});V.addEventListener("loadeddata",function(){amN=0;ambStart();applyAmb()});
+V.addEventListener("play",function(){hideEnd();updPlayIcon();showCtl();amN=0;ambStart()});
+V.addEventListener("seeked",function(){amN=0;ambStart()});V.addEventListener("loadeddata",function(){amN=0;ambStart()});
 V.addEventListener("pause",function(){updPlayIcon();showCtl()});
 V.addEventListener("waiting",function(){setLoading(true);onBufferToast()});
-V.addEventListener("playing",function(){setLoading(false);showErr("");preloadNext();ambStart()});
+V.addEventListener("playing",function(){setLoading(false);showErr("");preloadNext()});
 V.addEventListener("canplay",function(){setLoading(false)});
 V.addEventListener("progress",updBuf);
 V.addEventListener("timeupdate",function(){
@@ -4292,109 +4391,138 @@ function setSession(it){
   }catch(e){}
 }
 
-/* ---------- Ambient light (YouTube-style: continuous video sync + full HTML page wash) ---------- */
-var AM=CFG.amb||{},AMS=LS.get("ytb_amb",{}),amCv=$("#amb"),amCx=null,amRaf=0,amLast=0,amN=0,amBars={t:0,b:0,on:true};
-var amPage=$("#ambPage"),amPageCv=$("#ambPageCv"),amPageCx=null,amLastColors=null,amSample=null,amSampleCx=null,amCorsFail=0;
+/* ---------- Ambient light (YouTube-style FULL PAGE sync) ---------- */
+var AM=CFG.amb||{},AMS=LS.get("ytb_amb",{}),amCv=$("#amb"),amCx=null,amRaf=0,amLast=0,amN=0,amTry=0,amBars={t:0,b:0,on:true};
+var amPage=$("#ambPage"),amPageCv=$("#ambPageCv"),amPageCx=null,amLastColors=null,amRes=160,amDropped=0,amRunning=false;
 function amv(k,d){return AMS[k]!==undefined?AMS[k]:(AM[k]!==undefined?AM[k]:d)}
 function amset(k,v){AMS[k]=v;LS.set("ytb_amb",AMS);applyAmb()}
 function applyAmb(){
-  var on=!!amv("enabled",true),bl=amv("blur",28),watchOpen=!$("#watch").hidden;
-  var active=on&&watchOpen;
-  document.body.classList.toggle("amb-on",active);
-  document.documentElement.style.setProperty("--amb-op",String(Math.min(1,amv("intensity",90)/100)));
-  document.documentElement.style.setProperty("--hsh","0 0 "+amv("headerShadowSize",25)+"px rgba(0,0,0,"+(amv("headerShadowOpacity",30)/100)+")");
+  var on=!!amv("enabled",true),sp=amv("spread",140)/100,bl=amv("blur",18);
+  var fadeIn=amv("fadeInDuration",0);
+  document.body.classList.toggle("amb-on",on);
+  if(amCv)amCv.hidden=!on;
+  if(amPage){amPage.classList.toggle("on",on);amPage.style.display=on?"block":"none"}
+  if(amv("hideScrollbar",true)){document.documentElement.style.scrollbarWidth="none"}else{document.documentElement.style.scrollbarWidth=""}
+  document.body.classList.toggle("amb-fixed",!!amv("fixedPosition",false));
+  document.body.classList.toggle("amb-theater-hide",!!amv("hideInTheater",false));
+  /* local glow canvas around player */
   if(amCv){
-    amCv.removeAttribute("hidden");
-    var sp=amv("spread",145)/100;
-    amCv.style.left=((-sp*20)|0)+"%";amCv.style.top=((-sp*20)|0)+"%";
-    amCv.style.width=(100+sp*40)+"%";amCv.style.height=(100+sp*40)+"%";
-    amCv.style.filter="blur("+Math.max(24,Math.round(bl*1.8))+"px) saturate("+amv("saturation",1.55)+") brightness("+amv("brightness",1.08)+")";
+    amCv.style.width=(Math.max(1.1,sp)*100)+"%";
+    amCv.style.height=(Math.max(1.1,sp)*100)+"%";
+    amCv.style.left=((1-Math.max(1.1,sp))*50)+"%";
+    amCv.style.top=((1-Math.max(1.1,sp))*50)+"%";
+    amCv.style.position="absolute";
+    var sat=amv("saturation",1.55),bri=amv("brightness",1.08),con=amv("contrast",1.05);
+    amCv.style.filter="blur("+Math.round(bl*1.8)+"px) saturate("+sat+") brightness("+bri+") contrast("+con+")";
+    amCv.style.opacity=amv("intensity",90)/100;
+    if(fadeIn>0)amCv.style.transition="opacity "+fadeIn+"ms ease";
+    else amCv.style.transition="opacity .35s";
   }
-  if(amPage){
-    amPage.classList.toggle("on",active);
-    if(amPageCv){
-      amPageCv.style.filter="blur("+Math.max(60,Math.round(bl*3.2))+"px) saturate("+amv("saturation",1.7)+") brightness("+amv("brightness",1.12)+")";
-      amPageCv.style.opacity=String(Math.min(1,(amv("intensity",90)/100)));
+  /* full-page canvas sizing */
+  if(amPageCv){
+    var sat2=amv("saturation",1.55),bri2=amv("brightness",1.08);
+    amPageCv.style.filter="blur("+Math.max(40,Math.round(bl*4.2))+"px) saturate("+sat2+") brightness("+bri2+")";
+    amPageCv.style.opacity=Math.min(0.95,amv("intensity",90)/100);
+    var scale=Math.max(1.2,sp*1.15);
+    amPageCv.style.width=(scale*100)+"%";
+    amPageCv.style.height=(scale*100)+"%";
+  }
+  document.documentElement.style.setProperty("--hsh","0 0 "+amv("headerShadowSize",25)+"px rgba(0,0,0,"+(amv("headerShadowOpacity",30)/100)+")");
+  document.documentElement.style.setProperty("--vsh","0 0 "+(amv("videoShadowSize",100)/3)+"px rgba(var(--amb-rgb,0,0,0),"+(amv("videoShadowOpacity",25)/100)+")");
+  var pl=$("#pl");if(pl){pl.style.boxShadow=on?("var(--vsh)"):"none"}
+  amRes=Math.max(48,Math.min(240,Math.round(1.4*amv("resolution",100))));
+  if(on)ambStart();
+  else ambStop();
+}
+function detectBars(vw,vh){
+  try{
+    var c=document.createElement("canvas");c.width=64;c.height=36;var x=c.getContext("2d");x.drawImage(V,0,0,64,36);
+    var d=x.getImageData(0,0,64,36).data;
+    function lum(r){var s=0;for(var i=0;i<64;i++){var p=(r*64+i)*4;s+=d[p]*.3+d[p+1]*.59+d[p+2]*.11}return s/64}
+    var t=0,b=0,manual=amv("barSize",0)/100;
+    if(amv("removeBlackBars",false)||amv("detectHorizontalBarSizeEnabled",true)){
+      while(t<12&&lum(t)<14)t++;while(b<12&&lum(35-b)<14)b++;
     }
-  }
-  if(active)ambStart();else ambStop();
-}
-function ambStop(){
-  if(amRaf){cancelAnimationFrame(amRaf);amRaf=0}
-  if(amPage)amPage.classList.remove("on");
-  document.body.classList.remove("amb-on");
-}
-function ambEnsureCtx(){
-  if(amCv&&!amCx){amCv.width=320;amCv.height=180;try{amCx=amCv.getContext("2d",{willReadFrequently:true,alpha:true})}catch(e){try{amCx=amCv.getContext("2d")}catch(e2){}}}
-  if(amPageCv&&!amPageCx){amPageCv.width=64;amPageCv.height=36;try{amPageCx=amPageCv.getContext("2d",{willReadFrequently:true,alpha:true})}catch(e){try{amPageCx=amPageCv.getContext("2d")}catch(e2){}}}
-  if(!amSample){amSample=document.createElement("canvas");amSample.width=32;amSample.height=18;try{amSampleCx=amSample.getContext("2d",{willReadFrequently:true})}catch(e){try{amSampleCx=amSample.getContext("2d")}catch(e2){}}}
-}
-function ambPushColors(r,g,b){
-  var sm=+amv("smoothing",0.55);
-  if(amLastColors){r=Math.round(amLastColors.r*sm+r*(1-sm));g=Math.round(amLastColors.g*sm+g*(1-sm));b=Math.round(amLastColors.b*sm+b*(1-sm))}
-  amLastColors={r:r,g:g,b:b};
-  var rgb=r+","+g+","+b;
-  document.documentElement.style.setProperty("--amb-r",r);
-  document.documentElement.style.setProperty("--amb-g",g);
-  document.documentElement.style.setProperty("--amb-b",b);
-  document.documentElement.style.setProperty("--amb-rgb",rgb);
-  if(amPage)amPage.style.background="rgb("+rgb+")";
+    if(manual>0){t=Math.max(t,Math.round(manual*36));b=Math.max(b,Math.round(manual*36))}
+    amBars={t:t/36,b:b/36,on:true,side:amv("removeSideBars",false)?(amv("sidebarSize",0)/100):0};
+  }catch(e){amBars={t:0,b:0,on:false,side:0}}
 }
 function ambDraw(){
-  ambEnsureCtx();
-  var vw=V.videoWidth,vh=V.videoHeight;
-  if(!vw||!vh||V.readyState<2)return;
-  var sy=0,sh=vh;
-  if(amBars.on&&amBars.t+amBars.b>0.02){sy=Math.round(vh*amBars.t);sh=Math.max(1,Math.round(vh*(1-amBars.t-amBars.b)))}
-  /* 1) Always paint blurred video frames (works even if canvas is CORS-tainted) */
-  try{if(amCx)amCx.drawImage(V,0,sy,vw,sh,0,0,amCv.width,amCv.height)}catch(e){}
-  try{if(amPageCx)amPageCx.drawImage(V,0,sy,vw,sh,0,0,amPageCv.width,amPageCv.height)}catch(e){}
-  amN++;
-  /* 2) Average color — may fail on cross-origin without CORS; never stop the loop */
-  if(amN%3===0&&amSampleCx){
-    try{
-      amSampleCx.drawImage(V,0,sy,vw,sh,0,0,32,18);
-      var d=amSampleCx.getImageData(0,0,32,18).data,r=0,g=0,b=0,n=0,i;
-      for(i=0;i<d.length;i+=8){r+=d[i];g+=d[i+1];b+=d[i+2];n++}
-      if(n){amCorsFail=0;ambPushColors(Math.round(r/n),Math.round(g/n),Math.round(b/n))}
-    }catch(e){
-      amCorsFail++;
-      /* CORS blocked pixel read — visual blur frames still run; keep last color or neutral */
-      if(!amLastColors)ambPushColors(40,40,48);
-    }
+  if(!V||V.readyState<2)return;
+  var vw=V.videoWidth,vh=V.videoHeight;if(!vw||!vh)return;
+  var w=amRes||120,h=Math.round(w*9/16);
+  /* ensure contexts */
+  if(amCv&&(!amCx||amCv.width!==w)){
+    amCv.width=w;amCv.height=h;amCx=null;
+    try{amCx=amCv.getContext("2d",{willReadFrequently:true,alpha:true})}catch(e){try{amCx=amCv.getContext("2d")}catch(e2){}}
   }
-  /* black-bar detect occasionally (only when pixel read works) */
-  if(amCorsFail===0&&amv("detectHorizontalBarSizeEnabled",true)&&amN%45===0){
-    try{
-      var c=document.createElement("canvas");c.width=64;c.height=36;var x=c.getContext("2d");x.drawImage(V,0,0,64,36);
-      var dd=x.getImageData(0,0,64,36).data;
-      function lum(row){var s=0,j;for(j=0;j<64;j++){var p=(row*64+j)*4;s+=dd[p]*.3+dd[p+1]*.59+dd[p+2]*.11}return s/64}
-      var t=0,bb=0;while(t<12&&lum(t)<14)t++;while(bb<12&&lum(35-bb)<14)bb++;
-      amBars={t:t/36,b:bb/36,on:true};
-    }catch(e){amBars={t:0,b:0,on:false}}
+  if(amPageCv&&(!amPageCx||amPageCv.width!==w)){
+    amPageCv.width=w;amPageCv.height=h;amPageCx=null;
+    try{amPageCx=amPageCv.getContext("2d",{willReadFrequently:true,alpha:true})}catch(e){try{amPageCx=amPageCv.getContext("2d")}catch(e2){}}
+  }
+  if(amN%30===0)detectBars(vw,vh);
+  var sy=Math.round(vh*(amBars.t||0)),sh=Math.max(1,Math.round(vh*(1-(amBars.t||0)-(amBars.b||0))));
+  var sx=Math.round(vw*(amBars.side||0)),sw=Math.max(1,vw-2*sx);
+  try{
+    var drawTo=function(cx,cv){
+      if(!cx||!cv)return;
+      if(amv("fillRemovedBars",true))cx.drawImage(V,sx,sy,sw,sh,0,0,w,h);
+      else cx.drawImage(V,0,0,vw,vh,0,0,w,h);
+    };
+    drawTo(amCx,amCv);
+    drawTo(amPageCx,amPageCv);
+    amN++;
+    /* sample average color every few frames for CSS vars / page wash */
+    if(amN%2===0&&amCx){
+      try{
+        var d=amCx.getImageData(0,0,w,h).data,r=0,g=0,b=0,n=0;
+        for(var i=0;i<d.length;i+=16){r+=d[i];g+=d[i+1];b+=d[i+2];n++}
+        if(n){
+          r=Math.round(r/n);g=Math.round(g/n);b=Math.round(b/n);
+          var sm=+amv("smoothing",0.55);
+          if(amv("smoothMotion",true))sm=Math.min(0.9,sm+0.12);
+          var fr=amv("flickerReduction",0)/100;if(fr>0)sm=Math.min(0.95,sm+fr*0.25);
+          if(amLastColors){r=Math.round(amLastColors.r*sm+r*(1-sm));g=Math.round(amLastColors.g*sm+g*(1-sm));b=Math.round(amLastColors.b*sm+b*(1-sm))}
+          amLastColors={r:r,g:g,b:b};
+          document.documentElement.style.setProperty("--amb-r",r);
+          document.documentElement.style.setProperty("--amb-g",g);
+          document.documentElement.style.setProperty("--amb-b",b);
+          document.documentElement.style.setProperty("--amb-rgb",r+","+g+","+b);
+        }
+      }catch(e2){}
+    }
+  }catch(e){
+    /* cross-origin video: keep last colors, don't kill loop */
   }
 }
 function ambFrame(ts){
   amRaf=0;
-  if(!amv("enabled",true)||$("#watch").hidden)return;
-  if(document.hidden){amRaf=requestAnimationFrame(ambFrame);return}
-  var fps=Math.min(60,Math.max(8,amv("framerateLimit",30)|0));
-  if(V.paused&&amv("energySaver",true))fps=Math.min(fps,8);
-  if(!amv("syncVideoAmbient",true)&&V.paused&&amN>12){
-    /* sync explicitly off + paused: still keep loop alive at 2fps so it resumes instantly */
-    fps=2;
+  if(!amRunning)return;
+  if(!amv("enabled",true)||$("#watch").hidden||document.hidden){amRunning=false;return}
+  if(amv("enableInPictureInPicture",false)===false&&document.pictureInPictureElement){
+    amRaf=requestAnimationFrame(ambFrame);return;
   }
-  if(ts-amLast>=1000/fps){amLast=ts;ambDraw()}
+  /* energy saver: slow down when paused, but NEVER fully stop after N frames */
+  var paused=!!V.paused;
+  var fps=Math.min(60,Math.max(8,amv("framerateLimit",30)));
+  if(paused&&amv("energySaver",true))fps=Math.min(fps,6);
+  if(!paused||amN<8||!amv("energySaver",true)){
+    if(ts-amLast>=1000/fps){amLast=ts;ambDraw()}
+  }
+  /* KEEP RUNNING while watch page open + ambient on */
   amRaf=requestAnimationFrame(ambFrame);
 }
 function ambStart(){
   if(!amv("enabled",true)||$("#watch").hidden)return;
-  ambEnsureCtx();
+  amRunning=true;amTry=0;amDropped=0;
   if(!amRaf)amRaf=requestAnimationFrame(ambFrame);
 }
-document.addEventListener("visibilitychange",function(){if(!document.hidden)ambStart()});
-document.addEventListener("fullscreenchange",function(){amN=0;if(!$("#watch").hidden){applyAmb();ambStart()}});
-document.addEventListener("webkitfullscreenchange",function(){amN=0;if(!$("#watch").hidden){applyAmb();ambStart()}});
+function ambStop(){
+  amRunning=false;
+  if(amRaf){cancelAnimationFrame(amRaf);amRaf=0}
+}
+document.addEventListener("visibilitychange",function(){if(!document.hidden){amN=0;ambStart()}});
+document.addEventListener("leavepictureinpicture",function(){ambStart()});
 
 /* ---------- end screen (YouTube jaisa: replay + up next countdown + suggestions) ---------- */
 function hideEnd(){clearInterval(endT);endT=null;ENDSHOWN=false;var e=$("#endsc");if(e){e.hidden=true;e.textContent=""}}
@@ -4512,32 +4640,70 @@ function castTV(){
 function openUrlBox(){
   var old=$("#ubox");if(old)old.remove();
   var bx=el("div","ubox");bx.id="ubox";var c=el("div","ucard");
-  c.appendChild(el("h3","","\uD83D\uDD17 Play URL / MPD"));
+  c.appendChild(el("h3","","Play URL"));
+
+  /* ---- YouTube section ---- */
+  var ytSec=el("div","");
+  ytSec.style.cssText="margin-bottom:16px;padding:12px;border:1px solid var(--line);border-radius:12px;background:rgba(255,0,0,.06)";
+  ytSec.appendChild(el("div","", "YouTube URL  /  Vd6s download link"));
+  var ytIn=el("input");ytIn.type="url";ytIn.placeholder="YouTube URL  YA  videodownapi.com/mates/.../download?url=...";
+  ytIn.style.cssText="width:100%;margin:8px 0;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--tx);font-size:14px";
+  ytSec.appendChild(ytIn);
+  var ytRow=el("div","ubtn");
+  var ytPlay=el("button","","Play YouTube");
+  ytPlay.onclick=function(){
+    var u=ytIn.value.trim();
+    if(!u){toast("YouTube / download link paste karo");return}
+    playYouTube(u);
+    try{bx.remove()}catch(e){}
+  };
+  var ytMx=el("button","g","MX Player");
+  ytMx.onclick=function(){
+    var u=ytIn.value.trim();var id=ytId(u);
+    if(!id){toast("YouTube id nahi mila");return}
+    var w=ytWatchUrl(id);
+    location.href="intent:"+w+"#Intent;scheme=https;package=com.mxtech.videoplayer.ad;end";
+    toast("MX Player open…");
+  };
+  ytRow.appendChild(ytPlay);ytRow.appendChild(ytMx);ytSec.appendChild(ytRow);
+  var ytHint=el("div","unote");ytHint.textContent="youtu.be / watch?v= / shorts / embed sab chalenge. Desktop pe embed, Android pe MX Player bhi.";
+  ytSec.appendChild(ytHint);
+  c.appendChild(ytSec);
+
+  /* ---- Stream section ---- */
+  c.appendChild(el("h3","","Stream / MPD / file URL"));
   function fld(lbl,tag,ph){var w=el("label","ufl",lbl),i=el(tag);if(ph)i.placeholder=ph;if(tag==="textarea")i.rows=2;w.appendChild(i);c.appendChild(w);return i}
-  var iu=fld("Stream URL (mp4 / m3u8 / mpd ...)","input","https://...");
+  var iu=fld("Stream URL (mp4 / m3u8 / mpd / mkv ...)","input","https://...");
   var it_=fld("Title (optional)","input","");
-  var ty=el("select");[["","Auto detect"],["hls","HLS (.m3u8)"],["dash","DASH (.mpd)"],["native","MP4 / WebM / other"]].forEach(function(o){var op=el("option","",o[1]);op.value=o[0];ty.appendChild(op)});
+  var ty=el("select");[["","Auto detect"],["hls","HLS (.m3u8)"],["dash","DASH (.mpd)"],["mpegts","TS / FLV"],["native","MP4 / WebM / MKV / AVI / HEVC / WMV"]].forEach(function(o){var op=el("option","",o[1]);op.value=o[0];ty.appendChild(op)});
   var tw=el("label","ufl","Type");tw.appendChild(ty);c.appendChild(tw);
-  var ik=fld("ClearKey (MPD) - key_id:key, ek line me ek","textarea","kid_hex:key_hex");
-  var ic=fld("Cookie (optional)","input","name=value; name2=value2");
-  c.appendChild(el("div","unote","Cookie/Referer header browser se bhejna mumkin nahi, isliye cookie sirf 'Copy command' me use hoti hai. Cookie ya acctoken wali stream agar direct na chale to bot-proxy (PROXY_BASE) ya VLC/ffmpeg use karo."));
+  var ik=fld("ClearKey (MPD) - key_id:key","textarea","kid_hex:key_hex");
+  var ic=fld("Cookie (optional)","input","name=value; ...");
+  c.appendChild(el("div","unote","Agar YouTube link stream box me paste karo to bhi detect ho jayegi."));
   var row=el("div","ubtn");
   function mk(){
     var u=iu.value.trim();if(!/^https?:\/\//i.test(u)){toast("Valid http(s) URL daalo");return null}
+    if(isYouTubeUrl(u)){return {__yt:1,u:u}}
     var drm=ik.value.split(/\n/).map(function(l){var p=l.trim().split(":");return p.length>=2&&p[0]&&p[1]?[p[0].trim(),p.slice(1).join(":").trim()]:null}).filter(Boolean);
     var item=BYURL[u]||{t:"",u:u,k:"VIDEO",p:"",th:"",d:0,v:[],_x:1};
     item.t=it_.value.trim()||item.t||domainOf(u)||"Pasted URL";item.drm=drm.length?drm:undefined;item.eng=ty.value||(/\.mpd(\?|$)/i.test(u)?"dash":undefined);
     if(!BYURL[u]){BYURL[u]=item;ALL.push(item)}
     return item;
   }
-  var pl=el("button","","\u25B6 Play");pl.onclick=function(){var item=mk();if(!item)return;bx.remove();PXS[u0of(item)]=undefined;go(item)};
+  var pl=el("button","","Play stream");pl.onclick=function(){
+    var item=mk();if(!item)return;
+    if(item.__yt){playYouTube(item.u,it_.value.trim());try{bx.remove()}catch(e){}return}
+    bx.remove();PXS[item.u]=undefined;go(item);
+  };
   function u0of(i){return i.u}
-  var cm=el("button","g","Copy ffmpeg command");cm.onclick=function(){
-    var item=mk();if(!item)return;var k=(item.drm&&item.drm[0])?" -decryption_key "+item.drm[0][1]:"",ck=ic.value.trim()?' -headers "Cookie: '+ic.value.trim().replace(/"/g,'\\"')+'\\r\\n"':"";
-    copy("ffmpeg"+ck+k+' -i "'+item.u+'" -c copy out.mp4')};
+  var cm=el("button","g","Copy ffmpeg");cm.onclick=function(){
+    var item=mk();if(!item||item.__yt){toast("Stream URL chahiye");return}
+    var k=(item.drm&&item.drm[0])?" -decryption_key "+item.drm[0][1]:"",ck=ic.value.trim()?' -headers "Cookie: '+ic.value.trim().replace(/"/g,'\\"')+'\\r\\n"':"";
+    copy("ffmpeg"+ck+k+' -i "'+item.u+'" -c copy out.mp4');
+  };
   var cn=el("button","g","Cancel");cn.onclick=function(){bx.remove()};
   row.appendChild(pl);row.appendChild(cm);row.appendChild(cn);c.appendChild(row);
-  bx.appendChild(c);bx.onclick=function(e){if(e.target===bx)bx.remove()};document.body.appendChild(bx);iu.focus();
+  bx.appendChild(c);bx.onclick=function(e){if(e.target===bx)bx.remove()};document.body.appendChild(bx);ytIn.focus();
 }
 
 /* ---------- 3-dot settings panel (Playback / Advanced color) ---------- */
@@ -4573,6 +4739,7 @@ function renderPb(level){
     var asw=el("div","sw"+(amv("enabled",true)?" on":""));ar.appendChild(at);ar.appendChild(asw);
     ar.onclick=function(){amset("enabled",!amv("enabled",true));asw.className="sw"+(amv("enabled",true)?" on":"")};box.appendChild(ar);
     box.appendChild(nav("Ambient settings","Blur, spread, intensity, fps","amb"));
+    box.appendChild(nav("\uD83C\uDF10  Proxy settings","Stream proxy on/off, custom base URL","proxy"));
     var pu=el("div","row2"),put=el("div");put.appendChild(el("div","","\uD83D\uDD17  Play URL (MPD / key / cookie)"));put.appendChild(el("small","","Koi bhi link paste karke chalao"));pu.appendChild(put);pu.onclick=function(){pbClose();openUrlBox()};box.appendChild(pu);
     box.appendChild(nav("More tools","Subtitles, sleep timer, A-B repeat, refresh, screenshot, cast...","tools"));
     if(CFG.px){var xr=el("div","row2"),xt=el("div");xt.appendChild(el("div","","\uD83D\uDEE1  Bot proxy (acctoken / IP-lock links)"));xt.appendChild(el("small","","Stream bot ke through chalegi (same IP + Referer)"));
@@ -4629,6 +4796,30 @@ function renderPb(level){
   }else if(PBLEVEL==="sleep"){
     box.appendChild(hd("Sleep timer","tools"));
     var chs=el("div","chips2");[["Off",0],["15 min",15],["30 min",30],["60 min",60],["90 min",90]].forEach(function(p_){var c_=el("div","chip2",p_[0]);c_.onclick=function(){setSleep(p_[1]);renderPb("sleep")};chs.appendChild(c_)});box.appendChild(chs);
+  }else if(PBLEVEL==="proxy"){
+    box.appendChild(hd("Proxy settings","main"));
+    var pxOn=LS.get("ytb_px",true)!==false;
+    var r0=el("div","row2"),t0=el("div");t0.appendChild(el("div","","Use stream proxy"));t0.appendChild(el("small","","IP-lock / acctoken links ke liye"));
+    var s0=el("div","sw"+(pxOn?" on":""));r0.appendChild(t0);r0.appendChild(s0);
+    r0.onclick=function(){pxOn=!pxOn;LS.set("ytb_px",pxOn);s0.className="sw"+(pxOn?" on":"");toast(pxOn?"Proxy ON":"Proxy OFF");if(CUR)loadItem(CUR,{keepQ:true,at:V.currentTime||0})};box.appendChild(r0);
+    var mode=LS.get("ytb_px_mode","auto")||"auto";
+    function setMode(m){LS.set("ytb_px_mode",m);mode=m;if(m==="off")LS.set("ytb_px",false);if(m==="on")LS.set("ytb_px",true);renderPb("proxy");if(CUR)loadItem(CUR,{keepQ:true,at:V.currentTime||0})}
+    var lbM=el("div","lb");lbM.style.marginTop="10px";lbM.appendChild(el("div","","Proxy mode"));box.appendChild(lbM);
+    var chips=el("div","chips2");
+    [["auto","Auto (IP-lock only)"],["on","Always on"],["off","Always off"]].forEach(function(p){
+      var c=el("div","chip2"+(mode===p[0]?" on":""),p[1]);c.onclick=function(){setMode(p[0])};chips.appendChild(c);
+    });
+    box.appendChild(chips);
+    var base=LS.get("ytb_px_base","")||"";
+    var lb2=el("div","lb");lb2.style.marginTop="10px";lb2.appendChild(el("div","","Custom PROXY_BASE URL"));box.appendChild(lb2);
+    var inp=el("input");inp.type="url";inp.placeholder="https://your-app.onrender.com";inp.value=base;
+    inp.style.cssText="width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--tx);font-size:14px";
+    inp.onchange=inp.onblur=function(){var v=(inp.value||"").trim().replace(/\/$/,"");LS.set("ytb_px_base",v);toast(v?"Proxy base saved":"Proxy base cleared")};
+    box.appendChild(inp);
+    var note=el("div","");note.style.cssText="font-size:12px;opacity:.75;margin:12px 0;line-height:1.4";
+    note.textContent="Browser system HTTP proxy set nahi kar sakta. Ye bot stream-proxy (/p?u=...) ko control karta hai. Custom base tab kaam karta hai jab item me ready proxy URL (x) na ho.";
+    box.appendChild(note);
+    var clr=el("div","row2");clr.appendChild(el("div","","Clear per-video proxy overrides"));clr.onclick=function(){PXS={};toast("Overrides cleared");if(CUR)loadItem(CUR,{keepQ:true})};box.appendChild(clr);
   }else if(PBLEVEL==="amb"){
     box.appendChild(hd("Ambient light","main"));
     function asl(label,key,min,max,step,fmt){
@@ -4639,65 +4830,97 @@ function renderPb(level){
       rs.onclick=function(){delete AMS[key];LS.set("ytb_amb",AMS);inp.value=amv(key,0);vv.textContent=fmt(+inp.value);applyAmb()};
       w.appendChild(lb);w.appendChild(inp);return w;
     }
-    function atog(label,key,defv){
-      var on=!!amv(key,defv),w=el("div","row2");w.appendChild(el("div","",(on?"\u2705 ":"\u2B1C ")+label));
-      w.onclick=function(){amset(key,!amv(key,defv));applyAmb();renderPb("amb")};return w;
+    function asw(label,sub,key){
+      var r=el("div","row2"),t=el("div");t.appendChild(el("div","",label));if(sub)t.appendChild(el("small","",sub));
+      var s=el("div","sw"+(amv(key,false)?" on":""));r.appendChild(t);r.appendChild(s);
+      r.onclick=function(){amset(key,!amv(key,false));s.className="sw"+(amv(key,false)?" on":"");applyAmb()};return r;
     }
-    function asec(t){var h=el("div","sub");h.style.cssText="margin:12px 0 6px;font-weight:700;opacity:.85";h.textContent=t;return h}
-    box.appendChild(asec("Quality"));
-    box.appendChild(atog("WebGL renderer (uses less power)", "webglRenderer", true));
-    box.appendChild(asl("Resolution","resolutionScale",50,100,5,function(v){return v+"%"}));
-    box.appendChild(asl("Limit framerate (per second)","framerateLimit",5,60,1,function(v){return v+" fps"}));
-    box.appendChild(atog("Save energy on static videos","energySaver",true));
-    box.appendChild(atog("Prioritize page load speed","prioritizePageLoad",true));
-    box.appendChild(atog("YouTube responsiveness fixes","youtubeResponsiveness",true));
-    box.appendChild(asec("Page header"));
-    box.appendChild(asl("Shadows size","pageHeaderShadowSize",0,80,1,pct));
-    box.appendChild(asl("Shadows opacity","pageHeaderShadowOpacity",0,100,1,pct));
-    box.appendChild(asec("Page content"));
-    box.appendChild(asl("Shadows size","pageContentShadowSize",0,40,1,pct));
-    box.appendChild(asl("Shadows opacity","pageContentShadowOpacity",0,100,1,pct));
-    box.appendChild(atog("Shadows on texts and buttons only","shadowsOnTextButtonsOnly",false));
-    box.appendChild(asl("Images opacity","imagesOpacity",0,100,1,pct));
-    box.appendChild(asl("Buttons & boxes background opacity","buttonsBoxesBgOpacity",-100,100,5,function(v){return v+"%"}));
-    box.appendChild(asl("Background greyness","backgroundGreyness",0,100,1,pct));
-    box.appendChild(atog("Hide everything in theater mode","hideEverythingTheater",false));
-    box.appendChild(atog("Related videos as scrollable list","relatedAsScrollList",false));
-    box.appendChild(atog("Hide scrollbar","hideScrollbar",true));
-    box.appendChild(asec("Video"));
-    box.appendChild(asl("Size (in small view)","videoSizeSmall",50,150,0.5,function(v){return v+"%"}));
+    function sec(title){var d=el("div","lb");d.style.margin="12px 0 6px";d.style.opacity=".7";d.style.fontSize="12px";d.style.textTransform="uppercase";d.appendChild(el("div","",title));return d}
+    var pct=function(v){return v+"%"};
+    /* Quality */
+    box.appendChild(sec("Quality"));
+    box.appendChild(asw("WebGL renderer","Uses less power","webgl"));
+    box.appendChild(asl("Resolution","resolution",40,100,5,pct));
+    box.appendChild(asl("Limit framerate","framerateLimit",5,60,1,function(v){return v+" fps"}));
+    var syncR=el("div","row2"),st=el("div");st.appendChild(el("div","","Synchronization"));st.appendChild(el("small","","",amv("syncMode","video")==="video"?"Video framerate":"Display"));
+    syncR.appendChild(st);syncR.appendChild(el("span","arrow",amv("syncMode","video")==="video"?"Video":"Display"));
+    syncR.onclick=function(){amset("syncMode",amv("syncMode","video")==="video"?"display":"video");renderPb("amb")};box.appendChild(syncR);
+    box.appendChild(asw("Save energy on static videos",null,"energySaver"));
+    box.appendChild(asw("Prioritize page load speed","Loads ambient after page loaded","prioritizePageLoad"));
+    box.appendChild(asw("YouTube responsiveness fixes","Improves responsiveness of the webpage","youtubeFixes"));
+    var debR=el("div","row2"),dt=el("div");dt.appendChild(el("div","","Optimize debanding for"));dt.appendChild(el("small","",amv("debandPanel","lcd")==="lcd"?"LCD (normal)":"OLED (overlay)"));
+    debR.appendChild(dt);debR.appendChild(el("span","arrow",amv("debandPanel","lcd")==="lcd"?"LCD":"OLED"));
+    debR.onclick=function(){amset("debandPanel",amv("debandPanel","lcd")==="lcd"?"oled":"lcd");renderPb("amb")};box.appendChild(debR);
+    /* Page header */
+    box.appendChild(sec("Page header"));
+    box.appendChild(asl("Shadows size","headerShadowSize",0,100,1,pct));
+    box.appendChild(asl("Shadows opacity","headerShadowOpacity",0,100,1,pct));
+    box.appendChild(asl("Images opacity","headerImagesOpacity",0,100,5,pct));
+    box.appendChild(asl("Background opacity","headerBgOpacity",0,100,5,pct));
+    /* Page content */
+    box.appendChild(sec("Page content"));
+    box.appendChild(asl("Shadows size","contentShadowSize",0,50,1,pct));
+    box.appendChild(asl("Shadows opacity","contentShadowOpacity",0,50,1,pct));
+    box.appendChild(asw("Shadows on texts and buttons only","Decreases scrolling & video stutter","shadowTextOnly"));
+    box.appendChild(asl("Images opacity","contentImagesOpacity",0,100,5,pct));
+    box.appendChild(asl("Buttons & boxes background opacity","btnBoxBgOpacity",-50,50,5,function(v){return v+"%"}));
+    box.appendChild(asl("Background greyness","bgGreyness",0,100,5,pct));
+    box.appendChild(asw("Hide everything in theater mode",null,"hideInTheater"));
+    box.appendChild(asw("Related videos as scrollable list","Also improves scrolling through comments","relatedScrollList"));
+    box.appendChild(asw("Hide scrollbar",null,"hideScrollbar"));
+    /* Video */
+    box.appendChild(sec("Video"));
+    box.appendChild(asl("Size (in small view)","videoSizeSmall",50,150,1,function(v){return v+"%"}));
     box.appendChild(asl("Shadow size","videoShadowSize",0,200,5,pct));
-    box.appendChild(asl("Shadow opacity","videoShadowOpacity",0,100,0.5,function(v){return v+"%"}));
-    box.appendChild(asl("Debanding (noise)","debandingNoise",0,100,1,pct));
-    box.appendChild(atog("Sync video with ambient light","syncVideoAmbient",true));
-    box.appendChild(asl("Sync video disable threshold","syncDisableThreshold",0,100,1,pct));
-    box.appendChild(atog("Video jitter workaround","videoJitterWorkaround",false));
-    box.appendChild(atog("Video artifacts workaround","videoArtifactsWorkaround",true));
-    box.appendChild(atog("Remove black bars [B]","removeBlackBars",false));
-    box.appendChild(atog("Remove black sidebars [V]","removeBlackSidebars",false));
-    box.appendChild(asl("Bar size","barSize",0,50,1,function(v){return v+"%"}));
-    box.appendChild(asl("Sidebars size","sidebarsSize",0,50,1,function(v){return v+"%"}));
-    box.appendChild(atog("Reset bars next video","resetBarsNextVideo",false));
-    box.appendChild(atog("Fill video to removed bars [H]","fillVideoRemovedBars",true));
-    box.appendChild(asec("Filters"));
-    box.appendChild(asl("Brightness","filterBrightness",50,150,1,pct));
-    box.appendChild(asl("Contrast","filterContrast",50,150,1,pct));
-    box.appendChild(asl("Colors","filterColors",50,150,1,pct));
-    box.appendChild(asl("Saturation","filterSaturation",50,200,1,pct));
-    box.appendChild(asec("Ambient light core"));
-    box.appendChild(asl("Blur","blur",0,100,1,pct));
-    box.appendChild(asl("Edge size","edge",0,60,1,pct));
+    box.appendChild(asl("Shadow opacity","videoShadowOpacity",0,100,1,function(v){return v+"%"}));
+    box.appendChild(asl("Debanding (noise)","videoDeband",0,100,5,pct));
+    box.appendChild(asw("Sync video with ambient light",null,"syncVideoAmb"));
+    box.appendChild(asl("Sync video disable threshold","syncDisableThreshold",0,100,5,pct));
+    box.appendChild(asw("Video jitter workaround","Uses CPU & GPU power","videoJitterFix"));
+    box.appendChild(asw("Video artifacts workaround","For VSR / upscaling artifacts","videoArtifactsFix"));
+    box.appendChild(asw("Remove black bars [B]","Uses CPU power","removeBlackBars"));
+    box.appendChild(asw("Remove black sidebars [V]","Uses CPU power","removeSideBars"));
+    box.appendChild(asl("Bar size","barSize",0,30,1,pct));
+    box.appendChild(asl("Sidebars size","sidebarSize",0,30,1,pct));
+    box.appendChild(asw("Reset bars next video",null,"resetBarsNext"));
+    box.appendChild(asw("Fill video to removed bars [H]",null,"fillRemovedBars"));
+    /* Filters */
+    box.appendChild(sec("Filters"));
+    box.appendChild(asl("Brightness","brightness",0.5,2,0.05,function(v){return Math.round(v*100)+"%"}));
+    box.appendChild(asl("Contrast","contrast",0.5,2,0.05,function(v){return Math.round(v*100)+"%"}));
+    box.appendChild(asl("Colors","colors",0.5,2,0.05,function(v){return Math.round(v*100)+"%"}));
+    box.appendChild(asl("Saturation","saturation",0.5,2.5,0.05,function(v){return Math.round(v*100)+"%"}));
+    /* Ambient light core */
+    box.appendChild(sec("Ambient light"));
+    box.appendChild(asl("Blur","blur",0,100,1,function(v){return v+"%"}));
+    box.appendChild(asl("Edge size","edge",0,50,1,pct));
     box.appendChild(asl("Spread","spread",100,200,5,pct));
-    box.appendChild(asl("Spread fade start","spreadFadeStart",0,60,5,pct));
-    box.appendChild(asl("Spread fade curve","spreadFadeCurve",0,60,5,pct));
-    box.appendChild(asl("Glow intensity","intensity",0,100,5,pct));
-    box.appendChild(atog("Fixed position (ignore scroll)","fixedPosition",false));
-    box.appendChild(asec("View modes"));
-    box.appendChild(atog("Picture in picture","pictureInPicture",false));
-    box.appendChild(atog("Embedded videos","embeddedVideos",true));
-    box.appendChild(atog("VR/360 videos","vr360Videos",true));
-    box.appendChild(atog("Ambient enabled","enabled",true));
-    var rr2=el("div","row2");rr2.appendChild(el("div","","Reset to ambient.json defaults"));rr2.onclick=function(){AMS={};LS.set("ytb_amb",AMS);applyAmb();renderPb("amb")};box.appendChild(rr2);
+    box.appendChild(asl("Spread fade start","spreadFadeStart",0,60,1,pct));
+    box.appendChild(asl("Spread fade curve","spreadFadeCurve",0,60,1,pct));
+    box.appendChild(asl("Debanding (noise)","ambDeband",0,100,5,pct));
+    box.appendChild(asl("Fade in duration","fadeInDuration",0,2000,50,function(v){return v?v+" ms":"Off"}));
+    box.appendChild(asl("Flicker reduction","flickerReduction",0,100,5,pct));
+    box.appendChild(asw("Smooth motion (frame blending)","Uses GPU power","smoothMotion"));
+    box.appendChild(asw("Fixed position","Ignores the scroll position of the page","fixedPosition"));
+    box.appendChild(asl("Glow intensity","intensity",0,100,1,pct));
+    box.appendChild(asl("Color smoothing","smoothing",0,1,0.02,function(v){return Math.round(v*100)+"%"}));
+    box.appendChild(asw("Detect horizontal black bars",null,"detectHorizontalBarSizeEnabled"));
+    /* View modes */
+    box.appendChild(sec("View modes"));
+    var layR=el("div","row2"),lt=el("div");lt.appendChild(el("div","","Enable in layouts"));lt.appendChild(el("small","",String(amv("layoutMode","all")).toUpperCase()));
+    layR.appendChild(lt);layR.appendChild(el("span","arrow","\u203A"));
+    layR.onclick=function(){var o=["all","small","theater","fullscreen"],i=o.indexOf(amv("layoutMode","all"));amset("layoutMode",o[(i+1)%o.length]);renderPb("amb")};box.appendChild(layR);
+    box.appendChild(asw("Picture in picture",null,"enableInPictureInPicture"));
+    box.appendChild(asw("Embedded videos",null,"embeddedVideos"));
+    box.appendChild(asw("VR/360 videos",null,"vr360"));
+    /* General */
+    box.appendChild(sec("General"));
+    var thR=el("div","row2"),tt=el("div");tt.appendChild(el("div","","Appearance (theme)"));tt.appendChild(el("small","",amv("theme","default")));
+    thR.appendChild(tt);thR.appendChild(el("span","arrow","\u203A"));
+    thR.onclick=function(){var o=["light","default","dark"],i=o.indexOf(amv("theme","default"));var n=o[(i+1)%o.length];amset("theme",n);
+      document.documentElement.setAttribute("data-theme",n==="default"?"dark":n);renderPb("amb")};box.appendChild(thR);
+    box.appendChild(asw("Enabled","Master ambient light switch","enabled"));
+    var rr2=el("div","row2");rr2.appendChild(el("div","","Reset all ambient defaults"));rr2.onclick=function(){AMS={};LS.set("ytb_amb",AMS);applyAmb();renderPb("amb")};box.appendChild(rr2);
   }else if(PBLEVEL==="color"){
     box.appendChild(hd("Advanced color","play"));
     box.appendChild(slider("Contrast","contrast",50,200,5,pct));
@@ -4707,20 +4930,9 @@ function renderPb(level){
     rr.onclick=function(){["bright","contrast","sat","warm"].forEach(function(k){pbset(k,PBDEF[k])});applyVideoFx();renderPb("color")};box.appendChild(rr);
   }
 }
-$("#bMore").onclick=function(e){
-  e.preventDefault();e.stopPropagation();
-  PL.classList.add("show");clearTimeout(hideT);
-  var b=$("#pbm");
-  if(!b.hidden){pbClose();return}
-  try{renderPb("main")}catch(err){console.error("settings panel",err);toast("Settings error")}
-  showCtl();
-};
+$("#bMore").onclick=function(e){e.preventDefault();e.stopPropagation();PL.classList.add("show");clearTimeout(hideT);var b=$("#pbm");if(!b.hidden){pbClose();return}try{renderPb("main")}catch(err){console.error(err);toast("Settings error")}showCtl()};
 $("#bMore").onpointerdown=function(e){e.stopPropagation()};
-document.addEventListener("pointerdown",function(e){
-  var b=$("#pbm");if(!b||b.hidden)return;
-  if(e.target.closest("#pbm")||e.target.closest("#bMore")||e.target.closest(".ctl"))return;
-  pbClose();
-});
+document.addEventListener("pointerdown",function(e){var b=$("#pbm");if(!b.hidden&&!e.target.closest("#pbm")&&!e.target.closest("#bMore"))pbClose()});
 
 /* ---------- watch page ---------- */
 function actBtn(txt,fn,on){var b=el("button","act"+(on?" on":""),txt);b.onclick=fn;return b}
@@ -4756,10 +4968,19 @@ function showWatch(i){
   var it=ALL[i];if(!it){location.hash="#/";return}
   CUR=it;LIST=LIST.length?LIST:computeList();
   $("#home").hidden=true;chipsEl.hidden=true;$("#watch").hidden=false;tgBack(true);
-  $("#dimT").textContent=it.t||"";pbClose();renderMeta(it);renderUpnext(it);loadItem(it);setSession(it);applyAmb();window.scrollTo(0,0);showCtl();
+  $("#dimT").textContent=it.t||"";pbClose();renderMeta(it);renderUpnext(it);
+  if(it.eng==="youtube"||it.yt||(it.u&&typeof isYouTubeUrl==="function"&&isYouTubeUrl(it.u))){
+    var id=it.yt||ytId(it.u);
+    it.eng="youtube";it.yt=id;
+    try{destroyEngines()}catch(e){}
+    showYtEmbed(id,it.t);
+    setSession(it);applyAmb();window.scrollTo(0,0);showCtl();
+    return;
+  }
+  loadItem(it);setSession(it);applyAmb();window.scrollTo(0,0);showCtl();
 }
 function showHome(){
-  if(!$("#watch").hidden){hideEnd();pbClose();ambStop();amLastColors=null;destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title+(CFG.owner?" | "+CFG.owner:"")}
+  if(!$("#watch").hidden){hideEnd();pbClose();try{ambStop()}catch(e){cancelAnimationFrame(amRaf);amRaf=0}destroyEngines();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}$("#watch").hidden=true;CUR=null;document.title=CFG.title+(CFG.owner?" | "+CFG.owner:"")}
   $("#home").hidden=false;chipsEl.hidden=false;tgBack(false);renderGrid();updChips();
 }
 function route(){var m=location.hash.match(/^#\/w\/(\d+)/);if(m)showWatch(+m[1]);else showHome()}
@@ -4852,7 +5073,7 @@ function renderAdmin(tab){
     Object.keys(ADM.settings).forEach(function(k){
       var v=ADM.settings[k],r=row(k+": ",[]);
       if(["verify","ytdlp","keep_preview"].indexOf(k)>-1){r.appendChild(btn(v==="1"||(k==="ytdlp"&&v!=="0")?"ON":"OFF",function(){var on=(v==="1")||(k==="ytdlp"&&v!=="0");admDo("/api/admin/setting",{key:k,value:on?"off":"on"},k+" updated")}))}
-      else if(k==="proxy"){var sl=el("select");[["auto","auto (IP-lock/acctoken only)"],["on","on / bot-proxy always"],["off","off / direct no proxy"],["force","force bot-proxy"],["mtproto","mtproto (falls to auto)"]].forEach(function(o){var op=el("option","",o[1]);op.value=o[0];if(o[0]===(v||"auto"))op.selected=true;sl.appendChild(op)});sl.onchange=function(){admDo("/api/admin/setting",{key:k,value:sl.value},"proxy = "+sl.value)};r.appendChild(sl)}
+      else if(k==="proxy"){var sl=el("select");["auto","on","off"].forEach(function(o){var op=el("option","",o);op.value=o;if(o===(v||"auto"))op.selected=true;sl.appendChild(op)});sl.onchange=function(){admDo("/api/admin/setting",{key:k,value:sl.value},"proxy = "+sl.value)};r.appendChild(sl)}
       else{var inp=el("input");inp.value=v;r.appendChild(inp);r.appendChild(btn("Save",function(){admDo("/api/admin/setting",{key:k,value:inp.value},k+" saved")}))}
     });
     Object.keys(ADM.prefer).forEach(function(d){row("\u2B50 prefer "+d+": "+ADM.prefer[d].join(", "),[btn("Clear",function(){admDo("/api/admin/prefer",{site:d,host:"off"},"prefer clear")})])});
@@ -4893,16 +5114,21 @@ function initMini(){
 
 /* ========== SUPER POWER PACK (add-only) ========== */
 var SHUFFLE=false,_lastTap=0,_tapSide="";
+var BOOKMARKS=LS.get("ytb_bm",{})||{};
+var NOTES=LS.get("ytb_notes",{})||{};
+var SUBOFF=LS.get("ytb_suboff",0)||0;
+var GRID_COMPACT=!!LS.get("ytb_compact",false);
+var EQ_ON=false,EQ_NODES=null,EQ_GAINS=LS.get("ytb_eq",[0,0,0,0,0])||[0,0,0,0,0];
+var SKIP_SIL=false,SIL_T=null;
+var MINI_ON=false,CLIP_REC=null,CLIP_CHUNKS=[];
+var YT_MODE=false;
+
 function shuffleList(arr){
   var a=arr.slice();
   for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1));var t=a[i];a[i]=a[j];a[j]=t}
   return a;
 }
-function toggleShuffle(){
-  SHUFFLE=!SHUFFLE;
-  toast(SHUFFLE?"Shuffle ON (S)":"Shuffle OFF");
-  return SHUFFLE;
-}
+function toggleShuffle(){SHUFFLE=!SHUFFLE;toast(SHUFFLE?"Shuffle ON (S)":"Shuffle OFF");return SHUFFLE}
 function nextShuffled(dir){
   if(!SHUFFLE||!ALL||!ALL.length)return null;
   var pool=ALL.filter(function(x){return x&&x!==CUR});
@@ -4920,7 +5146,6 @@ function bindDoubleTap(){
     var now=Date.now();
     if(_tapSide===side&&now-_lastTap<280){
       if(e&&e.preventDefault)e.preventDefault();
-      if(e&&e.stopPropagation)e.stopPropagation();
       if(side==="L"){skipRel(-10);flash("#dtLr")}else{skipRel(10);flash("#dtRr")}
       _lastTap=0;_tapSide="";
     }else{_lastTap=now;_tapSide=side}
@@ -4929,14 +5154,468 @@ function bindDoubleTap(){
   if(l){l.addEventListener("click",function(e){onTap("L",e)});l.addEventListener("touchend",function(e){onTap("L",e)},{passive:false})}
   if(r){r.addEventListener("click",function(e){onTap("R",e)});r.addEventListener("touchend",function(e){onTap("R",e)},{passive:false})}
 }
+
+/* ----- pitch-preserving speed ----- */
+function setSpeed(r){
+  r=Math.max(0.25,Math.min(3,Math.round(r*100)/100));
+  V.playbackRate=r;
+  try{V.preservesPitch=true;V.mozPreservesPitch=true;V.webkitPreservesPitch=true}catch(e){}
+  var b=$("#bSpd");if(b)b.textContent=r+"x";
+  if(CUR){SPD[CUR.u]=r}
+  toast(r+"x (pitch preserved)");
+}
+
+/* ----- bookmarks ----- */
+function bmKey(){return CUR?(CUR.u||""):""}
+function addBookmark(){
+  var k=bmKey();if(!k)return;
+  var t=Math.floor(V.currentTime||0);
+  var arr=BOOKMARKS[k]||[];
+  if(arr.indexOf(t)<0){arr.push(t);arr.sort(function(a,b){return a-b})}
+  BOOKMARKS[k]=arr;LS.set("ytb_bm",BOOKMARKS);drawBookmarks();toast("Bookmark "+fmtTime(t));
+}
+function drawBookmarks(){
+  var seek=$("#seek");if(!seek)return;
+  var old=seek.querySelector(".bm-marks");if(old)old.remove();
+  var k=bmKey(),arr=BOOKMARKS[k]||[],d=V.duration;
+  if(!arr.length||!isFinite(d)||d<=0)return;
+  var box=el("div","bm-marks");
+  arr.forEach(function(t){var i=document.createElement("i");i.style.left=((t/d)*100)+"%";box.appendChild(i)});
+  seek.appendChild(box);
+}
+function jumpBookmark(dir){
+  var k=bmKey(),arr=BOOKMARKS[k]||[];if(!arr.length){toast("No bookmarks");return}
+  var cur=V.currentTime||0,t=null;
+  if(dir>0){for(var i=0;i<arr.length;i++)if(arr[i]>cur+0.4){t=arr[i];break}if(t==null)t=arr[0]}
+  else{for(var i=arr.length-1;i>=0;i--)if(arr[i]<cur-0.4){t=arr[i];break}if(t==null)t=arr[arr.length-1]}
+  V.currentTime=t;toast("BM "+fmtTime(t));
+}
+
+/* ----- notes ----- */
+function addNote(){
+  var k=bmKey();if(!k)return;
+  var t=Math.floor(V.currentTime||0);
+  var txt=prompt("Note at "+fmtTime(t)+":",(NOTES[k]&&NOTES[k][t])||"");
+  if(txt==null)return;
+  if(!NOTES[k])NOTES[k]={};
+  if(txt.trim())NOTES[k][t]=txt.trim();else delete NOTES[k][t];
+  LS.set("ytb_notes",NOTES);toast(txt.trim()?"Note saved":"Note removed");
+}
+
+/* ----- subtitles offset / style ----- */
+function applySubOff(){
+  try{
+    var tracks=V.textTracks;if(!tracks)return;
+    for(var i=0;i<tracks.length;i++){
+      var tr=tracks[i];
+      if(!tr.cues)continue;
+      /* browser doesn't allow moving cues easily; store offset for display tip */
+    }
+  }catch(e){}
+}
+function setSubOff(sec){SUBOFF=sec;LS.set("ytb_suboff",sec);toast("Subtitle offset "+sec+"s (reload sub to apply best-effort)");}
+
+/* ----- skip silence (simple) ----- */
+function toggleSkipSilence(){
+  SKIP_SIL=!SKIP_SIL;toast(SKIP_SIL?"Skip silence ON (experimental)":"Skip silence OFF");
+  if(SIL_T){clearInterval(SIL_T);SIL_T=null}
+  if(!SKIP_SIL)return;
+  SIL_T=setInterval(function(){
+    if(!SKIP_SIL||!V||V.paused)return;
+    try{
+      if(V.volume<0.02)return;
+      /* heuristic: if readyState ok and buffered far but no progress - skip 2s when very quiet via WebAudio analyser if graph exists */
+      if(!GRAPH||!AC)return;
+    }catch(e){}
+  },1500);
+}
+
+/* ----- equalizer ----- */
+function ensureEQ(){
+  if(!ensureGraph()){toast("Audio graph nahi bana");return false}
+  if(EQ_NODES)return true;
+  try{
+    var freqs=[60,230,910,3600,14000];
+    EQ_NODES=freqs.map(function(f,i){
+      var b=AC.createBiquadFilter();b.type="peaking";b.frequency.value=f;b.Q.value=1.2;b.gain.value=EQ_GAINS[i]||0;return b;
+    });
+    /* rewire: SRCN -> EQ chain -> COMPN */
+    try{SRCN.disconnect();COMPN.disconnect();GAINN.disconnect()}catch(e){}
+    var prev=SRCN;
+    EQ_NODES.forEach(function(n){prev.connect(n);prev=n});
+    prev.connect(COMPN);COMPN.connect(GAINN);GAINN.connect(AC.destination);
+    EQ_ON=true;return true;
+  }catch(e){toast("EQ fail");return false}
+}
+function setEQBand(i,db){
+  EQ_GAINS[i]=db;LS.set("ytb_eq",EQ_GAINS);
+  if(EQ_NODES&&EQ_NODES[i])EQ_NODES[i].gain.value=db;
+}
+
+/* ----- codec badge ----- */
+function codecBadge(it){
+  var f=fmtOf(it||CUR||{u:""});
+  var eng=engineOf(it||CUR||{u:""});
+  return f+" · "+eng;
+}
+
+/* ----- YouTube ----- */
+function isYouTubeUrl(u){
+  u=(u||"").trim();
+  if(/^[\w-]{11}$/.test(u))return true;
+  return /youtu\.be|youtube\.com|youtube-nocookie\.com|music\.youtube\.com/i.test(u);
+}
+function isVdDownloadUrl(u){
+  u=(u||"").trim();
+  return /videodownapi\.com\/mates\/.*download\?url=/i.test(u)||/googlevideo\.com\/videoplayback/i.test(u);
+}
+function ytId(u){
+  try{
+    u=(u||"").trim();
+    if(/^[\w-]{11}$/.test(u))return u;
+    var m=u.match(/(?:youtube(?:-nocookie)?\.com\/(?:watch\?(?:[^#]*&)?v=|embed\/|shorts\/|live\/|v\/)|youtu\.be\/|music\.youtube\.com\/watch\?(?:[^#]*&)?v=)([\w-]{11})/i);
+    if(m)return m[1];
+    m=u.match(/[?&]v=([\w-]{11})/i);
+    if(m)return m[1];
+    m=u.match(/youtu\.be\/([\w-]{11})/i);
+    if(m)return m[1];
+    if(/youtu/i.test(u)){m=u.match(/([\w-]{11})/);if(m)return m[1]}
+    return "";
+  }catch(e){return ""}
+}
+function ytWatchUrl(id){return "https://www.youtube.com/watch?v="+id}
+function ytLocalApi(){
+  try{
+    if(location.protocol==="http:"||location.protocol==="https:"){
+      return location.origin+"/api/yt";
+    }
+  }catch(e){}
+  return "";
+}
+function playDirectUrl(url,title){
+  url=(url||"").trim();
+  if(!url)return;
+  var item=BYURL[url];
+  if(!item){
+    item={t:title||("Stream"),u:url,k:"VIDEO",p:"",th:"",d:0,v:[],eng:"native",_x:1};
+    BYURL[url]=item;ALL.push(item);try{DATA.push(item)}catch(e){}
+  }
+  item.eng="native";item.u=url;if(title)item.t=title;CUR=item;
+  var idx=ALL.indexOf(item);if(idx<0){ALL.push(item);idx=ALL.length-1}
+  try{$("#home").hidden=true;if(chipsEl)chipsEl.hidden=true;$("#watch").hidden=false;
+    if(typeof tgBack==="function")tgBack(true);if(typeof pbClose==="function")pbClose();
+    if(typeof hideYtEmbed==="function")hideYtEmbed();if(typeof renderMeta==="function")renderMeta(item);
+  }catch(e){}
+  try{location.hash="#/w/"+idx}catch(e){}
+  try{destroyEngines()}catch(e){}
+  V.hidden=false;try{PL.classList.remove("yt-mode")}catch(e){}
+  var fr=$("#ytEmbed");if(fr){fr.hidden=true;try{fr.src="about:blank"}catch(e){}}
+  setLoading(true);try{V.removeAttribute("crossorigin")}catch(e){}
+  V.src=url;
+  V.addEventListener("loadeddata",function(){setLoading(false);toast("Playing")},{once:true});
+  V.addEventListener("error",function(){setLoading(false);toast("Stream fail")},{once:true});
+  V.play().catch(function(){});
+}
+function playYouTube(url,title){
+  url=(url||"").trim();
+  if(isVdDownloadUrl(url)||/googlevideo\.com/i.test(url)){playDirectUrl(url,title||"YouTube stream");return}
+  var id=ytId(url);
+  if(!id){toast("YouTube id nahi mili");return}
+  var canon=ytWatchUrl(id);
+  var item=BYURL[canon]||BYURL[url];
+  if(!item){
+    item={t:title||("YouTube "+id),u:canon,k:"VIDEO",p:canon,th:"https://i.ytimg.com/vi/"+id+"/hqdefault.jpg",d:0,v:[],eng:"youtube",yt:id,_x:1};
+    BYURL[canon]=item;ALL.push(item);try{DATA.push(item)}catch(e){}
+  }
+  item.eng="youtube";item.yt=id;item.u=canon;
+  item.th="https://i.ytimg.com/vi/"+id+"/maxresdefault.jpg";
+  if(title&&String(title).trim())item.t=String(title).trim();
+  if(!item.t)item.t="YouTube "+id;
+  BYURL[url]=item;BYURL[canon]=item;CUR=item;
+  var idx=ALL.indexOf(item);if(idx<0){ALL.push(item);idx=ALL.length-1}
+  try{$("#home").hidden=true;if(chipsEl)chipsEl.hidden=true;$("#watch").hidden=false;
+    if(typeof tgBack==="function")tgBack(true);if(typeof pbClose==="function")pbClose();
+    if(typeof renderMeta==="function")renderMeta(item);if(typeof setSession==="function")setSession(item);
+  }catch(e){}
+  try{location.hash="#/w/"+idx}catch(e){}
+  showYtEmbed(id,item.t);
+}
+function showYtEmbed(id,title){
+  id=(id||"").trim();
+  if(!id)return;
+  YT_MODE=true;
+  setLoading(true);try{showErr("")}catch(e){}
+  try{destroyEngines()}catch(e){}
+  try{V.pause();V.removeAttribute("src");V.load()}catch(e){}
+  var fr=$("#ytEmbed");if(fr){fr.hidden=true;try{fr.src="about:blank"}catch(e){}}
+  try{PL.classList.remove("yt-mode")}catch(e){}
+  V.hidden=false;
+  var watch=ytWatchUrl(id);
+
+  /* FORCE path 1: local player_server.py API */
+  var api=ytLocalApi();
+  if(api){
+    toast("Force resolve (local server)…");
+    fetch(api+"?url="+encodeURIComponent(watch),{method:"GET"})
+      .then(function(r){return r.json()})
+      .then(function(data){
+        if(!data||!data.ok||!data.streams||!data.streams.length)throw new Error((data&&data.error)||"no streams");
+        if(data.title&&CUR){CUR.t=data.title;try{$("#wt").textContent=data.title}catch(e){}}
+        if(data.thumb&&CUR)CUR.th=data.thumb;
+        ytPlayStreamsList(data.streams,function(ok){
+          if(!ok)ytForceFail(id,title,watch,"Local resolve streams fail");
+        });
+      })
+      .catch(function(){
+        /* server not running or error → try embed if http */
+        if((location.protocol==="http:"||location.protocol==="https:")&&location.hostname){
+          ytOfficialEmbed(id,title,watch);
+        }else{
+          ytForceFail(id,title,watch,"player_server.py start karo (force play)");
+        }
+      });
+    return;
+  }
+  ytForceFail(id,title,watch,"Force play ke liye server chalao");
+}
+function ytPlayStreamsList(streams,done){
+  var i=0;
+  function next(){
+    if(i>=streams.length){if(done)done(false);return}
+    var s=streams[i++];
+    if(!s||!s.url){next();return}
+    try{PL.classList.remove("yt-mode")}catch(e){}
+    V.hidden=false;
+    try{if(hls){hls.destroy()}}catch(e){}hls=null;
+    if(s.kind==="hls"||/m3u8/i.test(s.ext||"")||/m3u8/i.test(s.url)){
+      loadScript(HLS_URL).then(function(){
+        if(window.Hls&&Hls.isSupported()){
+          hls=new Hls({enableWorker:true});
+          hls.on(Hls.Events.MANIFEST_PARSED,function(){setLoading(false);V.play().catch(function(){});toast("YouTube HLS · "+(s.label||""));if(done)done(true)});
+          hls.on(Hls.Events.ERROR,function(ev,d){if(d&&d.fatal)next()});
+          hls.loadSource(s.url);hls.attachMedia(V);
+        }else if(V.canPlayType("application/vnd.apple.mpegurl")){
+          V.src=s.url;V.play().catch(function(){});setLoading(false);if(done)done(true);
+        }else next();
+      },function(){next()});
+    }else{
+      try{V.removeAttribute("crossorigin")}catch(e){}
+      V.src=s.url;
+      var onOk=function(){V.removeEventListener("loadeddata",onOk);V.removeEventListener("error",onEr);setLoading(false);toast("YouTube · "+(s.label||""));if(done)done(true)};
+      var onEr=function(){V.removeEventListener("loadeddata",onOk);V.removeEventListener("error",onEr);next()};
+      V.addEventListener("loadeddata",onOk);V.addEventListener("error",onEr);
+      V.play().catch(function(){});
+    }
+  }
+  next();
+}
+function ytOfficialEmbed(id,title,watch){
+  var fr=$("#ytEmbed");
+  if(!fr){ytForceFail(id,title,watch,"no iframe");return}
+  try{PL.classList.add("yt-mode")}catch(e){}
+  V.hidden=true;fr.hidden=false;
+  fr.setAttribute("allowfullscreen","true");
+  fr.setAttribute("allow","accelerometer;autoplay;clipboard-write;encrypted-media;gyroscope;picture-in-picture;web-share;fullscreen");
+  fr.style.cssText="position:absolute;inset:0;width:100%;height:100%;border:0;z-index:9;display:block;background:#000";
+  var origin="";try{origin=location.origin||""}catch(e){}
+  fr.src="https://www.youtube.com/embed/"+id+"?autoplay=1&rel=0&modestbranding=1&playsinline=1&fs=1&origin="+encodeURIComponent(origin);
+  setLoading(false);toast("YouTube embed");
+}
+function ytForceFail(id,title,watch,msg){
+  setLoading(false);
+  V.hidden=true;
+  var fr=$("#ytEmbed");if(fr){fr.hidden=true;try{fr.src="about:blank"}catch(e){}}
+  var e=$("#err");if(!e){toast(msg);return}
+  e.hidden=false;e.textContent="";
+  e.appendChild(el("div","",(msg||"Force play setup")+""));
+  e.appendChild(el("div","","Terminal me ye chalao (player folder me):"));
+  var code=el("div","");
+  code.style.cssText="background:#0a0;color:#000;padding:12px;border-radius:8px;margin:8px 0;font-family:monospace;font-weight:700";
+  code.textContent="python player_server.py";
+  e.appendChild(code);
+  e.appendChild(el("div","","Phir browser: http://127.0.0.1:8080/player.html  (password 7989)"));
+  e.appendChild(el("div","","Server yt-dlp se stream nikal ke player me force play karega."));
+  var row=el("div","eb");
+  var mx=el("a","","MX Player");mx.href="intent:"+watch+"#Intent;scheme=https;package=com.mxtech.videoplayer.ad;type=video/*;end";row.appendChild(mx);
+  var yt=el("a","","Open YouTube");yt.href=watch;yt.target="_blank";yt.rel="noopener";row.appendChild(yt);
+  e.appendChild(row);
+}
+function hideYtEmbed(){
+  YT_MODE=false;
+  var fr=$("#ytEmbed");if(fr){fr.hidden=true;try{fr.src="about:blank"}catch(e){}}
+  try{PL.classList.remove("yt-mode")}catch(e){}
+  try{V.hidden=false}catch(e){}
+}
+
+function addLocalFiles(files){
+  var n=0;
+  for(var i=0;i<files.length;i++){
+    var f=files[i];if(!f)continue;
+    var url=URL.createObjectURL(f);
+    var name=f.name||("Local "+(i+1));
+    var item={t:name,u:url,k:/\.(mp3|m4a|aac|wav|flac|ogg|opus|wma)$/i.test(name)?"AUDIO":"VIDEO",p:"",th:"",d:0,v:[],eng:"native",_local:1,_x:1};
+    BYURL[url]=item;ALL.push(item);DATA.push(item);n++;
+  }
+  if(n){LIST=[];updChips();renderGrid();toast(n+" local file(s) added");if(n===1)go(DATA[DATA.length-1])}
+}
+function bindDrop(){
+  var ov=$("#dropOv");
+  function show(on){if(ov)ov.classList.toggle("on",!!on)}
+  window.addEventListener("dragover",function(e){e.preventDefault();show(true)});
+  window.addEventListener("dragleave",function(e){if(e.relatedTarget==null)show(false)});
+  window.addEventListener("drop",function(e){
+    e.preventDefault();show(false);
+    var files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length)addLocalFiles(files);
+  });
+}
+
+/* ----- clip export ----- */
+function startClip(){
+  if(!V||V.paused){toast("Pehle play karo");return}
+  if(!window.MediaRecorder){toast("MediaRecorder support nahi");return}
+  try{
+    var stream=V.captureStream?V.captureStream():(V.mozCaptureStream&&V.mozCaptureStream());
+    if(!stream){toast("captureStream nahi chalata is browser me");return}
+    CLIP_CHUNKS=[];
+    CLIP_REC=new MediaRecorder(stream,{mimeType:MediaRecorder.isTypeSupported("video/webm;codecs=vp9")?"video/webm;codecs=vp9":"video/webm"});
+    CLIP_REC.ondataavailable=function(ev){if(ev.data&&ev.data.size)CLIP_CHUNKS.push(ev.data)};
+    CLIP_REC.onstop=function(){
+      var blob=new Blob(CLIP_CHUNKS,{type:"video/webm"});
+      var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=(CUR&&CUR.t?CUR.t:"clip").replace(/[^\w\-]+/g,"_").slice(0,40)+".webm";
+      document.body.appendChild(a);a.click();a.remove();toast("Clip saved");
+    };
+    CLIP_REC.start(500);toast("Recording clip… stop se save");
+  }catch(e){toast("Clip fail: "+(e.message||e))}
+}
+function stopClip(){
+  if(CLIP_REC&&CLIP_REC.state!=="inactive"){CLIP_REC.stop();CLIP_REC=null}else toast("No active clip");
+}
+
+/* ----- mini player ----- */
+function openMini(){
+  var mp=$("#miniP"),mv=$("#miniV");if(!mp||!mv||!CUR)return;
+  try{mv.src=V.currentSrc||CUR.u;mv.currentTime=V.currentTime||0;mv.play()}catch(e){}
+  $("#miniT").textContent=CUR.t||"Playing";
+  mp.classList.add("on");MINI_ON=true;
+}
+function closeMini(){
+  var mp=$("#miniP"),mv=$("#miniV");
+  if(mv){try{mv.pause();mv.removeAttribute("src")}catch(e){}}
+  if(mp)mp.classList.remove("on");MINI_ON=false;
+}
+
+/* ----- keyboard help ----- */
+function showHelp(){
+  var ov=$("#helpOv"),body=$("#helpBody");if(!ov||!body)return;
+  var rows=[
+    ["k / Space","Play / Pause"],["j / l","-10s / +10s"],["← / →","-5s / +5s"],[", / .","Frame step"],
+    ["[ / ]","Speed - / +"],["m","Mute"],["f","Fullscreen"],["t","Theater"],["i","Stats"],
+    ["c","Captions"],["n / p","Next / Prev"],["s","Shuffle"],["b","Bookmark"],["B","Prev bookmark"],
+    ["N","Note at time"],["?","This help"],["0-9","Seek %"]
+  ];
+  var html="<table>";rows.forEach(function(r){html+="<tr><td>"+r[0]+"</td><td>"+r[1]+"</td></tr>"});html+="</table>";
+  body.innerHTML=html;ov.hidden=false;
+}
+
+/* ----- ambient presets ----- */
+function ambPreset(name){
+  var map={
+    cinema:{blur:18,spread:140,intensity:70,edge:25,saturation:1.2,brightness:0.95},
+    rgb:{blur:8,spread:160,intensity:95,edge:15,saturation:1.8,brightness:1.1},
+    soft:{blur:30,spread:120,intensity:55,edge:30,saturation:1.1,brightness:1.0},
+    off:{enabled:false}
+  };
+  var p=map[name];if(!p)return;
+  Object.keys(p).forEach(function(k){AMS[k]=p[k]});
+  if(name!=="off")AMS.enabled=true;
+  LS.set("ytb_amb",AMS);applyAmb();toast("Ambient: "+name);
+}
+
+/* ----- proxy health ----- */
+function proxyHealth(){
+  var base=(LS.get("ytb_px_base","")||"").replace(/\/$/,"")||(CFG.px?"":"");
+  if(!base&&!CFG.px){toast("PROXY_BASE set nahi");return}
+  var test=(base||location.origin)+"/";
+  toast("Proxy ping…");
+  fetch(test,{method:"GET",mode:"no-cors"}).then(function(){toast("Proxy host reachable (opaque)")}).catch(function(){toast("Proxy host fail")});
+}
+
+/* ----- grid density ----- */
+function toggleCompact(){
+  GRID_COMPACT=!GRID_COMPACT;LS.set("ytb_compact",GRID_COMPACT);
+  var g=$("#grid");if(g)g.classList.toggle("compact",GRID_COMPACT);
+  toast(GRID_COMPACT?"Compact grid":"Comfortable grid");
+}
+
+/* ----- auto PiP ----- */
+document.addEventListener("visibilitychange",function(){
+  if(document.hidden&&CUR&&!V.paused&&document.pictureInPictureEnabled&&!document.pictureInPictureElement){
+    if(LS.get("ytb_autopip",false)){try{V.requestPictureInPicture()}catch(e){}}
+  }
+});
+
+/* ----- wrap loadItem for youtube ----- */
+(function(){
+  if(typeof loadItem!=="function")return;
+  var _load=loadItem;
+  loadItem=function(it,opt){
+    try{hideYtEmbed()}catch(e){}
+    if(it&&(it.eng==="youtube"||it.yt||(it.u&&isYouTubeUrl(it.u)))){
+      opt=opt||{};
+      try{destroyEngines()}catch(e){}
+      try{showErr("")}catch(e){}
+      try{hideEnd()}catch(e){}
+      CUR=it;
+      var id=it.yt||ytId(it.u||"");
+      if(!id){toast("YouTube id nahi mila");try{fail(it,"YouTube id nahi mila")}catch(e){}return}
+      it.yt=id;it.eng="youtube";
+      try{V.hidden=false}catch(e){}
+      try{IMGV.hidden=true}catch(e){}
+      setLoading(false);
+      showYtEmbed(id,it.t);
+      try{renderMeta(it)}catch(e){}
+      try{setSession(it)}catch(e){}
+      return;
+    }
+    return _load(it,opt);
+  };
+})();
+
+/* ----- enhance openUrlBox play for YT ----- */
+(function(){
+  if(typeof openUrlBox!=="function")return;
+  /* paste handler on document for yt urls when not in input */
+})();
+
+document.addEventListener("paste",function(e){
+  var t=e.target;if(t&&(t.tagName==="INPUT"||t.tagName==="TEXTAREA"))return;
+  var txt=(e.clipboardData||window.clipboardData).getData("text")||"";
+  txt=txt.trim();
+  if(isYouTubeUrl(txt)){e.preventDefault();playYouTube(txt);toast("YouTube URL play…")}
+  else if(/^https?:\/\//i.test(txt)&&/\.(mp4|m3u8|mpd|mkv|avi|webm|mov)(\?|$)/i.test(txt)){
+    e.preventDefault();
+    var item={t:domainOf(txt)||"Pasted",u:txt,k:"VIDEO",p:"",th:"",d:0,v:[],_x:1};
+    if(!BYURL[txt]){BYURL[txt]=item;ALL.push(item);DATA.push(item)}
+    go(item);
+  }
+});
+
+/* ----- key bindings (super) ----- */
 document.addEventListener("keydown",function(e){
-  if(e.target&&(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA"))return;
+  if(e.target&&(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA"||e.target.tagName==="SELECT"))return;
+  if(e.key==="?"||(e.shiftKey&&e.key==="/")){e.preventDefault();showHelp();return}
+  if($("#helpOv")&&!$("#helpOv").hidden&&e.key==="Escape"){$("#helpOv").hidden=true;return}
   if($("#watch")&&$("#watch").hidden)return;
   var k=e.key;
-  if(k==="s"||k==="S"){e.preventDefault();toggleShuffle()}
-  if(k==="." ){e.preventDefault();V.playbackRate=Math.min(3,Math.round(((V.playbackRate||1)+0.25)*100)/100);toast(V.playbackRate+"x")}
-  if(k==="," ){e.preventDefault();V.playbackRate=Math.max(0.25,Math.round(((V.playbackRate||1)-0.25)*100)/100);toast(V.playbackRate+"x")}
+  if(k==="s"||k==="S"){if(!e.ctrlKey&&!e.metaKey){e.preventDefault();toggleShuffle()}}
+  if(k==="["){e.preventDefault();setSpeed((V.playbackRate||1)-0.25)}
+  if(k==="]"){e.preventDefault();setSpeed((V.playbackRate||1)+0.25)}
+  if(k==="b"&&!e.shiftKey){e.preventDefault();addBookmark()}
+  if(k==="B"){e.preventDefault();jumpBookmark(-1)}
+  if(k==="N"&&e.shiftKey){e.preventDefault();addNote()}
 });
+
+/* ----- nextItem shuffle wrap ----- */
 (function(){
   if(typeof nextItem==="function"){
     var _ni=nextItem;
@@ -4946,8 +5625,68 @@ document.addEventListener("keydown",function(e){
     };
   }
 })();
-setTimeout(bindDoubleTap,50);
-window.__super={toggleShuffle:toggleShuffle,shuffle:function(){return SHUFFLE},skipRel:skipRel};
+
+/* ----- init hooks ----- */
+setTimeout(function(){
+  bindDoubleTap();
+  bindDrop();
+  var g=$("#grid");if(g&&GRID_COMPACT)g.classList.add("compact");
+  var hc=$("#helpClose");if(hc)hc.onclick=function(){$("#helpOv").hidden=true};
+  var mc=$("#miniClose");if(mc)mc.onclick=closeMini;
+  var mp=$("#miniPlay");if(mp)mp.onclick=function(){var mv=$("#miniV");if(mv.paused)mv.play();else mv.pause()};
+  V.addEventListener("loadedmetadata",function(){drawBookmarks()});
+  V.addEventListener("seeked",drawBookmarks);
+},80);
+
+/* ----- settings menu extras via tools rows patch ----- */
+(function(){
+  var _renderPb=typeof renderPb==="function"?renderPb:null;
+  if(!_renderPb)return;
+  /* add entries when tools panel opens - monkey-patch by wrapping */
+  window.renderPb=function(level){
+    _renderPb(level);
+    if(level==="tools"){
+      var box=$("#pbm");if(!box)return;
+      function rowBtn(title,sub,fn){var r=el("div","row2"),t=el("div");t.appendChild(el("div","",title));if(sub)t.appendChild(el("small","",sub));r.appendChild(t);r.onclick=fn;box.appendChild(r)}
+      rowBtn("🔀 Shuffle: "+(SHUFFLE?"ON":"OFF"),"S key",function(){toggleShuffle();renderPb("tools")});
+      rowBtn("📌 Bookmark now","B key — timeline marker",function(){addBookmark()});
+      rowBtn("📝 Note at time","Shift+N",function(){addNote()});
+      rowBtn("🎬 Start clip record","MediaRecorder → WebM",function(){startClip()});
+      rowBtn("⏹ Stop clip & save",null,function(){stopClip()});
+      rowBtn("🡽 Mini player","Floating while browsing",function(){openMini();pbClose()});
+      rowBtn("📦 Compact grid",GRID_COMPACT?"ON":"OFF",function(){toggleCompact();renderPb("tools")});
+      rowBtn("🎚 Equalizer on","5-band",function(){if(ensureEQ())toast("EQ ready — use Advanced")});
+      rowBtn("Ambient preset: Cinema",null,function(){ambPreset("cinema")});
+      rowBtn("Ambient preset: RGB",null,function(){ambPreset("rgb")});
+      rowBtn("Ambient preset: Soft",null,function(){ambPreset("soft")});
+      rowBtn("Auto PiP on tab hide",LS.get("ytb_autopip",false)?"ON":"OFF",function(){var v=!LS.get("ytb_autopip",false);LS.set("ytb_autopip",v);toast("Auto PiP "+(v?"ON":"OFF"));renderPb("tools")});
+      rowBtn("Proxy health ping",null,function(){proxyHealth()});
+      rowBtn("❓ Keyboard help","? key",function(){pbClose();showHelp()});
+      rowBtn("📁 Open local files",".mp4 .mkv .avi .webm …",function(){pickFile("video/*,audio/*,.mkv,.avi,.wmv,.mp4,.webm,.mov,.mp3",function(){},true)});
+    }
+    if(level==="play"){
+      try{V.preservesPitch=true}catch(e){}
+    }
+  };
+})();
+
+/* pickFile multi for local - extend if needed */
+(function(){
+  if(typeof pickFile!=="function")return;
+  var _pf=pickFile;
+  pickFile=function(accept,cb,asFiles){
+    if(!asFiles)return _pf(accept,cb);
+    var i=document.createElement("input");i.type="file";i.accept=accept||"*/*";i.multiple=true;
+    i.onchange=function(){if(i.files&&i.files.length)addLocalFiles(i.files)};
+    i.click();
+  };
+})();
+
+window.__super={
+  toggleShuffle:toggleShuffle,shuffle:function(){return SHUFFLE},skipRel:skipRel,
+  addBookmark:addBookmark,playYouTube:playYouTube,setSpeed:setSpeed,openMini:openMini,
+  ambPreset:ambPreset,startClip:startClip,stopClip:stopClip,ensureEQ:ensureEQ
+};
 /* ========== end SUPER POWER PACK ========== */
 
 /* ---------- init ---------- */
@@ -4964,6 +5703,8 @@ function start(){
   var th=LS.get("ytb_theme","dark");document.documentElement.setAttribute("data-theme",th);
   $("#setB").onclick=function(e){e.stopPropagation();gearMenu(this)};
   $("#themeB").onclick=function(){var n=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",n);LS.set("ytb_theme",n)};
+
+
   var q=$("#q"),qc=$("#qclr"),qt;
   q.oninput=function(){qc.hidden=!q.value;clearTimeout(qt);qt=setTimeout(function(){VIEW.q=q.value;renderGrid()},180)};
   qc.onclick=function(){q.value="";qc.hidden=true;VIEW.q="";renderGrid()};
@@ -5048,6 +5789,77 @@ def _player_item(it: dict) -> dict:
                  "p": it.get("page_url") or "", "th": it.get("thumb") or "", "d": it.get("duration") or 0,
                  "v": [[v["q"], v["u"]] for v in (it.get("variants") or [])],
                  "ip": it.get("iplock") or ""}, **_px_fields(it))
+
+
+
+def _store_scrape(uid: int, results: List[dict], start: int, end: int, url: str, domain: str = ""):
+    """Keep last results for Files pack button."""
+    _LAST_SCRAPE[uid] = {
+        "results": results,
+        "start": start,
+        "end": end,
+        "url": url,
+        "domain": domain or normalize_domain(url),
+        "t": time.time(),
+    }
+
+
+def _build_scrape_files(results: List[dict], start: int, end: int, domain: str = "scrape"):
+    """Return dict of text contents: full_txt, simple_txt, player_html, and tag."""
+    tag = f"{domain}_p{start}_to_p{end}"
+    full = f"--- {domain} | Pages {start}-{end} | {len(results)} Items ---\n\n"
+    simple = f"--- {domain} Simple Links (Pages {start}-{end} | {len(results)} Items) ---\n\n"
+    for i, it in enumerate(results, 1):
+        full += (
+            f"{i}. Title: {it.get('title') or 'Video'}\n"
+            f"   Source Listing Page: {it.get('source_page') or ''}\n"
+            f"   Permanent Video Page: {it.get('page_url') or ''}\n"
+            f"   Direct Stream Link: {it.get('download_link') or ''}\n"
+            + exp_line(it) + "\n"
+        )
+        simple += f"{it.get('title') or 'Video'}: {it.get('download_link') or ''}\n"
+    player_html = generate_web_app_html(results, title=f"{domain} ({start}-{end})")
+    return {
+        "tag": tag,
+        "full_txt": full,
+        "simple_txt": simple,
+        "player_html": player_html,
+    }
+
+
+async def send_files_pack(send_document, results: List[dict], start: int, end: int, domain: str = "scrape"):
+    """Send: 2 TXT + 1 Player HTML + 1 ZIP (all together)."""
+    pack = _build_scrape_files(results, start, end, domain)
+    tag = pack["tag"]
+
+    def mk(data: str, name: str):
+        b = io.BytesIO(data.encode("utf-8"))
+        b.name = name
+        return b
+
+    await send_document(
+        document=mk(pack["full_txt"], f"{tag}_full.txt"),
+        caption=f"📁 Full TXT ({len(results)} links)",
+    )
+    await send_document(
+        document=mk(pack["simple_txt"], f"{tag}_simple.txt"),
+        caption=f"📁 Simple TXT (Title: Stream)",
+    )
+    await send_document(
+        document=mk(pack["player_html"], f"{tag}_player.html"),
+        caption=f"🌐 Full Web App HTML (Player UI)",
+    )
+    try:
+        zbuf = pack_result_zip(tag, [
+            (f"{tag}_full.txt", pack["full_txt"]),
+            (f"{tag}_simple.txt", pack["simple_txt"]),
+            (f"{tag}_player.html", pack["player_html"]),
+        ])
+        if zbuf:
+            await send_document(document=zbuf, caption=f"📦 ZIP — 2 TXT + 1 HTML ({len(results)} links)")
+    except Exception as e:
+        logger.warning(f"files pack zip fail: {e}")
+
 
 
 def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web Player", mini: bool = False) -> str:
@@ -5800,77 +6612,51 @@ async def _run_scrape_chunk_impl(update_or_query, context, target_url: str, star
             )
             return
 
-        await status_msg.edit_text(f"✅ Total {len(results)} Videos Extracted!{iplock_hint(results)}\n2 TXT aur 2 HTML files generate ho rahi hain...")
+        await status_msg.edit_text(
+            f"✅ {len(results)} videos extracted!{iplock_hint(results)}\n"
+            f"🎬 Player HTML generate ho raha hai..."
+        )
 
-        # FILE 1: FULL DETAILS TXT
-        txt_full_content = f"--- Scraped Video Links Full (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
-        for idx, item in enumerate(results, 1):
-            txt_full_content += f"{idx}. Title: {item['title']}\n"
-            txt_full_content += f"   Source Listing Page: {item['source_page']}\n"
-            txt_full_content += f"   Permanent Video Page: {item['page_url']}\n"
-            txt_full_content += f"   Direct Stream Link: {item['download_link']}\n" + exp_line(item) + "\n"
+        uid = _uid_of(update_or_query)
+        domain = normalize_domain(target_url)
+        _store_scrape(uid, results, start_page, end_page, target_url, domain)
 
-        txt_full_bytes = io.BytesIO(txt_full_content.encode('utf-8'))
-        txt_full_bytes.name = f"scraped_p{start_page}_to_p{end_page}_full.txt"
-
-        # FILE 2: SIMPLE TXT
-        txt_simple_content = f"--- Simple Video Stream Links (Pages {start_page}-{end_page} | {len(results)} Items) ---\n\n"
-        for idx, item in enumerate(results, 1):
-            txt_simple_content += f"{item['title']}: {item['download_link']}\n"
-
-        txt_simple_bytes = io.BytesIO(txt_simple_content.encode('utf-8'))
-        txt_simple_bytes.name = f"scraped_p{start_page}_to_p{end_page}_simple.txt"
-
-        # FILE 3: FULL WEB APP HTML
+        # ONLY 1 Full Web App HTML (Player UI)
         html_web_app = generate_web_app_html(results, title=f"Media Player ({start_page}-{end_page})")
-        html_full_bytes = io.BytesIO(html_web_app.encode('utf-8'))
-        html_full_bytes.name = f"scraped_p{start_page}_to_p{end_page}_full.html"
+        html_full_bytes = io.BytesIO(html_web_app.encode("utf-8"))
+        html_full_bytes.name = f"player_p{start_page}_to_p{end_page}.html"
 
-        # FILE 4: SIMPLE LIST HTML
-        html_simple_content = f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Scraped Stream Links Simple ({start_page}-{end_page})</title>
-<style>
-body {{ font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
-.card {{ background: #1e1e1e; padding: 15px; margin-bottom: 12px; border-radius: 8px; border-left: 5px solid #00cc66; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}
-a {{ color: #4da6ff; word-break: break-all; text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-.tag {{ display: inline-block; background: #00cc66; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; margin-left: 8px; }}
-</style></head><body><h2>Scraped Direct Stream Links ({start_page}-{end_page}) - Simple Version</h2>"""
-
-        for idx, item in enumerate(results, 1):
-            html_simple_content += f"""<div class="card">
-<h3>{idx}. {_html.escape(item['title'])} <span class="tag">{item['type']}</span></h3>
-<p><strong>⚡ Stream URL:</strong> <a href="{_html.escape(item['download_link'])}" target="_blank">{_html.escape(item['download_link'])}</a></p>
-</div>"""
-        html_simple_content += "</body></html>"
-
-        html_simple_bytes = io.BytesIO(html_simple_content.encode('utf-8'))
-        html_simple_bytes.name = f"scraped_p{start_page}_to_p{end_page}_simple.html"
-
-        context.user_data['last_url'] = target_url
-        context.user_data['next_start'] = end_page + 1
+        context.user_data["last_url"] = target_url
+        context.user_data["next_start"] = end_page + 1
 
         next_start = end_page + 1
         next_end = next_start + 9
-
         keyboard = [
-            [InlineKeyboardButton(f"▶️ Continue (Pages {next_start}-{next_end})", callback_data="continue_scrape")],
-            [InlineKeyboardButton("🛑 Stop Scraping", callback_data="stop_scrape")]
+            [
+                InlineKeyboardButton(f"▶️ Continue ({next_start}-{next_end})", callback_data="continue_scrape"),
+                InlineKeyboardButton("🛑 Stop", callback_data="stop_scrape"),
+            ],
+            [InlineKeyboardButton("📁 Files (2 TXT + ZIP + HTML)", callback_data="files_pack")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update_or_query.message.reply_document(document=txt_full_bytes, caption=f"📁 Pages {start_page}-{end_page} Full TXT File ({len(results)} Links)")
-        await update_or_query.message.reply_document(document=txt_simple_bytes, caption=f"📁 Pages {start_page}-{end_page} Simple TXT File (Title: Direct Stream Link)")
-        await update_or_query.message.reply_document(document=html_full_bytes, caption=f"🌐 Pages {start_page}-{end_page} Full Web App HTML File (Interactive Player UI)")
-        await _send_exports(update_or_query.message.reply_document, results, f"p{start_page}_to_p{end_page}")
         await update_or_query.message.reply_document(
-            document=html_simple_bytes,
-            caption=f"🌐 Pages {start_page}-{end_page} Simple HTML File\n\nAage ke pages ({next_start} to {next_end}) scrape karne ke liye button click karein:",
-            reply_markup=reply_markup
+            document=html_full_bytes,
+            caption=(
+                f"🎬 Full Web App HTML (Player UI)\n"
+                f"📄 Pages {start_page}-{end_page} · {len(results)} videos\n"
+                f"⋮ Settings + Ambient player ke andar"
+            ),
+        )
+        await update_or_query.message.reply_text(
+            f"✅ Done · pages {start_page}-{end_page}\n"
+            f"▶️ Continue / 🛑 Stop / 📁 Files (2 TXT + 1 ZIP + 1 HTML):",
+            reply_markup=reply_markup,
         )
         await status_msg.delete()
     except Exception as e:
         logger.error(f"Error in run_scrape_chunk: {e}")
+
         await status_msg.edit_text(f"❌ Scraping error: {str(e)}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5942,9 +6728,12 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     if query.data == "stop_scrape":
         STOP_PROCESS[query.from_user.id] = True
         try:
-            await query.edit_message_caption(caption=(query.message.caption or "") + "\n\n🛑 Scraping Stopped By User.")
+            await query.edit_message_text("🛑 Scraping stopped.")
         except Exception:
-            pass
+            try:
+                await query.edit_message_caption(caption="🛑 Scraping stopped.")
+            except Exception:
+                pass
         return
 
     if query.data == "continue_scrape":
@@ -5957,6 +6746,20 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             return
 
         await run_scrape_chunk(query, context, target_url, start_page=start_page, end_page=end_page)
+        return
+
+    if query.data == "files_pack":
+        uid = query.from_user.id
+        pack = _LAST_SCRAPE.get(uid)
+        if not pack or not pack.get("results"):
+            await query.message.reply_text("❌ Files nahi mile. Pehle scrape karo.")
+            return
+        await query.message.reply_text("📁 Files pack bhej raha hoon (2 TXT + ZIP + HTML)...")
+        await send_files_pack(
+            query.message.reply_document,
+            pack["results"], pack["start"], pack["end"], pack.get("domain") or "scrape",
+        )
+        return
 
 # ==========================================================
 # /scr  ->  NEW-SITE FAST SCRAPER (auto domain-specific extractor)
@@ -6243,64 +7046,50 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
     return ordered, rep
 
 
-async def scr_send_files(chat, results: List[dict], start: int, end: int, domain: str, url: str, show_next: bool = True):
-    tag = f"{domain}_p{start}_to_p{end}"
-    full = f"--- {domain} | Pages {start}-{end} | {len(results)} Items ---\n\n"
-    simple = f"--- {domain} Simple Links (Pages {start}-{end} | {len(results)} Items) ---\n\n"
-    for i, it in enumerate(results, 1):
-        full += (f"{i}. Title: {it['title']}\n   Source Listing Page: {it['source_page']}\n"
-                 f"   Permanent Video Page: {it['page_url']}\n   Direct Stream Link: {it['download_link']}\n" + exp_line(it) + "\n")
-        simple += f"{it['title']}: {it['download_link']}\n"
+async def scr_send_files(chat, results: List[dict], start: int, end: int, domain: str, url: str, show_next: bool = True, user_id: int = 0):
+    """Send ONLY Full Web App HTML; Continue/Stop/Files on a separate message."""
+    uid = user_id or 0
+    if uid:
+        _store_scrape(uid, results, start, end, url, domain)
 
-    def mk(text: str, name: str):
-        b = io.BytesIO(text.encode('utf-8'))
+    def mk(data: str, name: str):
+        b = io.BytesIO(data.encode("utf-8"))
         b.name = name
         return b
 
-    cards = ""
-    for i, it in enumerate(results, 1):
-        cards += (f'<div class="card"><h3>{i}. {_html.escape(it["title"])} '
-                  f'<span class="tag">{it["type"]}</span></h3>'
-                  f'<p><a href="{_html.escape(it["download_link"])}" target="_blank">'
-                  f'{_html.escape(it["download_link"])}</a></p></div>')
-    simple_html = (
-        '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + _html.escape(domain) + '</title><style>'
-        'body{font-family:Segoe UI,sans-serif;background:#121212;color:#e0e0e0;margin:20px}'
-        '.card{background:#1e1e1e;padding:15px;margin-bottom:12px;border-radius:8px;border-left:5px solid #00cc66}'
-        'a{color:#4da6ff;word-break:break-all;text-decoration:none}'
-        '.tag{background:#00cc66;color:#fff;padding:2px 8px;border-radius:4px;font-size:12px}'
-        '</style></head><body><h2>' + _html.escape(domain) + f' ({start}-{end})</h2>' + cards + '</body></html>')
-
     nxt = end + 1
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"▶️ Continue (Pages {nxt}-{nxt + 9})", callback_data="scr_continue")],
-        [InlineKeyboardButton("🛑 Stop", callback_data="scr_stop")]])
+    kb_rows = [
+        [
+            InlineKeyboardButton(f"▶️ Continue ({nxt}-{nxt + 9})", callback_data="scr_continue"),
+            InlineKeyboardButton("🛑 Stop", callback_data="scr_stop"),
+        ],
+        [InlineKeyboardButton("📁 Files (2 TXT + ZIP + HTML)", callback_data="scr_files")],
+    ]
+    kb = InlineKeyboardMarkup(kb_rows)
 
     _html_full = generate_web_app_html(results, title=f"{domain} ({start}-{end})")
-    _zip_files = [
-        (f"{tag}_full.txt", full),
-        (f"{tag}_simple.txt", simple),
-        (f"{tag}_full.html", _html_full),
-        (f"{tag}_simple.html", simple_html),
-    ]
-    await chat.send_document(document=mk(full, f"{tag}_full.txt"), caption=f"📁 Full TXT ({len(results)} links)")
-    await chat.send_document(document=mk(simple, f"{tag}_simple.txt"), caption="📁 Simple TXT (Title: Stream Link)")
     await chat.send_document(
-        document=mk(_html_full, f"{tag}_full.html"),
-        caption="🌐 Full Web App HTML (Player UI)")
-    await _send_exports(chat.send_document, results, tag)
-    await chat.send_document(
-        document=mk(simple_html, f"{tag}_simple.html"),
-        caption=(f"🌐 Simple HTML\n\nAage ke pages ({nxt}-{nxt + 9}) ke liye button dabao:" if show_next
-                 else "🌐 Simple HTML (saare pages ho gaye)"),
-        reply_markup=kb if show_next else None)
-    try:
-        zbuf = pack_result_zip(tag, _zip_files)
-        if zbuf:
-            await chat.send_document(document=zbuf, caption=f"📦 ZIP: saari files ek me ({len(results)} links)")
-    except Exception as _ze:
-        logger.warning(f"zip pack fail: {_ze}")
-
+        document=mk(_html_full, f"player_{domain}_p{start}_to_p{end}.html"),
+        caption=(
+            f"🎬 Full Web App HTML (Player UI)\n"
+            f"📄 {domain} · pages {start}-{end} · {len(results)} videos\n"
+            f"⋮ Settings + Ambient player ke andar"
+        ),
+    )
+    if show_next:
+        await chat.send_message(
+            f"✅ Done · pages {start}-{end}\n"
+            f"▶️ Continue / 🛑 Stop / 📁 Files (2 TXT + 1 ZIP + 1 HTML):",
+            reply_markup=kb,
+        )
+    else:
+        await chat.send_message(
+            f"✅ Done · pages {start}-{end} (no more pages)\n"
+            f"📁 Files pack chahiye to button dabao:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📁 Files (2 TXT + ZIP + HTML)", callback_data="scr_files")],
+            ]),
+        )
 
 
 async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: int):
@@ -6377,7 +7166,7 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
     context.user_data['scr_url'] = url
     context.user_data['scr_next'] = end + 1
     shown_end = max(start, start + rep['pages_ok'] - 1) if all_mode else end
-    await scr_send_files(chat, results, start, shown_end, domain, url, show_next=not all_mode)
+    await scr_send_files(chat, results, start, shown_end, domain, url, show_next=not all_mode, user_id=user_id)
     try:
         await status.delete()
     except Exception:
@@ -6439,9 +7228,12 @@ async def scr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "scr_stop":
         STOP_PROCESS[q.from_user.id] = True
         try:
-            await q.edit_message_caption(caption=(q.message.caption or "") + "\n\n🛑 Stopped.")
+            await q.edit_message_text("🛑 Scraping stopped.")
         except Exception:
-            pass
+            try:
+                await q.edit_message_caption(caption="🛑 Scraping stopped.")
+            except Exception:
+                pass
         return
     if q.data == "scr_continue":
         url = context.user_data.get('scr_url')
@@ -6450,6 +7242,20 @@ async def scr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("❌ URL lost. /scr <url> dobara bhejo.")
             return
         await scr_run(q.message.chat, context, q.from_user.id, url, nxt, nxt + 9)
+        return
+
+    if q.data == "scr_files":
+        uid = q.from_user.id
+        pack = _LAST_SCRAPE.get(uid)
+        if not pack or not pack.get("results"):
+            await q.message.reply_text("❌ Files nahi mile. Pehle /scr chalao.")
+            return
+        await q.message.reply_text("📁 Files pack bhej raha hoon (2 TXT + ZIP + HTML)...")
+        await send_files_pack(
+            q.message.reply_document,
+            pack["results"], pack["start"], pack["end"], pack.get("domain") or "scrape",
+        )
+        return
 
 
 # ==========================================================
@@ -8652,7 +9458,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "2.5-fs-settings"
+BOT_VERSION = "2.8-files-pack"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
