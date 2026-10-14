@@ -6262,6 +6262,27 @@ html[data-font="poppins"]{--app-font:'Poppins',sans-serif}
 html[data-font="inter"]{--app-font:'Inter',sans-serif}
 html[data-font] body,html[data-font] body *{font-family:var(--app-font)!important}
 html[data-font] .clock-seconds,.calc-history,.vh-ptime,.clock-zone{font-family:'JetBrains Mono',monospace!important}
+
+/* music popup */
+.mpop{position:fixed;inset:0;z-index:80;background:rgba(0,0,0,.55);backdrop-filter:blur(10px);display:none;align-items:flex-end;justify-content:center;padding:16px}
+.mpop.on{display:flex}
+.mpop-card{width:min(420px,100%);border-radius:24px 24px 18px 18px;background:linear-gradient(165deg,var(--surface-hi),var(--surface-solid));border:1px solid var(--line-strong);box-shadow:var(--shadow-lg);padding:20px 18px 22px;animation:vhIn .35s ease}
+.mpop-art{width:120px;height:120px;border-radius:18px;margin:0 auto 14px;overflow:hidden;background:var(--surface);box-shadow:0 12px 30px var(--acc-glow)}
+.mpop-art img{width:100%;height:100%;object-fit:cover}
+.mpop-title{text-align:center;font-weight:700;font-size:16px;margin-bottom:4px}
+.mpop-artist{text-align:center;color:var(--muted);font-size:12px;margin-bottom:16px}
+.mpop-row{display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:14px}
+.mpop-row .mc-btn{width:44px;height:44px;border-radius:14px;background:var(--acc-soft);border:1px solid var(--line-strong);display:grid;place-items:center}
+.mpop-row .mc-btn.play{width:56px;height:56px;border-radius:18px;background:linear-gradient(135deg,var(--acc),var(--acc-2));color:var(--on-acc)}
+.mpop-row .mc-btn svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:2}
+.mpop-row .mc-btn.play svg{fill:currentColor;stroke:none}
+.mpop-vol{display:flex;align-items:center;gap:10px;padding:0 8px;margin-bottom:12px}
+.mpop-vol input{flex:1;accent-color:var(--acc)}
+.mpop-actions{display:flex;gap:10px}
+.mpop-actions button{flex:1;padding:12px;border-radius:14px;border:1px solid var(--line-strong);background:var(--surface);font-weight:600;font-size:13px}
+.mpop-actions button.fav.on{background:var(--acc-soft);border-color:var(--acc);color:var(--acc)}
+.mini{cursor:pointer}
+
 </style>
 </head>
 <body>
@@ -6622,6 +6643,29 @@ html[data-font] .clock-seconds,.calc-history,.vh-ptime,.clock-zone{font-family:'
   </div>
 </div>
 
+
+<div class="mpop" id="musicPop" onclick="if(event.target===this)closeMusicPop()">
+  <div class="mpop-card" onclick="event.stopPropagation()">
+    <div class="mpop-art"><img id="mpopArt" src="" alt=""></div>
+    <div class="mpop-title" id="mpopTitle">—</div>
+    <div class="mpop-artist" id="mpopArtist">—</div>
+    <div class="mpop-row">
+      <button class="mc-btn" onclick="Player.prev()" title="Previous"><svg viewBox="0 0 24 24"><polygon points="19 20 9 12 19 4 19 20" fill="currentColor" stroke="none"/><line x1="5" y1="19" x2="5" y2="5" stroke="currentColor"/></svg></button>
+      <button class="mc-btn play" id="mpopPlay" onclick="Player.toggle()" title="Play"><svg id="mpopPlayIcon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21" fill="currentColor"/></svg></button>
+      <button class="mc-btn" onclick="Player.next()" title="Next"><svg viewBox="0 0 24 24"><polygon points="5 4 15 12 5 20 5 4" fill="currentColor" stroke="none"/><line x1="19" y1="5" x2="19" y2="19" stroke="currentColor"/></svg></button>
+    </div>
+    <div class="mpop-vol">
+      <span style="font-size:12px;color:var(--muted)">Vol</span>
+      <input type="range" id="mpopVol" min="0" max="100" value="100" oninput="Player.setVol(this.value/100)">
+      <button type="button" onclick="Player.toggleMute()" style="font-size:12px;color:var(--acc)">Mute</button>
+    </div>
+    <div class="mpop-actions">
+      <button type="button" id="mpopFav" class="fav" onclick="toggleMusicFav()">♡ Favorite</button>
+      <button type="button" onclick="closeMusicPop()">Close</button>
+    </div>
+  </div>
+</div>
+
 <audio id="audioEl" preload="metadata"></audio>
 
 <script>
@@ -6667,6 +6711,26 @@ function loadSources(){try{return JSON.parse(localStorage.getItem(MX_KEY_SRC))||
 function saveSources(){try{localStorage.setItem(MX_KEY_SRC,JSON.stringify(MX.sources));return true;}catch(e){toast('Storage full');return false;}}
 
 /* PARSER */
+
+function thumbFromUrl(url, title){
+  const u=String(url||''), t=String(title||'Video');
+  let m=u.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{6,})/i);
+  if(m) return 'https://i.ytimg.com/vi/'+m[1]+'/hqdefault.jpg';
+  m=u.match(/vimeo\.com\/(?:video\/)?(\d+)/i);
+  if(m) return 'https://vumbnail.com/'+m[1]+'.jpg';
+  m=u.match(/(?:dailymotion\.com\/video\/|dai\.ly\/)([a-zA-Z0-9]+)/i);
+  if(m) return 'https://www.dailymotion.com/thumbnail/video/'+m[1];
+  // force unique visual thumb for ANY url (SVG gradient from hash)
+  let h=2166136261;
+  const src=t+'|'+u;
+  for(let i=0;i<src.length;i++){h^=src.charCodeAt(i);h=Math.imul(h,16777619);}
+  const c1='#'+(h>>>0).toString(16).slice(0,6).padStart(6,'0');
+  const c2='#'+((h*2654435761)>>>0).toString(16).slice(0,6).padStart(6,'0');
+  const label=(t||'VID').replace(/[<>&'"]/g,'').slice(0,22);
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="'+c1+'"/><stop offset="1" stop-color="'+c2+'"/></linearGradient></defs><rect width="640" height="360" fill="url(#g)"/><circle cx="320" cy="160" r="48" fill="rgba(255,255,255,.2)"/><polygon points="310,140 350,160 310,180" fill="#fff"/><text x="50%" y="78%" fill="#fff" font-size="22" font-family="system-ui,sans-serif" text-anchor="middle">'+label+'</text></svg>';
+  return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
+}
+
 function parseTxt(text,fileName,defaultThumb){
   const base=String(fileName||'Batch').replace(/\.txt$/i,'').replace(/_/g,' ').trim()||'Batch';
   const DEF=defaultThumb||MX_DEFAULT_THUMB;const combos={},order=[];let cur='Main Course',curThumb=DEF;
@@ -6689,14 +6753,14 @@ function parseTxt(text,fileName,defaultThumb){
     else if(/\.(jpe?g|png|webp|gif)/.test(lu))type='image';
     const c=ensure(cur);if(!c.subjects[subject])c.subjects[subject]={};const s=c.subjects[subject];
     if(!s[topic])s[topic]={'Videos':[],'PDFs':[],'Notes & Links':[]};
-    s[topic][folder].push({title:title||namePart,url,type});c.items++;if(type==='video')c.vids++;else if(type==='pdf')c.pdfs++;else c.notes++;
+    s[topic][folder].push({title:title||namePart,url,type,thumb:type==='video'?thumbFromUrl(url,title||namePart):''});c.items++;if(type==='video')c.vids++;else if(type==='pdf')c.pdfs++;else c.notes++;
   }
   return{base,combos,order};
 }
 function buildBatches(){
   const out=[];MX.sources.forEach(src=>{const p=parseTxt(src.text,src.name,src.thumb);p.order.forEach(name=>{const c=p.combos[name];if(!c.items)return;
     const idm=name.match(/^(\d+)\s*,\s*(.*)$/);const implicit=name==='Main Course';
-    out.push({key:src.id+'::'+name,title:implicit?p.base:(idm?idm[2].trim()||p.base:name),badge:idm?'#'+idm[1]:null,file:src.name,thumb:c.thumb,data:c,subjCount:Object.keys(c.subjects).length,vids:c.vids,pdfs:c.pdfs,notes:c.notes,items:c.items});});});
+    out.push({key:src.id+'::'+name,title:implicit?p.base:(idm?idm[2].trim()||p.base:name),badge:idm?'#'+idm[1]:null,file:src.name,thumb:(function(){try{for(const sub of Object.values(c.subjects||{})){for(const top of Object.values(sub||{})){const v=(top.Videos||[])[0];if(v){return v.thumb||thumbFromUrl(v.url,v.title||name);}}}}catch(e){}return c.thumb||thumbFromUrl(src.name||name,name);})(),data:c,subjCount:Object.keys(c.subjects).length,vids:c.vids,pdfs:c.pdfs,notes:c.notes,items:c.items});});});
   return out;
 }
 
@@ -6920,6 +6984,18 @@ function showPlayError(msg,url){
   row.append(dl,open);box.appendChild(row);stage.appendChild(box);
 }
 
+
+function captureVideoThumb(video,item){
+  try{
+    if(!video||!item)return;
+    const w=Math.min(640,video.videoWidth||320),h=Math.min(360,video.videoHeight||180);
+    if(!w||!h)return;
+    const c=document.createElement('canvas');c.width=w;c.height=h;
+    c.getContext('2d').drawImage(video,0,0,w,h);
+    item.thumb=c.toDataURL('image/jpeg',0.7);
+  }catch(e){}
+}
+
 function playItem(item){
   if(item.type!=='video'&&item.type!=='stream'){window.open(item.url,'_blank','noopener');return;}
   Lib.addHistory(item);
@@ -6946,7 +7022,7 @@ function playItem(item){
   v.playsInline=true;v.controls=false;v.preload='auto';
   v.style.cssText='width:100%;height:100%;object-fit:contain;background:#000';
   v.setAttribute('crossorigin','anonymous');
-  stage.appendChild(v);currentVideo=v;bindVideoEvents(v);
+  stage.appendChild(v);currentVideo=v;bindVideoEvents(v);try{v.addEventListener('loadeddata',function(){captureVideoThumb(v,item)},{once:true})}catch(e){}
 
   // ─── HLS ───
   if(fmt==='hls'&&window.Hls&&Hls.isSupported()){
@@ -7127,7 +7203,7 @@ const Player={audio:document.getElementById('audioEl'),st:{current:null,queue:[]
     this.audio.src=url;this.audio.play().then(()=>{this.st.isPlaying=true;document.getElementById('miniPlayer').classList.add('on');
       document.getElementById('miniTitle').textContent=track.title;document.getElementById('miniArtist').textContent=track.artist||'';
       document.getElementById('miniArtImg').src=track.artSmall||track.artwork||'';
-      document.getElementById('miniPlayIcon').innerHTML='<rect x="6" y="4" width="4" height="16" fill="currentColor" rx="1"/><rect x="14" y="4" width="4" height="16" fill="currentColor" rx="1"/>';
+      var _pi='<rect x="6" y="4" width="4" height="16" fill="currentColor" rx="1"/><rect x="14" y="4" width="4" height="16" fill="currentColor" rx="1"/>';document.getElementById('miniPlayIcon').innerHTML=_pi;var _mp=document.getElementById('mpopPlayIcon');if(_mp)_mp.innerHTML=_pi;syncMusicFavBtn();
     }).catch(()=>toast('Cannot play'));},
   toggle(){if(!this.st.current)return;if(this.audio.paused){this.audio.play();this.st.isPlaying=true;document.getElementById('miniPlayIcon').innerHTML='<rect x="6" y="4" width="4" height="16" fill="currentColor" rx="1"/><rect x="14" y="4" width="4" height="16" fill="currentColor" rx="1"/>';}
     else{this.audio.pause();this.st.isPlaying=false;document.getElementById('miniPlayIcon').innerHTML='<polygon points="5 3 19 12 5 21" fill="currentColor"/>';}},
@@ -7136,6 +7212,35 @@ const Player={audio:document.getElementById('audioEl'),st:{current:null,queue:[]
   setVol(v){this.st.vol=Math.max(0,Math.min(1,v));this.audio.volume=this.st.muted?0:this.st.vol;const s=document.getElementById('volSlider');if(s)s.value=Math.round(this.st.vol*100);},
   toggleMute(){this.st.muted=!this.st.muted;this.audio.volume=this.st.muted?0:this.st.vol;toast(this.st.muted?'Muted':'Unmuted');}
 };
+
+/* music popup + favorites */
+const MX_FAV_KEY='mx_music_favs';
+function loadMusicFavs(){try{return JSON.parse(localStorage.getItem(MX_FAV_KEY))||[]}catch(e){return[]}}
+function saveMusicFavs(a){try{localStorage.setItem(MX_FAV_KEY,JSON.stringify(a))}catch(e){}}
+function isMusicFav(id){return loadMusicFavs().some(x=>x.id===id)}
+function toggleMusicFav(){
+  const t=Player.st.current;if(!t){toast('No song');return}
+  let favs=loadMusicFavs();const id=t.id||t.downloadUrl||t.title;
+  if(isMusicFav(id)){favs=favs.filter(x=>x.id!==id);toast('Removed favorite')}
+  else{favs.unshift({id,title:t.title,artist:t.artist,downloadUrl:t.downloadUrl||t.preview,artSmall:t.artSmall||t.artwork});toast('Added favorite')}
+  saveMusicFavs(favs.slice(0,200));syncMusicFavBtn();
+}
+function syncMusicFavBtn(){
+  const t=Player.st.current,btn=document.getElementById('mpopFav');if(!btn)return;
+  const id=t?(t.id||t.downloadUrl||t.title):'';
+  const on=t&&isMusicFav(id);btn.classList.toggle('on',!!on);btn.textContent=on?'♥ Favorited':'♡ Favorite';
+}
+function openMusicPop(){
+  const t=Player.st.current;if(!t){toast('Play a song first');return}
+  const pop=document.getElementById('musicPop');if(!pop)return;
+  document.getElementById('mpopTitle').textContent=t.title||'—';
+  document.getElementById('mpopArtist').textContent=t.artist||'—';
+  document.getElementById('mpopArt').src=t.artSmall||t.artwork||'';
+  const vol=document.getElementById('mpopVol');if(vol)vol.value=Math.round((Player.st.vol||1)*100);
+  syncMusicFavBtn();pop.classList.add('on');
+}
+function closeMusicPop(){const pop=document.getElementById('musicPop');if(pop)pop.classList.remove('on')}
+
 async function searchSaavn(q){try{const r=await fetch('https://saavnapi-nine.vercel.app/result/?query='+encodeURIComponent(q)+'&lyrics=false');const j=await r.json();
   const arr=Array.isArray(j)?j:(j.data||j.results||[]);return arr.map(s=>({id:'s_'+s.id,title:s.song||s.name||s.title||'Unknown',artist:s.primary_artists||s.singers||'Unknown',
     artSmall:(s.image&&(s.image.find?.(x=>x.quality==='150x150')||s.image[0])?.url)||s.image||'',downloadUrl:s.media_url||s.mediaUrl||''})).filter(x=>x.title!=='Unknown');}catch(e){return[];}}
@@ -7234,6 +7339,8 @@ function init(){
         row.onclick=()=>Player.play(t,songs,i);box.appendChild(row);});},500);});
 
   loadDiscover();
+  document.getElementById('miniPlayer')?.addEventListener('click',function(e){if(e.target.closest('.mc-btn')||e.target.closest('input'))return;openMusicPop();});
+
 
   // Opening popup — show once, then always show app
   try{
@@ -7254,31 +7361,29 @@ init();
 
 
 def generate_mascot_x_html(simple_txt: str, batch_name: str = "Stream Links",
-                          username: str = "html", password: str = "7989") -> str:
-    """Mascotchlowa X HTML with Simple TXT (Title: Stream) auto-loaded + custom login."""
+                          username: str = None, password: str = None) -> str:
+    """Mascotchlowa X HTML with Simple TXT auto-loaded.
+    Default login stays permanent (html / 7989) unless username+password both provided.
+    """
     tpl = _MASCOT_X_TEMPLATE
-    u_js = json.dumps(username or "html")
-    p_js = json.dumps(password or "7989")
-    # bot Simple TXT format: "Title: https://stream..."
-    body = (simple_txt or "").strip()
-    if not body:
-        body = "# empty"
+    # optional custom login — only if BOTH given
+    if username and password:
+        u_js = json.dumps(username)
+        p_js = json.dumps(password)
+        if "if(u==='html'&&p==='7989')" in tpl:
+            tpl = tpl.replace(
+                "if(u==='html'&&p==='7989')",
+                f"if(u==={u_js}&&p==={p_js})",
+                1,
+            )
+    body = (simple_txt or "").strip() or "# empty"
     seed = [{
         "id": "seed_auto",
         "name": (batch_name or "Simple Stream Links")[:80],
         "text": body,
         "thumb": "https://images.unsplash.com/photo-1434030216411-0b793f4b4173?w=900&q=80",
     }]
-    # JSON safe for embedding inside <script>
     seed_js = json.dumps(seed, ensure_ascii=False).replace("<", "\u003c").replace(">", "\u003e")
-    # login credentials
-    if "if(u==='html'&&p==='7989')" in tpl:
-        tpl = tpl.replace(
-            "if(u==='html'&&p==='7989')",
-            f"if(u==={u_js}&&p==={p_js})",
-            1,
-        )
-    # FORCE Simple TXT into sources every open (ignore old localStorage)
     old_init = "MX.sources=loadSources();updateLoginUI();renderBatches();"
     new_init = (
         "try{var __seed=" + seed_js + ";"
@@ -7290,8 +7395,8 @@ def generate_mascot_x_html(simple_txt: str, batch_name: str = "Stream Links",
         tpl = tpl.replace(old_init, new_init, 1)
     else:
         logger.warning("mascot_x: init seed hook not found")
-    # also ensure after successful login batches refresh (already does)
     return tpl
+
 
 
 def _simple_txt_from_results(results: List[dict]) -> str:
@@ -8116,28 +8221,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Special Mascot X / /sky2 credentials (username:password)
     if context.user_data.get("await_mascot_creds"):
-        if text.lower() == "cancel":
+        low = text.lower().strip()
+        if low == "cancel":
             context.user_data.pop("await_mascot_creds", None)
             context.user_data.pop("sky2_pending_txt", None)
             context.user_data.pop("mascot_from", None)
             await update.message.reply_text("❎ Mascot X cancel.")
             return
+        # skip / default / empty -> permanent HTML password (html/7989)
+        if low in ("skip", "default", "ok", "-"):
+            await deliver_mascot_x(update, context, None, None)
+            return
         if ":" in text:
             user, pw = text.split(":", 1)
-        else:
-            parts = text.split(None, 1)
-            if len(parts) < 2:
-                await update.message.reply_text(
-                    "❌ Format: <code>username:password</code>\nExample: <code>html:7989</code>",
-                    parse_mode="HTML",
-                )
+            user, pw = user.strip(), pw.strip()
+            if not user or not pw:
+                await update.message.reply_text("❌ username:password dono chahiye, ya <code>skip</code>", parse_mode="HTML")
                 return
-            user, pw = parts[0], parts[1]
-        user, pw = user.strip(), pw.strip()
-        if not user or not pw:
-            await update.message.reply_text("❌ Username aur password dono chahiye.")
+            await deliver_mascot_x(update, context, user, pw)
             return
-        await deliver_mascot_x(update, context, user, pw)
+        parts = text.split(None, 1)
+        if len(parts) >= 2:
+            await deliver_mascot_x(update, context, parts[0].strip(), parts[1].strip())
+            return
+        await update.message.reply_text(
+            "Optional: <code>username:password</code>\n"
+            "Default password: <code>skip</code>",
+            parse_mode="HTML",
+        )
         return
 
     pending_domain = context.user_data.get('await_cookie')
@@ -8244,8 +8355,9 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         context.user_data["mascot_from"] = "scrape"
         await query.message.reply_text(
             "✨ <b>Special Mascot X HTML</b>\n\n"
-            "Username:Password bhejo (ek line me):\n"
-            "<code>html:7989</code>\n\n"
+            "Optional custom login (ek line):\n"
+            "<code>username:password</code>\n\n"
+            "Default password rakhna ho to: <code>skip</code>\n"
             "Cancel: <code>cancel</code>",
             parse_mode="HTML",
         )
@@ -8758,8 +8870,9 @@ async def scr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mascot_from"] = "scrape"
         await q.message.reply_text(
             "✨ <b>Special Mascot X HTML</b>\n\n"
-            "Username:Password bhejo (ek line me):\n"
-            "<code>html:7989</code>\n\n"
+            "Optional custom login (ek line):\n"
+            "<code>username:password</code>\n\n"
+            "Default password rakhna ho to: <code>skip</code>\n"
             "Cancel: <code>cancel</code>",
             parse_mode="HTML",
         )
@@ -9279,8 +9392,8 @@ async def sky2_from_file(update: Update, context: ContextTypes.DEFAULT_TYPE, doc
     await update.message.reply_text(
         f"📄 TXT received ({len(text_body.splitlines())} lines)\n"
         f"Title: {title}\n\n"
-        "Ab <b>username:password</b> bhejo (ek line):\n"
-        "<code>html:7989</code>\n\n"
+        "Optional custom login: <code>username:password</code>\n"
+        "Default password: <code>skip</code>\n"
         "Cancel: <code>cancel</code>",
         parse_mode="HTML",
     )
@@ -9308,7 +9421,7 @@ async def deliver_mascot_x(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         await update.message.reply_text("❌ Simple TXT empty.")
         return
     try:
-        html_out = generate_mascot_x_html(simple, batch_name=title, username=username, password=password)
+        html_out = generate_mascot_x_html(simple, batch_name=title, username=username or None, password=password or None)
     except Exception as e:
         logger.error(f"mascot_x generate: {e}")
         await update.message.reply_text(f"❌ HTML generate fail: {e}")
@@ -9319,9 +9432,9 @@ async def deliver_mascot_x(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         document=bio,
         caption=(
             f"✨ Mascotchlowa X HTML\n"
-            f"🔐 Login: {username} / (your password)\n"
-            f"📄 Simple TXT auto-loaded inside\n"
-            f"Open in browser → login → batches ready"
+            f"🔐 Login: {(username + ' / custom') if (username and password) else 'default (permanent)'}\n"
+            f"📄 Simple TXT auto-loaded · video thumbs forced\n"
+            f"Open browser → login → batches ready"
         ),
     )
     # clear one-shot state
@@ -11079,7 +11192,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "2.9.1-mascot-seed"
+BOT_VERSION = "2.9.2-mascot-ux"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
