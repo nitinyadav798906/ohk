@@ -7255,35 +7255,42 @@ init();
 
 def generate_mascot_x_html(simple_txt: str, batch_name: str = "Stream Links",
                           username: str = "html", password: str = "7989") -> str:
-    """Mascotchlowa X HTML with Simple TXT auto-loaded + custom login."""
+    """Mascotchlowa X HTML with Simple TXT (Title: Stream) auto-loaded + custom login."""
     tpl = _MASCOT_X_TEMPLATE
     u_js = json.dumps(username or "html")
     p_js = json.dumps(password or "7989")
+    # bot Simple TXT format: "Title: https://stream..."
+    body = (simple_txt or "").strip()
+    if not body:
+        body = "# empty"
     seed = [{
         "id": "seed_auto",
-        "name": (batch_name or "Stream Links")[:80],
-        "text": simple_txt or "",
+        "name": (batch_name or "Simple Stream Links")[:80],
+        "text": body,
         "thumb": "https://images.unsplash.com/photo-1434030216411-0b793f4b4173?w=900&q=80",
     }]
-    seed_js = json.dumps(seed, ensure_ascii=False)
+    # JSON safe for embedding inside <script>
+    seed_js = json.dumps(seed, ensure_ascii=False).replace("<", "\u003c").replace(">", "\u003e")
     # login credentials
-    tpl = tpl.replace(
-        "if(u==='html'&&p==='7989')",
-        f"if(u==={u_js}&&p==={p_js})",
-        1,
-    )
-    # auto-seed Simple TXT sources on first open
+    if "if(u==='html'&&p==='7989')" in tpl:
+        tpl = tpl.replace(
+            "if(u==='html'&&p==='7989')",
+            f"if(u==={u_js}&&p==={p_js})",
+            1,
+        )
+    # FORCE Simple TXT into sources every open (ignore old localStorage)
     old_init = "MX.sources=loadSources();updateLoginUI();renderBatches();"
     new_init = (
-        "MX.sources=loadSources();"
-        "if(!MX.sources.length){try{var __seed=" + seed_js + ";"
-        "if(__seed&&__seed.length){MX.sources=__seed;saveSources();}}catch(e){}}"
+        "try{var __seed=" + seed_js + ";"
+        "if(__seed&&__seed.length&&__seed[0].text){MX.sources=__seed;try{saveSources()}catch(_e){}}"
+        "else{MX.sources=loadSources()||[]}}catch(e){MX.sources=loadSources()||[]}"
         "updateLoginUI();renderBatches();"
     )
     if old_init in tpl:
         tpl = tpl.replace(old_init, new_init, 1)
     else:
         logger.warning("mascot_x: init seed hook not found")
+    # also ensure after successful login batches refresh (already does)
     return tpl
 
 
@@ -11072,7 +11079,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "2.9-mascot-x"
+BOT_VERSION = "2.9.1-mascot-seed"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
