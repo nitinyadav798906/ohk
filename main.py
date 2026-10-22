@@ -688,8 +688,13 @@ def px_usage_info() -> dict:
 _RF_CACHE: Dict[str, tuple] = {}
 
 
+def rf_path(page_url: str) -> str:
+    """Relative signed refresh path — client prefixes optional/auto PROXY_BASE."""
+    return f"/r?p={quote(page_url, safe='')}&s={px_sig(page_url, 'refresh')}"
+
+
 def rf_url(page_url: str) -> str:
-    return f"{PROXY_BASE}/r?p={quote(page_url, safe='')}&s={px_sig(page_url, 'refresh')}"
+    return (PROXY_BASE + rf_path(page_url)) if PROXY_BASE else ""
 
 
 async def _refresh_one(p: str) -> Optional[dict]:
@@ -3818,7 +3823,10 @@ function exportFav(){
   try{var b=new Blob([txt],{type:"audio/x-mpegurl"}),a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="favorites.m3u";document.body.appendChild(a);a.click();a.remove();toast("favorites.m3u download ho gayi")}catch(e){copy(txt)}
 }
 function gearMenu(anchor){
+  var pxb=getPxBase();
   showPop(anchor,[
+    {t:"\u2699  Proxy / PROXY_BASE"+(pxb?" \u2713":" (optional)"),f:function(){renderPb("proxy")}},
+    {t:"\uD83D\uDD04  Refresh all links",f:function(){refreshAll(ALL,function(){LIST=[];renderGrid()})}},
     {t:"\uD83D\uDD17  Play URL / MPD...",f:openUrlBox},
     {t:"\uD83D\uDDD1  Clear history ("+Object.keys(HIST).length+")",f:function(){clearList("hist")}},
     {t:"\uD83D\uDDD1  Clear favorites ("+Object.keys(FAV).length+")",f:function(){clearList("fav")}},
@@ -3862,18 +3870,44 @@ function go(it){location.hash="#/w/"+ALL.indexOf(it)}
 var V=$("#v"),PL=$("#pl"),hls=null,mp=null,dash=null,retries=0,hideT,lastSave=0,dragging=false,IMGV=$("#imgv");
 var CURQ="auto",SEEK_AT=0,CURURL="",CURENG="native",PXS={};
 var shakaPlayer=null,HOLD2X=false,HOLD_SPD=1,PRELOAD_V=null,PRELOAD_U="",BUF_TOAST_T=0;
+function getPxBase(){
+  /* PROXY_BASE optional — auto: user LS → server CFG → same-origin (Mini App / hosted) */
+  var b=(LS.get("ytb_px_base","")||"").toString().trim().replace(/\/$/,"");
+  if(b)return b;
+  if(CFG.pxBase)return String(CFG.pxBase).replace(/\/$/,"");
+  try{if(/^https?:$/.test(location.protocol)&&location.host)return location.origin}catch(e){}
+  return "";
+}
 function PXON(it){
   if(PXS[it.u]!==undefined)return PXS[it.u];
-  var mode=LS.get("ytb_px_mode","auto")||"auto";
+  var mode=LS.get("ytb_px_mode",CFG.pxMode||"auto")||"auto";
   if(mode==="off"||LS.get("ytb_px",true)===false)return false;
-  if(mode==="on")return !!(it.x||LS.get("ytb_px_base",""));
-  return !!(it.x&&it.xa);
+  var hasPx=!!(it.x||it.xp||getPxBase());
+  if(mode==="on")return hasPx;
+  return !!(it.xa&&hasPx);
 }
 function pxUrlFor(it,u){
+  if(it.x&&String(it.x).indexOf("http")===0)return it.x;
+  var base=getPxBase();
+  if(it.xp&&base)return base+(it.xp.charAt(0)==="/" ? it.xp : "/"+it.xp);
   if(it.x)return it.x;
-  var base=(LS.get("ytb_px_base","")||"").replace(/\/$/,"");
-  if(!base||!u)return "";
-  try{return base+"/p?u="+encodeURIComponent(u)+(it.p?"&r="+encodeURIComponent(it.p):"")}catch(e){return ""}
+  return "";
+}
+function resolveRf(it){
+  if(!it)return "";
+  if(it.rf&&String(it.rf).indexOf("http")===0)return it.rf;
+  var path=it.rfp||it.rf||"";
+  if(!path)return "";
+  if(String(path).indexOf("http")===0)return path;
+  var base=getPxBase();
+  if(!base)return "";
+  return base+(path.charAt(0)==="/" ? path : "/"+path);
+}
+function canRefresh(it){
+  if(!it)return false;
+  if(it.rf&&String(it.rf).indexOf("http")===0)return true;
+  if(it.rfp||(it.rf&&String(it.rf).charAt(0)==="/"))return !!getPxBase();
+  return false;
 }
 function reloadCur(at,cors){var o={keepQ:true,at:at};if(cors)o.cors=true;if(CUR&&CURURL!==CUR.x)o.url=CURURL;loadItem(CUR,o)}
 function b64u(x){x=(x||"").trim();if(/^[0-9a-fA-F]+$/.test(x)&&x.length%2===0){var s="";for(var i=0;i<x.length;i+=2)s+=String.fromCharCode(parseInt(x.substr(i,2),16));return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}return x}
@@ -4024,15 +4058,15 @@ function showErr(msg,it){
     extLinks(it.u).forEach(function(x){var a=el("a","",x.n==="Open link"?"Open / Download":x.n);a.href=x.h;a.target="_blank";a.rel="noopener noreferrer";box.appendChild(a)});
     var eHard=HARD_EXT.indexOf(extOf(it.u))>-1||["HEVC","MKV","AVI","WMV"].indexOf(fmtOf(it))>-1;
     if(eHard){var fn=el("button","","Force try in browser");fn.onclick=function(){loadItem(CUR,{keepQ:true,forceNative:true,at:V.currentTime||0})};box.appendChild(fn)}
-    if(it.rf){var rb=el("button","","\uD83D\uDD04 Refresh link");rb.onclick=function(){setLoading(true);refreshItem(it,function(ok){if(ok){toast("Naya link mil gaya");loadItem(it,{keepQ:true})}else{setLoading(false);toast("Naya link nahi mila")}})};box.appendChild(rb)}
-    if(it.x){var usingPx=(CURURL===it.x),pb=el("button","",usingPx?"Try direct (no proxy)":"Try via bot proxy");pb.onclick=function(){PXS[it.u]=!usingPx;loadItem(CUR,{keepQ:true,at:V.currentTime})};box.appendChild(pb)}
+    if(canRefresh(it)){var rb=el("button","","\uD83D\uDD04 Refresh link");rb.onclick=function(){setLoading(true);refreshItem(it,function(ok){if(ok){toast("Naya link mil gaya");loadItem(it,{keepQ:true})}else{setLoading(false);toast("Naya link nahi mila")}})};box.appendChild(rb)}
+    if(it.x||it.xp){var usingPx=!!(CURURL&&(CURURL===it.x||(it.xp&&String(CURURL).indexOf(it.xp)>=0))),pb=el("button","",usingPx?"Try direct (no proxy)":"Try via bot proxy");pb.onclick=function(){PXS[it.u]=!usingPx;loadItem(CUR,{keepQ:true,at:V.currentTime})};box.appendChild(pb)}
     var cp=el("button","","Copy link");cp.onclick=function(){copy(it.u)};box.appendChild(cp);
   }
   e.appendChild(box);
 }
 function fail(it,why){
   var key=it.p||it.u,now=Date.now();
-  if(it.rf&&!(RFTRIED[key]&&now-RFTRIED[key]<600000)){          /* link expire ho gayi ho sakti hai -> khud refresh */
+  if(canRefresh(it)&&!(RFTRIED[key]&&now-RFTRIED[key]<600000)){          /* link expire -> force refresh (PROXY_BASE optional/auto) */
     RFTRIED[key]=now;toast("Link refresh ho rahi...");setLoading(true);
     refreshItem(it,function(ok){if(ok&&CUR===it){toast("Naya link mil gaya");loadItem(it,{keepQ:true})}else showErr((why||"Ye stream browser me play nahi ho raha")+" ("+fmtOf(it)+"). Refresh se bhi naya link nahi mila:",it)});
     return;
@@ -4563,7 +4597,7 @@ var RFTRIED={},SPD=LS.get("ytb_spd",{}),AB={a:null,b:null},AUDONLY=false,SLEEPT=
 function setSpeed(v){V.playbackRate=v;$("#bSpd").textContent=v+"x";if(CUR){if(v===1)delete SPD[CUR.u];else SPD[CUR.u]=v;LS.set("ytb_spd",SPD)}}
 function applyFresh(it,nw){
   var old=it.u;
-  ["u","th","d","ip","v","rf"].forEach(function(k){if(nw[k]!==undefined)it[k]=nw[k]});
+  ["u","th","d","ip","v","rf","rfp","x","xp","xa","p"].forEach(function(k){if(nw[k]!==undefined)it[k]=nw[k]});
   if(nw.x!==undefined){it.x=nw.x;if(nw.xa)it.xa=nw.xa;else delete it.xa}else{delete it.x;delete it.xa}
   if(old!==it.u){
     delete BYURL[old];BYURL[it.u]=it;
@@ -4574,12 +4608,13 @@ function applyFresh(it,nw){
   }
 }
 function refreshItem(it,cb){
-  if(!it.rf){cb(false);return}
-  fetch(it.rf).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||"fail");return j})})
+  var url=resolveRf(it);
+  if(!url){cb(false);return}
+  fetch(url).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||"fail");return j})})
     .then(function(nw){applyFresh(it,nw);cb(true)}).catch(function(){cb(false)});
 }
 function refreshAll(list,done){
-  var todo=list.filter(function(x){return x.rf}),i=0,okn=0,run=0,fin=0;
+  var todo=list.filter(function(x){return canRefresh(x)}),i=0,okn=0,run=0,fin=0;
   if(!todo.length){toast("Is list me refresh-able link nahi");return}
   function next(){
     if(fin>=todo.length){toast("\uD83D\uDD04 "+okn+"/"+todo.length+" links refresh hui");if(done)done();return}
@@ -4767,8 +4802,8 @@ function renderPb(level){
   }else if(PBLEVEL==="tools"){
     box.appendChild(hd("More tools","main"));
     function rowBtn(label,sub,fn){var r=el("div","row2"),t_=el("div");t_.appendChild(el("div","",label));if(sub)t_.appendChild(el("small","",sub));r.appendChild(t_);r.onclick=fn;box.appendChild(r);return r}
-    if(CUR&&CUR.rf)rowBtn("\uD83D\uDD04  Refresh this link","Expire link ka naya stream page se",function(){pbClose();setLoading(true);refreshItem(CUR,function(ok){if(ok){toast("Naya link mil gaya");loadItem(CUR,{keepQ:true})}else{setLoading(false);toast("Naya link nahi mila")}})});
-    var rl=upList().filter(function(x){return x.rf});
+    if(CUR&&canRefresh(CUR))rowBtn("\uD83D\uDD04  Refresh this link","Expire link ka naya stream page se",function(){pbClose();setLoading(true);refreshItem(CUR,function(ok){if(ok){toast("Naya link mil gaya");loadItem(CUR,{keepQ:true})}else{setLoading(false);toast("Naya link nahi mila")}})});
+    var rl=upList().filter(function(x){return canRefresh(x)});
     if(rl.length)rowBtn("\uD83D\uDD04  Refresh all links ("+rl.length+")","Poori list ki links dobara nikalo",function(){pbClose();refreshAll(rl,function(){LIST=[];renderGrid()})});
     rowBtn("\uD83D\uDCAC  Subtitles","File ya URL (.srt / .vtt)",function(){renderPb("subs")});
     rowBtn("\uD83D\uDCCA  Live stats","Resolution / bitrate / buffer (i key)",function(){toggleStats();renderPb("tools")});
@@ -4811,14 +4846,15 @@ function renderPb(level){
     });
     box.appendChild(chips);
     var base=LS.get("ytb_px_base","")||"";
-    var lb2=el("div","lb");lb2.style.marginTop="10px";lb2.appendChild(el("div","","Custom PROXY_BASE URL"));box.appendChild(lb2);
-    var inp=el("input");inp.type="url";inp.placeholder="https://your-app.onrender.com";inp.value=base;
+    var lb2=el("div","lb");lb2.style.marginTop="10px";lb2.appendChild(el("div","","PROXY_BASE URL (optional)"));box.appendChild(lb2);
+    var inp=el("input");inp.type="url";inp.placeholder=CFG.pxBase||"https://your-bot.onrender.com (optional)";inp.value=base;
     inp.style.cssText="width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--tx);font-size:14px";
-    inp.onchange=inp.onblur=function(){var v=(inp.value||"").trim().replace(/\/$/,"");LS.set("ytb_px_base",v);toast(v?"Proxy base saved":"Proxy base cleared")};
+    inp.onchange=inp.onblur=function(){var v=(inp.value||"").trim().replace(/\/$/,"");LS.set("ytb_px_base",v);toast(v?"PROXY_BASE saved":"cleared — auto mode")};
     box.appendChild(inp);
-    var note=el("div","");note.style.cssText="font-size:12px;opacity:.75;margin:12px 0;line-height:1.4";
-    note.textContent="Browser system HTTP proxy set nahi kar sakta. Ye bot stream-proxy (/p?u=...) ko control karta hai. Custom base tab kaam karta hai jab item me ready proxy URL (x) na ho.";
+    var note=el("div","");note.style.cssText="font-size:12px;opacity:.75;margin:12px 0;line-height:1.45";
+    note.innerHTML="<b>Optional.</b> Refresh force chalega bina iske bhi jab:<br>• server ne absolute <code>rf</code> diya, ya<br>• Mini App / same-origin (<code>location.origin</code>), ya<br>• CFG.pxBase set hai<br>Active base: <code>"+(getPxBase()||"—")+"</code>";
     box.appendChild(note);
+    var tst=el("div","row2");tst.appendChild(el("div","","\uD83D\uDCE1  Test base"));tst.onclick=function(){proxyHealth()};box.appendChild(tst);
     var clr=el("div","row2");clr.appendChild(el("div","","Clear per-video proxy overrides"));clr.onclick=function(){PXS={};toast("Overrides cleared");if(CUR)loadItem(CUR,{keepQ:true})};box.appendChild(clr);
   }else if(PBLEVEL==="amb"){
     box.appendChild(hd("Ambient light","main"));
@@ -5533,11 +5569,12 @@ function ambPreset(name){
 
 /* ----- proxy health ----- */
 function proxyHealth(){
-  var base=(LS.get("ytb_px_base","")||"").replace(/\/$/,"")||(CFG.px?"":"");
-  if(!base&&!CFG.px){toast("PROXY_BASE set nahi");return}
-  var test=(base||location.origin)+"/";
+  var base=getPxBase();
+  if(!base){toast("Koi base nahi mila (optional field / same-origin)");return}
   toast("Proxy ping…");
-  fetch(test,{method:"GET",mode:"no-cors"}).then(function(){toast("Proxy host reachable (opaque)")}).catch(function(){toast("Proxy host fail")});
+  fetch(base+"/",{method:"GET",mode:"cors"}).then(function(r){toast("Base OK ("+r.status+")")}).catch(function(){
+    fetch(base+"/",{method:"GET",mode:"no-cors"}).then(function(){toast("Host reachable")}).catch(function(){toast("Base fail")});
+  });
 }
 
 /* ----- grid density ----- */
@@ -5771,14 +5808,21 @@ def load_ambient_cfg() -> dict:
 
 
 def _px_fields(it: dict) -> dict:
+    """rfp/xp = signed relative paths (always). rf/x absolute only if PROXY_BASE set.
+    HTML player auto-detects base (CFG / same-origin) — user PROXY_BASE optional."""
     d: dict = {}
-    if PROXY_BASE and str(it.get("page_url") or "").startswith("http"):
-        d["rf"] = rf_url(it["page_url"])                 # expire link ko page se dobara nikalne ke liye
+    page = str(it.get("page_url") or "")
+    if page.startswith("http"):
+        d["rfp"] = rf_path(page)
+        if PROXY_BASE:
+            d["rf"] = PROXY_BASE + d["rfp"]
     mode = (get_setting("proxy") or "auto").lower()
-    u = it["download_link"]
-    if not PROXY_BASE or mode == "off" or (it.get("type") or "VIDEO") in ("IMAGE", "PDF") or not u.startswith("http"):
+    u = it.get("download_link") or ""
+    if mode == "off" or (it.get("type") or "VIDEO") in ("IMAGE", "PDF") or not str(u).startswith("http"):
         return d
-    d["x"] = px_url(u, it.get("page_url") or "")
+    d["xp"] = px_path(u, page if page.startswith("http") else "")
+    if PROXY_BASE:
+        d["x"] = PROXY_BASE + d["xp"]
     if mode == "on" or px_needs(u, it.get("iplock") or ""):
         d["xa"] = 1
     return d
@@ -7419,6 +7463,7 @@ def generate_web_app_html(results: List[dict], title: str = "Scraped Video Web P
                 .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
     cfg = {"title": title, "owner": BOT_OWNER_NAME, "tg": TELEGRAM_LINK, "amb": load_ambient_cfg(), "px": bool(PROXY_BASE),
+           "pxBase": PROXY_BASE or "",
            "pxMode": (get_setting("proxy") or "auto"),
            "hash": hashlib.sha256(SKY_PASSWORD.encode("utf-8")).hexdigest() if SKY_PASSWORD else ""}
     if mini:
