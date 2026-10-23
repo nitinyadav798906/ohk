@@ -949,6 +949,8 @@ async def _mini_job_run(jid: str, uid: int, url, start: int, end: int):
             j["part"] = f"{idx}/{len(urls)}" if len(urls) > 1 else ""
 
             async def progress(done, total):
+                total = max(1, int(total or 1))
+                done = min(int(done or 0), total)
                 j["done"], j["total"] = done, total
 
             try:
@@ -2221,7 +2223,7 @@ async def build_page_urls(url: str, start: int, end: int) -> List[str]:
         return [url if p == 1 else tmpl.replace('{p}', str(p - 1))
                 for p in range(start, end + 1)]
 
-    if ("xhamster" in host or "xhaccess" in host) and '?' not in url:   # pages: /, /2, /3 ... (no probing)
+    if is_xhamster_family(host, url) and '?' not in url:
         base2 = re.sub(r'/\d+$', '', base)
         first = url if base2 == base else base2
         return [first if p == 1 else f"{base2}/{p}" for p in range(start, end + 1)]
@@ -3403,7 +3405,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
         async with limiter:
             r = await guarded_extract(v_url, src_p)
             limiter.feedback(v_url, bool(r))
-        state["done"] += 1
+        state["done"] = min(state["done"] + 1, total)
         if progress:
             try:
                 await progress(state["done"], total)
@@ -18692,6 +18694,8 @@ async def _run_scrape_chunk_impl(update_or_query, context, target_url: str, star
             if time.time() - last["t"] < 3:
                 return
             last["t"] = time.time()
+            total = max(1, int(total or 1))
+            done = min(int(done or 0), total)
             await status_msg.edit_text(f"⚡ Extracting {done}/{total} (Pages {start_page}-{end_page})...")
 
         results = await scrape_multi_pages_chunk(target_url, start_page=start_page,
@@ -19066,13 +19070,23 @@ def _scr_diag(html: str, page_url: str, links: List[str]) -> str:
 
 
 async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None, auto_end: bool = False):
-    """Fast scraper: parallel pages + parallel extraction + cache + retry + self-heal."""
+    """Fast scraper + hard job deadline (default 120s) so hang na ho — partial results OK."""
     _ensure_fast_executor()
     reset_host_stats(url)
     domain = normalize_domain(url)
     rep = {"pages_ok": 0, "pages_fail": [], "links": 0, "extracted": 0,
-           "cached": 0, "healed": False, "diag": ""}
+           "cached": 0, "healed": False, "diag": "", "timed_out": False}
     first_html: Dict[str, str] = {}
+    job_deadline = time.time() + float(os.getenv("SCR_JOB_DEADLINE", "120" if FAST_SCRAPE else "300"))
+
+    def _job_expired() -> bool:
+        if STOP_PROCESS.get(user_id):
+            return True
+        if time.time() >= job_deadline:
+            STOP_PROCESS[user_id] = True
+            rep["timed_out"] = True
+            return True
+        return False
 
     if _looks_like_single_video(url):
         r = await extract_video_link(url, source_page=url)
@@ -19085,10 +19099,13 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
     psem = asyncio.Semaphore(SCR_PAGE_CONCURRENCY)
 
     async def crawl(pu: str):
-        if STOP_PROCESS.get(user_id):
+        if _job_expired():
             return
         async with psem:
-            page = await fast_fetch(pu)
+            try:
+                page = await asyncio.wait_for(fast_fetch(pu), timeout=float(os.getenv("PAGE_FETCH_TIMEOUT", "12")))
+            except Exception:
+                page = None
         if not page:
             rep["pages_fail"].append(f"{pu} (HTTP {LAST_STATUS.get(pu, '?')})")
             return
@@ -19115,6 +19132,10 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
     else:
         await asyncio.gather(*[crawl(p) for p in page_urls])
     rep["links"] = len(url_to_source)
+    _max_v = int(os.getenv("SCR_MAX_VIDEOS", "100" if FAST_SCRAPE else "250"))
+    if len(url_to_source) > _max_v:
+        url_to_source = dict(list(url_to_source.items())[:_max_v])
+        rep["diag"] = ((rep.get("diag") or "") + f"\n⚡ First {_max_v} videos (SCR_MAX_VIDEOS)").strip()
 
     results: Dict[str, dict] = {}
     if url_to_source:
@@ -19123,7 +19144,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
         state = {"done": 0, "last": 0.0}
 
         async def work(v: str, s: str):
-            if STOP_PROCESS.get(user_id):
+            if _job_expired():
                 return
             hit = _STREAM_CACHE.get(v)
             if hit and hit.get("expires") and hit["expires"] < time.time() + 300:
@@ -19144,7 +19165,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
                         _STREAM_CACHE.clear()
                     results[v] = r
                     _STREAM_CACHE[v] = r
-            state["done"] += 1
+            state["done"] = min(state["done"] + 1, total)
             if progress and time.time() - state["last"] > 2.5:
                 state["last"] = time.time()
                 try:
@@ -19152,19 +19173,39 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
                 except Exception:
                     pass
 
-        await asyncio.gather(*[work(v, s) for v, s in url_to_source.items()])
+        left = max(8.0, job_deadline - time.time())
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*[work(v, s) for v, s in url_to_source.items()]),
+                timeout=left,
+            )
+        except asyncio.TimeoutError:
+            rep["timed_out"] = True
+            STOP_PROCESS[user_id] = True
+            logger.warning(f"scr deadline domain={domain} got={len(results)}/{total}")
 
         # ---- SELF-HEAL: saved rule stopped working (site changed) -> relearn once ----
         failed = [v for v in url_to_source if v not in results]
         if (get_site_rule(domain) and total >= 6 and len(results) < 0.3 * total
-                and not STOP_PROCESS.get(user_id)):
+                and not STOP_PROCESS.get(user_id) and not FAST_SCRAPE and not rep.get("timed_out")):
             try:
-                res = await build_auto_rule(url, domain)
+                res = await asyncio.wait_for(build_auto_rule(url, domain), timeout=20)
                 if res.get("ok"):
                     save_site_rule(domain, res["regex"], res["shapes"],
                                    res.get("strict", True), (res.get("note") or "") + " [auto-healed]")
                     rep["healed"] = True
-                    await asyncio.gather(*[work(v, url_to_source[v]) for v in failed])
+                    # re-extract failed only — DO NOT bump state["done"] again (fixes 758/480)
+                    async def heal_one(v):
+                        if STOP_PROCESS.get(user_id):
+                            return
+                        try:
+                            r = await guarded_extract(v, url_to_source[v])
+                            if r:
+                                results[v] = r
+                                _STREAM_CACHE[v] = r
+                        except Exception:
+                            pass
+                    await asyncio.gather(*[heal_one(v) for v in failed])
             except Exception as e:
                 logger.error(f"self-heal error {domain}: {e}")
 
@@ -19248,26 +19289,37 @@ async def scr_send_files(chat, results: List[dict], start: int, end: int, domain
 async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: int):
     domain = normalize_domain(url)
     STOP_PROCESS[user_id] = False
-    status = await chat.send_message(f"⚡ {domain} | Pages {start}-{end} ...")
+    xh_fast = is_xhamster_family(domain, url)
+    status = await chat.send_message(
+        f"⚡ {domain} | Pages {start}-{end}\n"
+        f"{'🚀 XH fast path' if xh_fast else '⏳ starting'} · /cancel se stop"
+    )
 
-    # ---- 0) age-gate / consent page? unlock it first (so rule-learning sees the real listing) ----
     gate_note = ""
-    try:
-        new_url = await scr_preflight(url)
-        if new_url != url or _root_host(urlparse(url).netloc) in _SCR_EXTRA_COOKIES:
-            gate_note = "🔓 Age-gate/consent page bypass hua\n"
-        url = new_url
-    except Exception as e:
-        logger.error(f"/scr preflight error {domain}: {e}")
+    if not xh_fast:
+        try:
+            new_url = await asyncio.wait_for(
+                scr_preflight(url), timeout=float(os.getenv("SCR_PREFLIGHT_TIMEOUT", "12")))
+            if new_url != url or _root_host(urlparse(url).netloc) in _SCR_EXTRA_COOKIES:
+                gate_note = "🔓 Age-gate/consent page bypass hua\n"
+            url = new_url
+        except Exception as e:
+            logger.error(f"/scr preflight error {domain}: {e}")
+    else:
+        gate_note = "🚀 XH fast (preflight skip)\n"
 
-    # ---- 1) NEW SITE? -> add to /site list + auto-build domain-specific extractor ----
     learn = gate_note
-    if not get_site_rule(domain) and not _is_builtin_domain(domain) and domain not in _RULE_FAILED:
+    if (not xh_fast and not get_site_rule(domain) and not _is_builtin_domain(domain)
+            and domain not in _RULE_FAILED):
+
         if domain not in get_all_sites():
             add_custom_site_db(domain, user_id)          # now visible in /site
-        await status.edit_text(f"{gate_note}🧩 Nayi site: {domain}\nAuto extractor ban raha hai (2-3 pages analyze)...")
+        await status.edit_text(f"{gate_note}🧩 Nayi site: {domain}\nAuto extractor (max 20s)...")
         try:
-            res = await build_auto_rule(url, domain)
+            if FAST_SCRAPE and os.getenv("SCR_AUTO_RULE", "0") != "1":
+                res = {"ok": False, "report": "FAST skip auto-rule"}
+            else:
+                res = await asyncio.wait_for(build_auto_rule(url, domain), timeout=20)
         except Exception as e:
             res = {"ok": False, "report": str(e)}
         if res.get("ok"):
@@ -19281,6 +19333,8 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
         await status.edit_text(f"{learn}⚡ Scraping Pages {start}-{end} ...")
 
     async def progress(done, total):
+        total = max(1, int(total or 1))
+        done = min(int(done or 0), total)
         await status.edit_text(f"{learn}⚡ Extracting {done}/{total} ...")
 
     try:
@@ -19300,6 +19354,8 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
         await status.edit_text(f"❌ Scraping error: {e}")
         return
 
+    if rep.get("timed_out"):
+        learn += "⏱️ Job deadline (SCR_JOB_DEADLINE) — partial/stop\n"
     if not results:
         msg = (f"{learn}❌ Koi video link nahi mila.\n"
                f"📄 Pages OK: {rep['pages_ok']} | 🚫 Failed: {rep['pages_fail'][:3]}\n"
@@ -20891,6 +20947,8 @@ def scrape_cache_get(url: str, start: int, end: int, max_age: int = 480):
 
 
 def scrape_cache_set(url: str, start: int, end: int, results, rep):
+    if rep.get("timed_out"):
+        learn += "⏱️ Job deadline (SCR_JOB_DEADLINE) — partial/stop\n"
     if not results:
         return
     if len(_SCRAPE_CACHE) > 80:
@@ -21142,6 +21200,8 @@ async def _watch_run(app, wid: int, uid: int, url: str, baselined: int):
     conn.commit()
     conn.close()
     results, rep = await scr_scrape(url, 1, 1, -abs(uid) - 1)      # pseudo user id: /stop se na ruke
+    if rep.get("timed_out"):
+        learn += "⏱️ Job deadline (SCR_JOB_DEADLINE) — partial/stop\n"
     if not results:
         return
     conn = sqlite3.connect(DB_FILE)
@@ -21742,7 +21802,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "3.0.2-2min"
+BOT_VERSION = "3.0.5-xhfast"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
