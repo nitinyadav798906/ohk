@@ -1656,6 +1656,24 @@ def _quick_streams(text: str, page_url: str, limit: int = 12) -> List[str]:
     return out
 
 
+
+def is_xhamster_family(domain: str = "", url: str = "", html: str = "") -> bool:
+    """xhamster.com + mirrors (xhaccess, xhamster46.desi, xhamsterN.*, etc.)."""
+    d = (domain or "").lower()
+    if "xhamster" in d or "xhaccess" in d:
+        return True
+    if re.search(r"xhamster\d*\.", d):
+        return True
+    if html and ("xhcdn.com" in html or "xplayerPluginSettings" in html or "window.initials" in html):
+        if "xhamster" in html.lower() or "xhcdn.com" in html:
+            return True
+    path = urlparse(url or "").path if url else ""
+    if re.search(r"/videos/[^/]*-xh[A-Za-z0-9]{4,}/?$", path):
+        return True
+    return False
+
+
+
 def _xh_parse(text: str) -> Optional[str]:
     return (xh_player_hls(text) or xh_best_stream(text)
             or (xh_from_initials(text) if 'initials' in text else None))
@@ -1814,8 +1832,10 @@ async def guarded_extract(v: str, s: str) -> Optional[dict]:
     """extract_video_link + hard timeout + blocked-host par turant skip."""
     if host_is_blocked(_root_host(urlparse(v).netloc)):
         return None
+    # SUPERFAST: 18s per video page (2-min total budget for typical batch)
+    _to = float(os.getenv("EXTRACT_TIMEOUT", "18" if FAST_SCRAPE else "45"))
     try:
-        return await asyncio.wait_for(extract_video_link(v, source_page=s), timeout=100)
+        return await asyncio.wait_for(extract_video_link(v, source_page=s), timeout=_to)
     except asyncio.TimeoutError:
         return None
 
@@ -1862,7 +1882,7 @@ def _fetch_once(url: str, referer: Optional[str] = None, use_cookie: bool = True
     root = _root_host(urlparse(url).netloc)
     st = _HOST_STATS.get(root)
     degraded = bool(st and st["ok"] == 0 and st["fail"] >= 6)   # lagataar fail -> fast-fail mode
-    tmo = (5, 8) if degraded else (6, 15)
+    tmo = (4, 6) if degraded else ((5, 10) if FAST_SCRAPE else (6, 15))
 
     engines = {}
     if cffi_requests:  # best against Cloudflare (real Chrome TLS fingerprint)
@@ -2018,7 +2038,9 @@ _BF_STATS: Dict[str, list] = {}      # root -> [ok, fail, last_fail_ts]  (browse
 
 
 def _browser_fetch_allowed(url: str) -> bool:
-    if not async_playwright or os.getenv("BROWSER_FETCH", "1") == "0":
+    if FAST_SCRAPE and os.getenv("BROWSER_FETCH", "0") != "1":
+        return False
+    if not async_playwright or os.getenv("BROWSER_FETCH", "0") == "0":
         return False
     if not re.search(r':(?:403|503|429|challenge)\b', LAST_DETAIL.get(url, "")):
         return False
@@ -2655,7 +2677,7 @@ async def dig_stream(text: str, video_url: str) -> Optional[str]:
     if _DIG_DEAD.get("n:" + root, 0) > time.time():
         return None
     stats = _DIG_STATS.setdefault(root, {})
-    deadline = time.time() + (16 if FAST_SCRAPE else 40)
+    deadline = time.time() + (8 if FAST_SCRAPE else 25)
     async with _dig_sem():
         for name, fn in _DIG_STAGES:
             if name in ("decode", "ytdlp"):             # ye pehle hi try ho chuke
@@ -3132,7 +3154,7 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
                         re.search(r'(https?:[^\s"\']*?\.m3u8[^\s"\']*)', text)
             if xhn_match: stream_link = xhn_match.group(1)
 
-        elif "xhamster" in domain or "xhaccess" in domain:   # xhaccess = xHamster mirror
+        elif is_xhamster_family(domain, video_url, text):   # xhamster + mirrors (*.desi, xhaccess, xhamster46…)
             xh_id = re.search(r'-((?:xh)?[A-Za-z0-9]{5,})/?$', urlparse(video_url).path)
             if xh_id and xh_id.group(1) not in text:
                 EXTRACT_NOTE["v"] = (f"{video_url}\n⚠️ Page me video-id nahi mila "
@@ -3147,7 +3169,7 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
                     cand = xh_match.group(1).replace('\\/', '/')
                     if not JUNK.search(cand.lower()):
                         xh_link = cand
-            if not xh_link:
+            if not xh_link and not FAST_SCRAPE:
                 xh_link = await xh_embed_try(video_url)
             if xh_link:
                 stream_link = xh_link
@@ -3260,14 +3282,15 @@ async def _extract_video_link_impl(video_url: str, source_page: str = "",
             if extra:
                 stream_link = await generic_extract(extra, video_url, depth=2)
 
-        if not stream_link and ytdlp_allowed(video_url):     # yt-dlp fallback (hazaaron sites)
+        if not stream_link and ytdlp_allowed(video_url) and (not FAST_SCRAPE or os.getenv("YTDLP_FAST", "0") == "1"):
             y = await ytdlp_try(video_url, source_page or None)
             if y:
                 stream_link = y[1]
                 if y[0] and title in ("Video", ""):
                     title = y[0]
 
-        if not stream_link:                      # kuch nahi mila -> iframe/API/browser se gehra dhundo
+        if not stream_link and not FAST_SCRAPE:
+            # dig (iframe/browser) is the slowest path — SUPERFAST me skip
             stream_link = await dig_stream(text, video_url)
 
         if not stream_link:
@@ -18070,8 +18093,8 @@ async def turbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"♻️ Turbo OFF — extract={SCR_CONCURRENCY} page={SCR_PAGE_CONCURRENCY} FAST={FAST_SCRAPE}")
         return
     FAST_SCRAPE = True
-    SCR_CONCURRENCY = max(SCR_CONCURRENCY, int(os.getenv("TURBO_CONCURRENCY", "96")))
-    SCR_PAGE_CONCURRENCY = max(SCR_PAGE_CONCURRENCY, int(os.getenv("TURBO_PAGE_CONCURRENCY", "36")))
+    SCR_CONCURRENCY = max(SCR_CONCURRENCY, int(os.getenv("TURBO_CONCURRENCY", "100")))
+    SCR_PAGE_CONCURRENCY = max(SCR_PAGE_CONCURRENCY, int(os.getenv("TURBO_PAGE_CONCURRENCY", "40")))
     try:
         from concurrent.futures import ThreadPoolExecutor
         asyncio.get_running_loop().set_default_executor(
@@ -18892,11 +18915,11 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 # ==========================================================
 # /scr  ->  NEW-SITE FAST SCRAPER (auto domain-specific extractor)
 # ==========================================================
-SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "64"))        # parallel video extractions (super-fast)
-SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "28"))   # parallel listing pages
+SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "80"))        # parallel video extractions (~2 min target)
+SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "32"))   # parallel listing pages
 SCR_MAX_PAGES = int(os.getenv("SCR_MAX_PAGES", "40"))
 SCR_ALL_MAX = int(os.getenv("SCR_ALL_MAX", "400"))
-_SCR_CACHE_TTL = int(os.getenv("SCR_CACHE_TTL", "420"))
+_SCR_CACHE_TTL = int(os.getenv("SCR_CACHE_TTL", "600"))
 FAST_SCRAPE = os.getenv("FAST_SCRAPE", "1").strip().lower() not in ("0", "off", "false", "no")
 _FETCH_CACHE: Dict[str, tuple] = {}
 _STREAM_CACHE: Dict[str, dict] = {}   # video page url -> extracted result (instant re-runs)
@@ -21719,7 +21742,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 # NEW FEATURES: version / proxy / quota / queue / ping / mirrors
 # ==========================================================
-BOT_VERSION = "3.0.1-fast"
+BOT_VERSION = "3.0.2-2min"
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(update.effective_user.id):
