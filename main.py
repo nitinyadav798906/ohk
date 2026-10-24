@@ -1644,7 +1644,8 @@ SKIP_EXT = ('.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
 BAD_PATH = re.compile(
     r'/(login|signin|register|signup|search|tags?|categories|category|cats?|'
     r'channels?|pornstars?|creators?|playlists?|collections?|models?|actors?|studios?|sites?|dmca|contact|terms|'
-    r'privacy|2257|upload|premium|history|favorites|page|blog|about|faq)(/|$)',
+    r'privacy|2257|upload|premium|history|favorites|page|blog|about|faq|'
+    r'dating|flirts?|cams?|chat|messages?|moments?|personals?)(/|$)',
     re.I)
 
 LISTING_END = re.compile(r'/(?:newest|best|trending|popular|latest|weekly|monthly|daily|alltime|top-rated)(?:/\d+)?/?$', re.I)
@@ -2030,6 +2031,13 @@ def find_video_links(html: str, page_url: str, use_rule: bool = True) -> List[st
         score[sh] += 1
         thumbs[sh] += int(th)
     top = max(score.values())
+
+    # xhamster creator/pornstar pages: dating ads ke thumbs zyada hote hain,
+    # asli videos/{slug} kam thumb ke saath bhi prefer karo
+    vid_shapes = {sh for sh, c in score.items()
+                  if c >= 2 and re.match(r'^(?:videos?|shorts?|watch|v|film|view_video)/', sh, re.I)}
+    if vid_shapes:
+        return [u for u, (sh, _) in items.items() if sh in vid_shapes][:120]
 
     def pick(min_count: int, need_thumb: bool):
         return {sh for sh, c in score.items()
