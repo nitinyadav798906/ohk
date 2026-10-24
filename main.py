@@ -3088,7 +3088,7 @@ async def scrape_multi_pages_chunk(url: str, start_page: int = 1, end_page: int 
     if not url_to_source:
         return []
 
-    limiter = AdaptiveLimiter(SCR_CONCURRENCY)
+    limiter = AdaptiveLimiter(host_concurrency(url))
     total = len(url_to_source)
     state = {"done": 0}
 
@@ -17689,25 +17689,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def turbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/turbo [off] — admin: is process me scrape limits ultra-high."""
-    global SCR_CONCURRENCY, SCR_PAGE_CONCURRENCY
+    global SCR_CONCURRENCY, SCR_PAGE_CONCURRENCY, XH_CONCURRENCY, XH_PAGE_CONCURRENCY
     if update.effective_user.id != ADMIN_ID:
         return
     args = [a.lower() for a in (context.args or [])]
     if args and args[0] in ("off", "normal", "0"):
         SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "48"))
-        SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "20"))
+        SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "24"))
+        XH_CONCURRENCY = int(os.getenv("XH_CONCURRENCY", "18"))
+        XH_PAGE_CONCURRENCY = int(os.getenv("XH_PAGE_CONCURRENCY", "16"))
         await update.message.reply_text(
-            f"♻️ Turbo OFF — concurrency={SCR_CONCURRENCY}, page={SCR_PAGE_CONCURRENCY}")
+            f"♻️ Turbo OFF — conc={SCR_CONCURRENCY}/{SCR_PAGE_CONCURRENCY} | "
+            f"xhamster={XH_CONCURRENCY}/{XH_PAGE_CONCURRENCY}")
         return
     SCR_CONCURRENCY = max(SCR_CONCURRENCY, int(os.getenv("TURBO_CONCURRENCY", "72")))
     SCR_PAGE_CONCURRENCY = max(SCR_PAGE_CONCURRENCY, int(os.getenv("TURBO_PAGE_CONCURRENCY", "28")))
+    XH_CONCURRENCY = max(XH_CONCURRENCY, int(os.getenv("TURBO_XH_CONCURRENCY", "28")))
+    XH_PAGE_CONCURRENCY = max(XH_PAGE_CONCURRENCY, int(os.getenv("TURBO_XH_PAGE", "22")))
     await update.message.reply_text(
         f"🚀 TURBO ON (is process)\n"
         f"• Video extract parallel: {SCR_CONCURRENCY}\n"
         f"• Listing page parallel: {SCR_PAGE_CONCURRENCY}\n"
+        f"• xhamster extract/page: {XH_CONCURRENCY}/{XH_PAGE_CONCURRENCY}\n"
         f"• Thread workers: {os.getenv('SCR_WORKERS', '96')}\n\n"
         f"Band: /turbo off\n"
-        f"Permanent ke liye env: SCR_CONCURRENCY / SCR_PAGE_CONCURRENCY / SCR_WORKERS")
+        f"Env: SCR_CONCURRENCY, XH_CONCURRENCY, XH_PAGE_CONCURRENCY")
 
 
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -18366,7 +18372,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Access Denied!")
         return
 
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip().lstrip("\ufeff")
+
+    # URL (kahin bhi) = naya scrape. Purane adhoore "waiting" modes hata do
+    # (warna https://... me ":" hone se mascot_creds / cookie flow URL ko password samajh leta hai)
+    _has_url = bool(re.search(r'https?://', text, re.I))
+    if _has_url:
+        for k in ("await_mascot_creds", "await_cookie", "cookie_flow", "cookie_merge",
+                  "sky2_pending_txt", "mascot_from"):
+            context.user_data.pop(k, None)
 
     # Special Mascot X / /sky2 credentials (username:password)
     if context.user_data.get("await_mascot_creds"):
@@ -18415,13 +18429,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cookie_flow_step(update, context, cf, text)
         return
 
-    url_match = re.search(r'(https?://[^\s]+)', text)
+    url_match = re.search(r'(https?://[^\s<>"\']+)', text)
 
     if not url_match:
-        await update.message.reply_text("❌ Valid URL bhejein!")
+        await update.message.reply_text("❌ Valid URL bhejein!\n\n💡 Agar pehle Sign In / Mascot X dabaya tha to pehle <code>cancel</code> bhejo.", parse_mode="HTML")
         return
 
-    target_url = url_match.group(1)
+    target_url = url_match.group(1).rstrip(".,;)]}>'\"")
     if re.search(r'\ball\b', text.replace(target_url, " "), re.I):       # "<url> all" -> saare pages
         context.user_data['scr_all'] = True
         await scr_run(update.effective_chat, context, user_id, target_url, 1, SCR_ALL_MAX)
@@ -18516,9 +18530,28 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 # /scr  ->  NEW-SITE FAST SCRAPER (auto domain-specific extractor)
 # ==========================================================
 SCR_CONCURRENCY = int(os.getenv("SCR_CONCURRENCY", "48"))        # parallel video-page extractions (ultra-fast)
-SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "20"))   # parallel listing-page fetches (ultra-fast)
+SCR_PAGE_CONCURRENCY = int(os.getenv("SCR_PAGE_CONCURRENCY", "24"))   # parallel listing-page fetches (ultra-fast)
 SCR_MAX_PAGES = 30          # max pages per single run
 SCR_ALL_MAX = int(os.getenv("SCR_ALL_MAX", "300"))   # /scr <url> all : itne pages tak (jaise hi naye links band, ruk jata hai)
+XH_CONCURRENCY = int(os.getenv("XH_CONCURRENCY", "18"))          # xhamster extract parallel (fast but not 48)
+XH_PAGE_CONCURRENCY = int(os.getenv("XH_PAGE_CONCURRENCY", "16"))  # xhamster listing pages parallel
+
+
+def host_concurrency(url: str) -> int:
+    """xhamster: high parallel = 403; 18 + adaptive limiter = fast + stable."""
+    h = urlparse(url).netloc.lower()
+    if "xhamster" in h or "xhaccess" in h or "xhnews" in h:
+        return max(4, XH_CONCURRENCY)
+    return SCR_CONCURRENCY
+
+
+def host_page_concurrency(url: str) -> int:
+    h = urlparse(url).netloc.lower()
+    if "xhamster" in h or "xhaccess" in h or "xhnews" in h:
+        return max(4, XH_PAGE_CONCURRENCY)
+    return SCR_PAGE_CONCURRENCY
+
+
 _SCR_CACHE_TTL = 300        # seconds, html cache
 _FETCH_CACHE: Dict[str, tuple] = {}
 _STREAM_CACHE: Dict[str, dict] = {}   # video page url -> extracted result (instant re-runs)
@@ -18592,6 +18625,26 @@ def scr_find_links(html: str, page_url: str) -> List[str]:
     synth = "".join(f'<a href="{u}"><img src="x"></a>' for u in dict.fromkeys(extra))
     more = find_video_links(html + synth, page_url)
     return more if len(more) > len(links) else links
+
+
+_CAT_INDEX_RX = re.compile(r'^/(?:categories|category|cats|tags|channels|niches)/?$', re.I)
+_CAT_ITEM_RX = re.compile(r'^/(?:categories|category|cats|tags|channels|niches)/[^/?#]+/?$', re.I)
+CAT_MAX = int(os.getenv("CAT_MAX", "40"))
+
+
+def find_category_links(html: str, page_url: str, limit: int = 40) -> List[str]:
+    """/categories index page se individual category URLs nikaalo (BAD_PATH unko skip karta hai)."""
+    root = _root_host(urlparse(page_url).netloc)
+    out: List[str] = []
+    for m in re.finditer(r'<a\b[^>]*?href=["\']([^"\']+)["\']', html, re.I):
+        full = fix_url(urljoin(page_url, m.group(1).replace('&amp;', '&')).split('#')[0])
+        pu = urlparse(full)
+        if (_root_host(pu.netloc) == root and _CAT_ITEM_RX.match(pu.path)
+                and full.rstrip('/') != page_url.rstrip('/') and full not in out):
+            out.append(full)
+            if len(out) >= limit:
+                break
+    return out
 
 
 async def scr_unlock_gate(url: str, html: str):
@@ -18673,6 +18726,36 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
            "cached": 0, "healed": False, "diag": ""}
     first_html: Dict[str, str] = {}
 
+    # /categories (index) — BAD_PATH category links skip karta hai, isliye alag handle
+    if _CAT_INDEX_RX.match(urlparse(url).path):
+        idx = await fast_fetch(url)
+        cats = find_category_links(idx, url, CAT_MAX) if idx else []
+        if cats:
+            merged, seen = [], set()
+            for i, c in enumerate(cats, 1):
+                if STOP_PROCESS.get(user_id):
+                    break
+                try:
+                    res, r2 = await scr_scrape(c, 1, 1, user_id)  # har category page 1
+                except Exception as e:
+                    logger.error(f"category {c}: {e}")
+                    continue
+                for it in res:
+                    if it["page_url"] not in seen:
+                        seen.add(it["page_url"])
+                        merged.append(it)
+                rep["pages_ok"] += r2.get("pages_ok", 0)
+                rep["links"] += r2.get("links", 0)
+                rep["pages_fail"] += r2.get("pages_fail") or []
+                if progress:
+                    try:
+                        await progress(i, len(cats))
+                    except Exception:
+                        pass
+            rep["extracted"] = len(merged)
+            rep["diag"] = f"📂 {len(cats)} categories scan hui"
+            return merged, rep
+
     if _looks_like_single_video(url):
         r = await extract_video_link(url, source_page=url)
         if r:
@@ -18681,7 +18764,8 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
 
     page_urls = [fix_url(x) for x in await build_page_urls(url, start, end)]
     url_to_source: Dict[str, str] = {}
-    psem = asyncio.Semaphore(SCR_PAGE_CONCURRENCY)
+    _page_conc = host_page_concurrency(url)
+    psem = asyncio.Semaphore(_page_conc)
 
     async def crawl(pu: str):
         if STOP_PROCESS.get(user_id):
@@ -18701,7 +18785,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
             url_to_source.setdefault(l, pu)
 
     if auto_end:        # "all" mode: pages ki waves, jis wave me naye links na aayein wahin ruk jao
-        wave = max(4, SCR_PAGE_CONCURRENCY)
+        wave = max(4, _page_conc)
         for i in range(0, len(page_urls), wave):
             if STOP_PROCESS.get(user_id):
                 break
@@ -18717,7 +18801,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
 
     results: Dict[str, dict] = {}
     if url_to_source:
-        esem = AdaptiveLimiter(SCR_CONCURRENCY)
+        esem = AdaptiveLimiter(host_concurrency(url))
         total = len(url_to_source)
         state = {"done": 0, "last": 0.0}
 
@@ -18735,7 +18819,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
                     r = await guarded_extract(v, s)
                     if (not r and not STOP_PROCESS.get(user_id)
                             and not host_is_blocked(_root_host(urlparse(v).netloc))):
-                        await asyncio.sleep(1)               # one quick retry
+                        await asyncio.sleep(0.35)            # quick retry (fast mode)
                         r = await guarded_extract(v, s)
                     esem.feedback(v, bool(r))
                 if r:
@@ -18744,7 +18828,7 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
                     results[v] = r
                     _STREAM_CACHE[v] = r
             state["done"] += 1
-            if progress and time.time() - state["last"] > 2.5:
+            if progress and time.time() - state["last"] > 2.0:
                 state["last"] = time.time()
                 try:
                     await progress(state["done"], total)
@@ -18752,6 +18836,14 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
                     pass
 
         await asyncio.gather(*[work(v, s) for v, s in url_to_source.items()])
+
+        # ---- RETRY PASS: 403/429 throttle ke baad failed pages slow se dubara ----
+        failed = [v for v in url_to_source if v not in results]
+        if failed and not STOP_PROCESS.get(user_id):
+            await asyncio.sleep(1.2)
+            _HOST_STATS.pop(_root_host(urlparse(url).netloc), None)  # blocked-flag reset
+            esem = AdaptiveLimiter(min(6, host_concurrency(url)))
+            await asyncio.gather(*[work(v, url_to_source[v]) for v in failed])
 
         # ---- SELF-HEAL: saved rule stopped working (site changed) -> relearn once ----
         failed = [v for v in url_to_source if v not in results]
@@ -18786,12 +18878,13 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
             ordered = [single]
             rep["links"] = max(rep["links"], 1)
 
+    raw_n = len(ordered)  # extract success, filters se pehle — health ratio sahi rahe
     ordered, dropped = clean_results(ordered)
     ordered = await verify_results(ordered, rep)
     rep["dropped"] = dropped
     rep["extracted"] = len(ordered)
     try:
-        record_health(url, rep["links"], len(ordered))
+        record_health(url, rep["links"], raw_n)
     except Exception:
         pass
     return ordered, rep
@@ -18914,7 +19007,8 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
 
     heal = " | 🩹 extractor auto-healed" if rep["healed"] else ""
     await status.edit_text(
-        f"{learn}✅ {len(results)}/{rep['links']} extracted (cache: {rep['cached']}){heal}{iplock_hint(results)}\nFiles bhej raha hoon...")
+        f"{learn}✅ {len(results)}/{rep['links']} extracted (cache: {rep['cached']}){heal}{iplock_hint(results)}\n"
+        f"{drop_hint()}Files bhej raha hoon...")
     context.user_data['scr_url'] = url
     context.user_data['scr_next'] = end + 1
     shown_end = max(start, start + rep['pages_ok'] - 1) if all_mode else end
@@ -20189,9 +20283,11 @@ class AdaptiveLimiter:
         self._wake()
 
     def feedback(self, url: str, ok: bool):
-        if LAST_STATUS.get(url) in (429, 503):
+        st = LAST_STATUS.get(url)
+        throttled = st in (403, 429, 503) or (isinstance(st, str) and ("challenge" in st or "redirect" in st))
+        if throttled:
             self.throttled += 1
-            self.limit = max(4, self.limit // 2)
+            self.limit = max(min(4, self.max), self.limit // 2)
         elif ok:
             self.ok += 1
             if self.ok % 12 == 0 and self.limit < self.max:
