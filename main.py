@@ -5880,8 +5880,8 @@ def _build_scrape_files(results: List[dict], start: int, end: int, domain: str =
 
 
 async def send_files_pack(send_document, results: List[dict], start: int, end: int, domain: str = "scrape"):
-    """Send: 2 TXT + 1 Player HTML + 1 ZIP (all together)."""
-    pack = _build_scrape_files(results, start, end, domain)
+    """Send: 2 TXT + 1 Player HTML + 1 ZIP (all together). Errors logged, partial send ok."""
+    pack = await asyncio.to_thread(_build_scrape_files, results, start, end, domain)
     tag = pack["tag"]
 
     def mk(data: str, name: str):
@@ -5889,18 +5889,25 @@ async def send_files_pack(send_document, results: List[dict], start: int, end: i
         b.name = name
         return b
 
-    await send_document(
-        document=mk(pack["full_txt"], f"{tag}_full.txt"),
-        caption=f"📁 Full TXT ({len(results)} links)",
-    )
-    await send_document(
-        document=mk(pack["simple_txt"], f"{tag}_simple.txt"),
-        caption=f"📁 Simple TXT (Title: Stream)",
-    )
-    await send_document(
-        document=mk(pack["player_html"], f"{tag}_player.html"),
-        caption=f"🌐 Full Web App HTML (Player UI)",
-    )
+    async def _one(name, data, caption):
+        try:
+            await send_document(document=mk(data, name), caption=caption)
+            return True
+        except Exception as e:
+            logger.error(f"send_files_pack {name}: {e}")
+            # ZIP-only fallback for this file
+            try:
+                zbuf = pack_result_zip(tag + "_" + name.replace(".", "_"), [(name, data)])
+                if zbuf:
+                    await send_document(document=zbuf, caption=caption + " (zip)")
+                    return True
+            except Exception as e2:
+                logger.error(f"send_files_pack zip {name}: {e2}")
+            return False
+
+    await _one(f"{tag}_full.txt", pack["full_txt"], f"📁 Full TXT ({len(results)} links)")
+    await _one(f"{tag}_simple.txt", pack["simple_txt"], f"📁 Simple TXT (Title: Stream)")
+    await _one(f"{tag}_player.html", pack["player_html"], f"🌐 Full Web App HTML (Player UI)")
     try:
         zbuf = pack_result_zip(tag, [
             (f"{tag}_full.txt", pack["full_txt"]),
@@ -18335,11 +18342,7 @@ async def _run_scrape_chunk_impl(update_or_query, context, target_url: str, star
         domain = normalize_domain(target_url)
         _store_scrape(uid, results, start_page, end_page, target_url, domain)
 
-        # ONLY 1 Full Web App HTML (Player UI)
-        html_web_app = generate_web_app_html(results, title=f"Media Player ({start_page}-{end_page})")
-        html_full_bytes = io.BytesIO(html_web_app.encode("utf-8"))
-        html_full_bytes.name = f"player_p{start_page}_to_p{end_page}.html"
-
+        # ONLY 1 Full Web App HTML (Player UI) — thread + error-safe
         context.user_data["last_url"] = target_url
         context.user_data["next_start"] = end_page + 1
 
@@ -18355,20 +18358,54 @@ async def _run_scrape_chunk_impl(update_or_query, context, target_url: str, star
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update_or_query.message.reply_document(
-            document=html_full_bytes,
-            caption=(
-                f"🎬 Full Web App HTML (Player UI)\n"
-                f"📄 Pages {start_page}-{end_page} · {len(results)} videos\n"
-                f"⋮ Settings + Ambient player ke andar"
-            ),
-        )
+        html_ok = False
+        try:
+            html_web_app = await asyncio.to_thread(
+                generate_web_app_html, results, f"Media Player ({start_page}-{end_page})")
+            html_full_bytes = io.BytesIO(html_web_app.encode("utf-8"))
+            html_full_bytes.name = f"player_p{start_page}_to_p{end_page}.html"
+            await update_or_query.message.reply_document(
+                document=html_full_bytes,
+                caption=(
+                    f"🎬 Full Web App HTML (Player UI)\n"
+                    f"📄 Pages {start_page}-{end_page} · {len(results)} videos\n"
+                    f"⋮ Settings + Ambient player ke andar"
+                ),
+            )
+            html_ok = True
+        except Exception as e:
+            logger.error(f"run_scrape_chunk HTML send fail: {e}")
+            try:
+                html_web_app = await asyncio.to_thread(
+                    generate_web_app_html, results, f"Media Player ({start_page}-{end_page})")
+                zbuf = pack_result_zip(
+                    f"player_p{start_page}_to_p{end_page}",
+                    [(f"player_p{start_page}_to_p{end_page}.html", html_web_app)],
+                )
+                if zbuf:
+                    await update_or_query.message.reply_document(
+                        document=zbuf,
+                        caption=(
+                            f"🎬 Full Web App HTML (ZIP fallback)\n"
+                            f"📄 Pages {start_page}-{end_page} · {len(results)} videos"
+                        ),
+                    )
+                    html_ok = True
+            except Exception as e2:
+                logger.error(f"run_scrape_chunk ZIP fallback: {e2}")
+                await update_or_query.message.reply_text(
+                    f"⚠️ HTML send fail: {str(e)[:120]}\n📁 Files button se try karo.")
+
+        note = "" if html_ok else "\n⚠️ HTML nahi gaya — 📁 Files se dobara."
         await update_or_query.message.reply_text(
-            f"✅ Done · pages {start_page}-{end_page}\n"
+            f"✅ Done · pages {start_page}-{end_page}{note}\n"
             f"▶️ Continue / 🛑 Stop / 📁 Files (2 TXT + 1 ZIP + 1 HTML):",
             reply_markup=reply_markup,
         )
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Error in run_scrape_chunk: {e}")
 
@@ -18899,7 +18936,8 @@ async def scr_scrape(url: str, start: int, end: int, user_id: int, progress=None
 
 
 async def scr_send_files(chat, results: List[dict], start: int, end: int, domain: str, url: str, show_next: bool = True, user_id: int = 0):
-    """Send ONLY Full Web App HTML; Continue/Stop/Files on a separate message."""
+    """Send ONLY Full Web App HTML; Continue/Stop/Files on a separate message.
+    Large result sets: generate HTML in thread + try/except so fail pe status stuck na rahe."""
     uid = user_id or 0
     if uid:
         _store_scrape(uid, results, start, end, url, domain)
@@ -18920,30 +18958,80 @@ async def scr_send_files(chat, results: List[dict], start: int, end: int, domain
     ]
     kb = InlineKeyboardMarkup(kb_rows)
 
-    _html_full = generate_web_app_html(results, title=f"{domain} ({start}-{end})")
-    await chat.send_document(
-        document=mk(_html_full, f"player_{domain}_p{start}_to_p{end}.html"),
-        caption=(
-            f"🎬 Full Web App HTML (Player UI)\n"
-            f"📄 {domain} · pages {start}-{end} · {len(results)} videos\n"
-            f"⋮ Settings + Ambient player ke andar"
-        ),
-    )
+    html_ok = False
+    err_msg = ""
+    try:
+        # heavy JSON+template: thread me generate (event loop block / timeout kam)
+        _html_full = await asyncio.to_thread(
+            generate_web_app_html, results, f"{domain} ({start}-{end})")
+        raw = _html_full.encode("utf-8")
+        # Telegram bot limit ~50MB; safety pehle ZIP try if very large
+        if len(raw) > 45_000_000:
+            zbuf = pack_result_zip(
+                f"player_{domain}_p{start}_to_p{end}",
+                [(f"player_{domain}_p{start}_to_p{end}.html", raw)],
+            )
+            if zbuf:
+                await chat.send_document(
+                    document=zbuf,
+                    caption=(
+                        f"🎬 Full Web App HTML (ZIP — file badi thi)\n"
+                        f"📄 {domain} · pages {start}-{end} · {len(results)} videos"
+                    ),
+                )
+                html_ok = True
+        else:
+            doc = mk(_html_full, f"player_{domain}_p{start}_to_p{end}.html")
+            await chat.send_document(
+                document=doc,
+                caption=(
+                    f"🎬 Full Web App HTML (Player UI)\n"
+                    f"📄 {domain} · pages {start}-{end} · {len(results)} videos\n"
+                    f"⋮ Settings + Ambient player ke andar"
+                ),
+            )
+            html_ok = True
+    except Exception as e:
+        err_msg = str(e)[:180]
+        logger.error(f"scr_send_files HTML fail ({len(results)} items): {e}")
+        # fallback: ZIP of HTML only (sometimes plain HTML upload fails on host)
+        try:
+            _html_full = await asyncio.to_thread(
+                generate_web_app_html, results, f"{domain} ({start}-{end})")
+            zbuf = pack_result_zip(
+                f"player_{domain}_p{start}_to_p{end}",
+                [(f"player_{domain}_p{start}_to_p{end}.html", _html_full)],
+            )
+            if zbuf:
+                await chat.send_document(
+                    document=zbuf,
+                    caption=(
+                        f"🎬 Full Web App HTML (ZIP fallback)\n"
+                        f"📄 {domain} · pages {start}-{end} · {len(results)} videos"
+                    ),
+                )
+                html_ok = True
+                err_msg = ""
+        except Exception as e2:
+            logger.error(f"scr_send_files ZIP fallback fail: {e2}")
+            err_msg = (err_msg or str(e2))[:180]
+
     if show_next:
+        note = "" if html_ok else f"\n⚠️ HTML send fail: {err_msg}\n📁 Files button se dobara try karo."
         await chat.send_message(
-            f"✅ Done · pages {start}-{end}\n"
+            f"✅ Done · pages {start}-{end}{note}\n"
             f"▶️ Continue / 🛑 Stop / 📁 Files (2 TXT + 1 ZIP + 1 HTML):",
             reply_markup=kb,
         )
     else:
+        note = "" if html_ok else f"\n⚠️ HTML send fail: {err_msg}"
         await chat.send_message(
-            f"✅ Done · pages {start}-{end} (no more pages)\n"
+            f"✅ Done · pages {start}-{end} (no more pages){note}\n"
             f"📁 Files pack chahiye to button dabao:",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📁 Files (2 TXT + ZIP + HTML)", callback_data="scr_files")],
             ]),
         )
-
 
 async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: int):
     domain = normalize_domain(url)
@@ -19020,7 +19108,17 @@ async def _scr_run_impl(chat, context, user_id: int, url: str, start: int, end: 
     context.user_data['scr_url'] = url
     context.user_data['scr_next'] = end + 1
     shown_end = max(start, start + rep['pages_ok'] - 1) if all_mode else end
-    await scr_send_files(chat, results, start, shown_end, domain, url, show_next=not all_mode, user_id=user_id)
+    try:
+        await scr_send_files(chat, results, start, shown_end, domain, url, show_next=not all_mode, user_id=user_id)
+    except Exception as e:
+        logger.error(f"scr_send_files outer: {e}")
+        try:
+            await chat.send_message(
+                f"⚠️ HTML/files bhejne me error: {str(e)[:150]}\n"
+                f"✅ {len(results)} links extract ho chuke hain — 📁 Files button se dobara try karo.",
+            )
+        except Exception:
+            pass
     try:
         await status.delete()
     except Exception:
@@ -21634,7 +21732,13 @@ def main():
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
     app = (ApplicationBuilder().token(BOT_TOKEN)
-           .concurrent_updates(True).post_init(_post_init).build())
+           .concurrent_updates(True)
+           .connect_timeout(30.0)
+           .read_timeout(60.0)
+           .write_timeout(120.0)
+           .pool_timeout(30.0)
+           .get_updates_read_timeout(40.0)
+           .post_init(_post_init).build())
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
