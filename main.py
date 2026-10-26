@@ -358,6 +358,268 @@ def clean_cookie(raw: str) -> str:
     c = re.sub(r'^cookie:\s*', '', c, flags=re.I)
     return c.encode('ascii', errors='ignore').decode('ascii').strip()
 
+
+def extract_faphouse2_paywall_break(url: str, proxy: Optional[dict] = None) -> Optional[str]:
+    """
+    FapHouse2 aggressive paywall bypass.
+    Targets: token extraction, API interception, stream CDN access.
+    """
+    try:
+        match = re.search(r'faphouse2\.com/(?:video/)?(\d+)', url, re.I)
+        if not match:
+            return None
+        
+        video_id = match.group(1)
+        
+        headers_aggressive = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Connection': 'keep-alive',
+            'DNT': '1'
+        }
+        
+        sess = requests.Session()
+        sess.headers.update(headers_aggressive)
+        
+        resp = sess.get(url, timeout=20, proxies=proxy, verify=False, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        
+        html = resp.text
+        
+        patterns_paywall_break = [
+            r'"hls"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"dash"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"m3u8"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"streamUrl"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"playUrl"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"videoUrl"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"video"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"source"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"sources"\s*:\s*\[\s*\{\s*"src"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"',
+            r'"url"\s*:\s*"(https://[^"\\]+\.(?:mp4|m3u8)[^"\\]*)"',
+            r'src="(https://[a-z0-9\-\.]+(?:cdn|stream|video)[^"]+\.(?:m3u8|mp4))"',
+            r'<source\s+src="(https://[^"]+\.(?:mp4|m3u8))"',
+            r'data-video="(https://[^"]+\.(?:mp4|m3u8))"',
+            r'data-stream="(https://[^"]+\.(?:mp4|m3u8))"',
+            r'data-hls="(https://[^"]+\.m3u8)"',
+            r'window\["__PLAYER_DATA__"\]\s*=\s*(\{[^}]+?"url"[^}]*\})',
+            r'window\.player\s*=\s*(\{[^}]+?"source"[^}]*\})',
+            r'var\s+config\s*=\s*(\{[^}]*?"video[^}]*\})',
+            r'const\s+videoData\s*=\s*(\{[^}]*?"url[^}]*\})',
+            r'"videoToken"\s*:\s*"([a-zA-Z0-9_\-]+)"',
+            r'"accessToken"\s*:\s*"([a-zA-Z0-9_\-\.]+)"',
+            r'"jwt"\s*:\s*"([a-zA-Z0-9_\-\.]+)"',
+        ]
+        
+        for pattern in patterns_paywall_break:
+            matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+            for match_str in matches:
+                if isinstance(match_str, str):
+                    clean = match_str.replace('\\/', '/').replace('\\"', '"').strip()
+                    if clean.startswith('http') and ('.mp4' in clean or '.m3u8' in clean):
+                        return clean
+                    
+                    if match_str.startswith('{'):
+                        try:
+                            data = json.loads(match_str)
+                            for key in ['url', 'src', 'videoUrl', 'streamUrl', 'playUrl', 'hls', 'dash', 'm3u8']:
+                                if key in data and isinstance(data[key], str):
+                                    if 'http' in data[key] and ('.mp4' in data[key] or '.m3u8' in data[key]):
+                                        return data[key].replace('\\/', '/').strip()
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+        
+        token_match = re.search(r'"accessToken"\s*:\s*"([a-zA-Z0-9_\-\.]+)"', html)
+        if token_match:
+            token = token_match.group(1)
+            api_urls = [
+                f'https://www.faphouse2.com/api/videos/{video_id}?token={token}',
+                f'https://api.faphouse2.com/v1/videos/{video_id}?accessToken={token}',
+                f'https://www.faphouse2.com/api/v1/video/{video_id}/stream?token={token}',
+            ]
+            
+            for api_url in api_urls:
+                try:
+                    resp_api = sess.get(api_url, timeout=15, proxies=proxy, verify=False)
+                    if resp_api.status_code == 200:
+                        data = resp_api.json()
+                        for key in ['url', 'videoUrl', 'streamUrl', 'playUrl', 'hls_url', 'dash_url', 'm3u8_url', 'source', 'stream']:
+                            if key in data and isinstance(data[key], str):
+                                if 'http' in data[key] and ('.mp4' in data[key] or '.m3u8' in data[key]):
+                                    return data[key].replace('\\/', '/').strip()
+                except Exception:
+                    continue
+        
+        cdn_patterns = [
+            r'https://[a-z0-9\-\.]*(?:cdn|stream|video|dl|download)[a-z0-9\-\.]*\.(?:com|net|io)/[^"\s]+\.(?:mp4|m3u8)',
+            r'https://[a-z0-9\-\.]+\.(?:cloudfront|akamai|fastly|bunnycdn)[^"\s]+\.(?:mp4|m3u8)',
+        ]
+        
+        for pattern in cdn_patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            for match in matches:
+                if match and ('http' in match):
+                    return match.replace('\\/', '/').strip()
+        
+        m3u8_patterns = re.findall(r'https://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
+        if m3u8_patterns:
+            for m3u8_url in m3u8_patterns:
+                if m3u8_url.count('.m3u8') == 1:
+                    return m3u8_url.replace('\\/', '/').strip()
+        
+        mp4_patterns = re.findall(r'https://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
+        if mp4_patterns:
+            for mp4_url in mp4_patterns:
+                if mp4_url.count('.mp4') == 1:
+                    return mp4_url.replace('\\/', '/').strip()
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"FapHouse2 paywall break error: {e}")
+        return None
+
+
+def extract_faphouse_video(url: str, proxy: Optional[dict] = None) -> Optional[str]:
+    """
+    FapHouse & FapHouse2 paywall bypass — extracts full video URL without login.
+    Handles: JSON API responses, HTML page scraping, embedded video data.
+    Returns: Full HTTPS video URL or None
+    """
+    try:
+        match = re.search(r'(?:faphouse2?\.com|www\.faphouse2?\.com)/(?:video/)?(\d+)', url, re.I)
+        if not match:
+            return None
+        
+        video_id = match.group(1)
+        domain = 'faphouse2.com' if 'faphouse2' in url.lower() else 'faphouse.com'
+        base_url = f'https://www.{domain}'
+        
+        headers = {
+            'User-Agent': DEFAULT_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Referer': f'{base_url}/video/{video_id}',
+            'Origin': base_url,
+            'Accept-Language': 'en-US,en;q=0.9',
+            'DNT': '1',
+            'Connection': 'keep-alive'
+        }
+        
+        api_endpoints = [
+            f'{base_url}/api/v2/videos/{video_id}',
+            f'{base_url}/api/videos/{video_id}',
+            f'https://api.{domain}/video/{video_id}',
+        ]
+        
+        headers_api = headers.copy()
+        headers_api['Accept'] = 'application/json, text/plain, */*'
+        headers_api['X-Requested-With'] = 'XMLHttpRequest'
+        
+        for api_url in api_endpoints:
+            try:
+                resp = requests.get(api_url, headers=headers_api, timeout=12, proxies=proxy, verify=False)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    
+                    video_url = None
+                    if isinstance(data, dict):
+                        video_url = (data.get('video_url') or 
+                                   data.get('url') or 
+                                   data.get('file') or
+                                   data.get('hls_url') or
+                                   data.get('dash_url') or
+                                   data.get('video') or
+                                   data.get('stream_url') or
+                                   data.get('src'))
+                        
+                        if isinstance(video_url, list) and video_url:
+                            video_url = next((v for v in video_url if isinstance(v, str) and 'http' in v), None)
+                        
+                        if video_url and isinstance(video_url, str) and ('http' in video_url):
+                            return video_url.replace('\\/', '/').strip()
+                    
+                    if 'files' in data and isinstance(data['files'], (dict, list)):
+                        files = data['files'] if isinstance(data['files'], list) else [data['files']]
+                        for f in files:
+                            if isinstance(f, dict):
+                                if 'url' in f:
+                                    return f['url'].replace('\\/', '/').strip()
+                                if 'video_url' in f:
+                                    return f['video_url'].replace('\\/', '/').strip()
+                    
+                    if 'qualities' in data and isinstance(data['qualities'], dict):
+                        for quality, url_data in sorted(data['qualities'].items(), reverse=True):
+                            if isinstance(url_data, str) and 'http' in url_data:
+                                return url_data.replace('\\/', '/').strip()
+                            elif isinstance(url_data, dict) and 'url' in url_data:
+                                return url_data['url'].replace('\\/', '/').strip()
+                    
+                    if 'source' in data and isinstance(data['source'], str):
+                        return data['source'].replace('\\/', '/').strip()
+                    
+            except (requests.RequestException, ValueError):
+                continue
+        
+        resp = requests.get(url, headers=headers, timeout=15, proxies=proxy, verify=False)
+        if resp.status_code == 200:
+            html = resp.text
+            
+            patterns = [
+                (r'"video_url"\s*:\s*"([^"\\]+(?:\\.[^"\\]*)*)"', 0),
+                (r'"url"\s*:\s*"(https://[^"]+\.(?:mp4|m3u8)[^"]*)"', 0),
+                (r'"(?:file|video|src)"\s*:\s*"(https://[^"]+(?:\.mp4|\.m3u8|/playlist)[^"]*)"', 0),
+                (r'"source"\s*:\s*"(https://[^"]+\.(?:mp4|m3u8))"', 0),
+                (r'data-video-url="([^"]+)"', 0),
+                (r'<source\s+src="(https://[^"]+\.(?:mp4|m3u8))"', 0),
+                (r'src=["\']?(https://[^"\'\s]+\.(?:mp4|m3u8))["\']?', 0),
+                (r'"videoUrl"\s*:\s*"(https://[^"\\]+(?:\\.[^"\\]*)*)"', 0),
+                (r"'video_url'\s*:\s*'([^']+)'", 0),
+                (r'hlsUrl["\']?\s*:\s*["\']?(https://[^"\']+\.m3u8)["\']?', 0),
+                (r'mp4Url["\']?\s*:\s*["\']?(https://[^"\']+\.mp4)["\']?', 0),
+                (r'data-src="(https://[^"]+\.(?:mp4|m3u8))"', 0),
+                (r'<video[^>]*src="(https://[^"]+\.(?:mp4|m3u8))"', 0),
+                (r'"stream"\s*:\s*"(https://[^"\\]+(?:\\.[^"\\]*)*)"', 0),
+                (r'<iframe[^>]+src="([^"]*(?:video|embed)[^"]*)"', 0),
+                (r'window\.initialState\s*=\s*(\{[^}]*"video[^}]*\})', 1),
+                (r'data\s*=\s*(\{[^}]*"url[^}]*\})', 1),
+            ]
+            
+            for pattern, is_json in patterns:
+                m = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+                if m:
+                    result = m.group(1)
+                    
+                    if is_json:
+                        try:
+                            data = json.loads(result)
+                            if isinstance(data, dict):
+                                for key in ['url', 'video_url', 'file', 'src', 'videoUrl']:
+                                    if key in data and isinstance(data[key], str):
+                                        if 'http' in data[key]:
+                                            return data[key].replace('\\/', '/').strip()
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                    else:
+                        clean_url = result.replace('\\/', '/').replace('\\"', '"').strip()
+                        if clean_url.startswith('http') and ('.mp4' in clean_url or '.m3u8' in clean_url):
+                            return clean_url
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"FapHouse extraction: {e}")
+        return None
+
 def parse_cookie_str(c: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for part in (c or "").split(';'):
@@ -21717,6 +21979,59 @@ async def mirrors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔗 Matches:\n" + "\n".join(f"• {h}" for h in hits[:40]))
 
 
+async def faphouse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_user_allowed(update.effective_user.id):
+        return
+    args = context.args or []
+    if not args or not re.match(r'^https?://', args[0], re.I):
+        await update.message.reply_text(
+            "⚡ FapHouse/FapHouse2 Paywall Bypass\n\n"
+            "/faphouse <url>\n\n"
+            "Supports:\n"
+            "• faphouse.com (standard extraction)\n"
+            "• faphouse2.com (aggressive paywall break)\n\n"
+            "Examples:\n"
+            "/faphouse https://www.faphouse.com/video/123456\n"
+            "/faphouse https://www.faphouse2.com/video/654321")
+        return
+    
+    url = args[0].strip()
+    is_faphouse2 = 'faphouse2' in url.lower()
+    
+    if is_faphouse2:
+        await update.message.reply_text("⚙️ FapHouse2: Aggressive paywall break in progress...\n(Token extraction → API hijack → Stream CDN capture)")
+    else:
+        await update.message.reply_text("🔄 Extracting video URL from HTML (no login needed)...")
+    
+    try:
+        proxy = proxy_dict()
+        
+        if is_faphouse2:
+            video_url = extract_faphouse2_paywall_break(url, proxy)
+        else:
+            video_url = extract_faphouse_video(url, proxy)
+        
+        if video_url:
+            await update.message.reply_text(
+                f"✅ PAYWALL BYPASSED — Full Video URL\n\n"
+                f"`{video_url}`\n\n"
+                f"📥 Download with:\n"
+                f"`yt-dlp \"{video_url}\"`\n\n"
+                f"Or stream directly in any player.",
+                parse_mode='Markdown',
+                disable_web_page_preview=True)
+        else:
+            await update.message.reply_text(
+                "❌ Paywall still holding.\n\n"
+                "Likely reasons:\n"
+                "• Video deleted/expired\n"
+                "• Region-locked\n"
+                "• New encryption method\n"
+                "• Cloudflare blocking")
+    
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
+
 
 def main():
     if not BOT_TOKEN:
@@ -21790,6 +22105,7 @@ def main():
     app.add_handler(CommandHandler("qrun", queue_run_command))
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("mirrors", mirrors_command))
+    app.add_handler(CommandHandler("faphouse", faphouse_command))
 
     # /scr buttons MUST be registered before the generic callback handler
     app.add_handler(CallbackQueryHandler(scr_callback, pattern=r"^scr_"))
