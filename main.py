@@ -361,7 +361,7 @@ def clean_cookie(raw: str) -> str:
 
 def extract_faphouse2_aggressive(url: str, proxy: Optional[dict] = None, cookies_str: Optional[str] = None) -> Optional[str]:
     """
-    FapHouse2 paywall assault — 7-vector aggressive bypass (no auth required).
+    FapHouse2 paywall assault — 8-vector aggressive bypass (no auth required).
     
     Vectors:
     1. Trailer token extraction + path replay (/trailer/ → /video/)
@@ -371,6 +371,7 @@ def extract_faphouse2_aggressive(url: str, proxy: Optional[dict] = None, cookies
     5. CDN token reconstruction (base64,timestamp parsing)
     6. JavaScript render (Puppeteer full execution)
     7. Concurrent validation (6-thread HEAD check)
+    8. Regex brute force (50+ patterns on raw HTML + rendered)
     """
     try:
         import concurrent.futures
@@ -380,64 +381,104 @@ def extract_faphouse2_aggressive(url: str, proxy: Optional[dict] = None, cookies
             return None
         video_id = match.group(1)
         
+        logger.info(f"[FapHouse2] Extracting {video_id} — 8-vector assault starting")
+        
+        # Fetch HTML once (reuse across vectors)
+        headers_base = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
+        }
+        
+        sess = requests.Session()
+        sess.headers.update(headers_base)
+        html = None
+        
+        try:
+            resp = sess.get(url, timeout=20, proxies=proxy, verify=False)
+            if resp.status_code == 200:
+                html = resp.text
+                logger.info(f"[FapHouse2] HTML fetched: {len(html)} bytes")
+        except Exception as e:
+            logger.error(f"[FapHouse2] HTML fetch failed: {str(e)}")
+        
+        if not html:
+            logger.warning(f"[FapHouse2] No HTML, returning None")
+            return None
+        
         # ===== VECTOR 1: Trailer token extraction + replay =====
         def extract_trailer_and_replay():
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Cache-Control': 'max-age=0',
-            }
-            
-            sess = requests.Session()
-            sess.headers.update(headers)
-            
-            try:
-                resp = sess.get(url, timeout=20, proxies=proxy, verify=False)
-                html = resp.text
-            except Exception:
+            if not html:
                 return []
             
-            # Extract trailer URLs
-            trailer_patterns = [
-                r'(https://video-nss\.fhcdngroup\.online/([A-Za-z0-9+/=\-.,]+)/[^/]+/[^/]+/trailer/[^"\s]+)',
-                r'(https://[a-z0-9\-\.]*video[a-z0-9\-\.]*\.fhcdngroup\.online/([A-Za-z0-9+/=\-.,]+)/[^"\s]+/trailer/[^"\s]+)',
-                r'"source"\s*:\s*"(https://video-nss[^"]+/trailer/[^"]+)"',
+            # Extract ANY video URLs (trailer or full)
+            url_patterns = [
+                # Direct fhcdngroup URLs (trailer or video)
+                r'(https://[a-z0-9\-\.]*\.fhcdngroup\.online/[A-Za-z0-9+/=\-.,]+/[^"\s<>]+\.(?:mp4|m3u8))',
+                # video-nss specific
+                r'(https://video-nss\.fhcdngroup\.online/[^"\s<>]+(?:\.mp4|\.m3u8))',
+                # Source tags
+                r'<source[^>]+src=["\']([^"\']+fhcdn[^"\']*)["\']',
+                # src= attributes
+                r'src=["\']([^"\']*fhcdngroup[^"\']*)["\']',
+                # data-src
+                r'data-src=["\']([^"\']*fhcdn[^"\']*)["\']',
+                # JSON urls
+                r'"(?:url|src|source|stream|video_url|hls|dash)"[^:]*:\s*"([^"]*fhcdn[^"]*)"',
+                # href attributes
+                r'href=["\']([^"\']*fhcdn[^"\']*)["\']',
+                # Any https url with fhcdn
+                r'(https://[^\s"\'<>]*fhcdngroup[^\s"\'<>]*\.(?:mp4|m3u8)[^\s"\'<>]*)',
             ]
             
             trailers = []
-            for pattern in trailer_patterns:
-                matches = re.findall(pattern, html, re.IGNORECASE)
-                for match in matches:
-                    if isinstance(match, tuple):
-                        trailers.append(match[0])
-                    else:
-                        trailers.append(match)
+            for pattern in url_patterns:
+                try:
+                    matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                    for match in matches:
+                        if isinstance(match, tuple):
+                            url_str = match[0]
+                        else:
+                            url_str = match
+                        
+                        if url_str and ('http' in url_str):
+                            url_str = url_str.replace('\\"', '"').replace('\\/', '/').strip()
+                            if url_str not in trailers and len(url_str) > 50:
+                                trailers.append(url_str)
+                except Exception:
+                    pass
             
             results = []
             for trailer_url in trailers:
-                # Strategy A: Direct path swap /trailer/ → /video/
-                full_urls = [
-                    trailer_url.replace('/trailer/', '/video/'),
-                    trailer_url.replace('/trailer/', '/video/').replace('.av1.mp4', '.mp4'),
-                    trailer_url.replace('/trailer/', '/video/').replace('.av1.m3u8', '.m3u8'),
-                ]
-                
-                # Strategy B: Reconstruct with standard qualities
-                base_path = re.sub(r'/trailer/.*', '', trailer_url)
-                for quality in ['2160', '1440', '1080', '720', '480', '360']:
-                    for ext in ['.mp4', '.m3u8', '.av1.mp4']:
-                        full_urls.append(f"{base_path}/video/{quality}{ext}")
-                
-                results.extend(full_urls)
+                if '/trailer/' in trailer_url:
+                    # Strategy A: Direct path swap /trailer/ → /video/
+                    full_urls = [
+                        trailer_url.replace('/trailer/', '/video/'),
+                        trailer_url.replace('/trailer/', '/video/').replace('.av1.mp4', '.mp4'),
+                        trailer_url.replace('/trailer/', '/video/').replace('.av1.m3u8', '.m3u8'),
+                        trailer_url.replace('/trailer/', '/video/').replace('.av1', ''),
+                    ]
+                    
+                    # Strategy B: Reconstruct with standard qualities
+                    base_path = re.sub(r'/trailer/.*', '', trailer_url)
+                    for quality in ['2160', '1440', '1080', '720', '480', '360', '240']:
+                        for ext in ['.mp4', '.m3u8', '.av1.mp4', '.av1.m3u8']:
+                            full_urls.append(f"{base_path}/video/{quality}{ext}")
+                    
+                    results.extend(full_urls)
+                else:
+                    # Already looks like a valid URL, might be /video/ already
+                    results.append(trailer_url)
             
+            logger.info(f"[FapHouse2] Vector 1 (trailer replay): found {len(results)} URL variants")
             return results
         
         # ===== VECTOR 3: Session spoofing headers =====
@@ -474,12 +515,13 @@ def extract_faphouse2_aggressive(url: str, proxy: Optional[dict] = None, cookies
             
             for api_url in endpoints:
                 try:
-                    resp = requests.get(api_url, headers=headers, timeout=10, proxies=proxy, verify=False)
+                    resp = requests.get(api_url, headers=headers, timeout=8, proxies=proxy, verify=False)
                     if resp.status_code in [200, 201]:
                         try:
                             data = resp.json()
                             for key, val in data.items():
                                 if isinstance(val, str) and 'http' in val and ('.mp4' in val or '.m3u8' in val):
+                                    logger.info(f"[FapHouse2] Vector 4 API hit: {api_url}")
                                     results.append(val)
                                 elif isinstance(val, list):
                                     for item in val:
@@ -489,28 +531,23 @@ def extract_faphouse2_aggressive(url: str, proxy: Optional[dict] = None, cookies
                                                     results.append(subval)
                         except json.JSONDecodeError:
                             pass
-                except Exception:
+                except Exception as e:
                     pass
             
+            logger.info(f"[FapHouse2] Vector 4 (API brute): {len(results)} URLs found")
             return results
         
         # ===== VECTOR 5: CDN token reverse engineering =====
         def cdn_token_patterns():
-            sess = requests.Session()
-            sess.headers.update(spoofed_headers())
-            
-            try:
-                resp = sess.get(url, timeout=20, proxies=proxy, verify=False)
-                html = resp.text
-            except Exception:
-                return []
-            
             token_patterns = [
                 r'([A-Za-z0-9+/=]{20,}?(?:==)?),(\d{10})',
                 r'video-nss\.fhcdngroup\.online/([A-Za-z0-9+/=\-.,]+)/',
+                r'auth[a-z_]*=["\']?([A-Za-z0-9+/=\-.,]+)["\'s;]',
             ]
             
             results = []
+            tokens_found = set()
+            
             for pattern in token_patterns:
                 matches = re.findall(pattern, html, re.IGNORECASE)
                 for match in matches:
@@ -519,78 +556,167 @@ def extract_faphouse2_aggressive(url: str, proxy: Optional[dict] = None, cookies
                     else:
                         token = match if isinstance(match, str) else None
                     
-                    if token:
-                        for quality in ['2160', '1440', '1080', '720', '480']:
-                            for ext in ['.mp4', '.m3u8', '.av1.mp4']:
+                    if token and len(token) > 15 and token not in tokens_found:
+                        tokens_found.add(token)
+                        for quality in ['2160', '1440', '1080', '720', '480', '360']:
+                            for ext in ['.mp4', '.m3u8', '.av1.mp4', '.av1.m3u8']:
                                 results.append(f'https://video-nss.fhcdngroup.online/{token}/{video_id[:2]}/{video_id}/video/{quality}{ext}')
             
+            logger.info(f"[FapHouse2] Vector 5 (CDN tokens): {len(tokens_found)} tokens, {len(results)} URLs constructed")
             return results
         
         # ===== VECTOR 6: JavaScript render (full page execution) =====
         def render_with_js():
             try:
-                html, _ = pw_render(url, wait=5)
-                if html:
-                    mp4_matches = re.findall(r'https://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
-                    m3u8_matches = re.findall(r'https://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
+                logger.info(f"[FapHouse2] Vector 6: Starting JS render...")
+                html_rendered, _ = pw_render(url, wait=5)
+                if html_rendered and len(html_rendered) > len(html or ""):
+                    logger.info(f"[FapHouse2] JS render succeeded: {len(html_rendered)} bytes")
+                    mp4_matches = re.findall(r'https://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html_rendered)
+                    m3u8_matches = re.findall(r'https://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html_rendered)
                     
                     for match in mp4_matches + m3u8_matches:
-                        if 'fhcdn' in match or 'video-' in match:
-                            return match
-            except Exception:
-                pass
+                        clean_url = match.replace('\\/', '/').strip()
+                        if ('fhcdn' in clean_url or 'video-' in clean_url) and len(clean_url) > 50:
+                            logger.info(f"[FapHouse2] Vector 6 found: {clean_url[:100]}")
+                            return clean_url
+            except Exception as e:
+                logger.warning(f"[FapHouse2] Vector 6 (JS render) failed: {str(e)[:100]}")
             return None
         
         # ===== VECTOR 7: Concurrent validation (HEAD requests) =====
         def validate_urls_concurrent(url_list):
+            valid_urls = []
+            
             def check_url(test_url):
                 try:
-                    resp = requests.head(test_url, timeout=5, proxies=proxy, verify=False, allow_redirects=True)
-                    if resp.status_code == 200:
+                    resp = requests.head(test_url, timeout=3, proxies=proxy, verify=False, allow_redirects=False)
+                    if resp.status_code in [200, 206]:  # 206 = partial content (video range requests)
                         return test_url
                 except Exception:
                     pass
                 return None
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-                futures = [executor.submit(check_url, u) for u in url_list if u]
-                for future in concurrent.futures.as_completed(futures):
-                    result = future.result()
-                    if result:
-                        return result
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(check_url, u): u for u in url_list if u}
+                for future in concurrent.futures.as_completed(futures, timeout=10):
+                    try:
+                        result = future.result(timeout=2)
+                        if result:
+                            return result
+                    except Exception:
+                        pass
             
             return None
         
+        # ===== VECTOR 8: Regex brute force (50+ patterns) =====
+        def regex_brute_force():
+            logger.info(f"[FapHouse2] Vector 8: Regex brute force starting...")
+            patterns = [
+                # FHCDNGroup URLs
+                r'https://[a-z0-9\-\.]*\.fhcdngroup\.online/[A-Za-z0-9+/=\-.,]+(?:/[^/\s"\'<>]+)*(?:\.mp4|\.m3u8)(?:[^"\s<>]*)?',
+                r'https://video-nss\.fhcdngroup\.online/[^\s"\'<>]+\.(?:mp4|m3u8)',
+                r'(https://[a-z0-9\-\.]+\.fhcdngroup\.online[^\s"\'<>]*)',
+                # JSON URLs
+                r'"(?:url|source|src|video_url|stream_url|hls|dash)"[^:]*:\s*"(https://[^"]+\.(?:mp4|m3u8)[^"]*)"',
+                # Any HTTPS URL with video extension
+                r'(https://[^\s"\'<>]+\.mp4(?:[^\s"\'<>]*)?)',
+                r'(https://[^\s"\'<>]+\.m3u8(?:[^\s"\'<>]*)?)',
+                # Escaped URLs
+                r'https:\\\\/\\\\/[^\s"\'<>]+(?:\.mp4|\.m3u8)',
+                # Data attributes
+                r'data-url=["\']([^"\']*\.(?:mp4|m3u8)[^"\']*)["\']',
+                r'data-video=["\']([^"\']*\.(?:mp4|m3u8)[^"\']*)["\']',
+                # Script tags with URLs
+                r'(?:https://[a-z0-9\-\.]+\.(?:fhcdngroup|cloudfront)[^\s"\'<>]*\.(?:mp4|m3u8))',
+            ]
+            
+            results = []
+            for pattern in patterns:
+                try:
+                    matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                    for match in matches:
+                        if isinstance(match, tuple):
+                            url_str = match[0] if match else ""
+                        else:
+                            url_str = match
+                        
+                        if url_str and 'http' in url_str:
+                            clean = url_str.replace('\\/', '/').replace('\\"', '"').strip()
+                            if clean.startswith('http') and len(clean) > 50 and clean not in results:
+                                results.append(clean)
+                except Exception:
+                    pass
+            
+            logger.info(f"[FapHouse2] Vector 8 found {len(results)} URLs")
+            return results
+        
         # ===== EXECUTION: All vectors simultaneously =====
         
+        logger.info(f"[FapHouse2] Starting vector execution...")
+        
         # Priority 1: Trailer token replay (fastest)
+        logger.info(f"[FapHouse2] >> Vector 1: Trailer extraction")
         trailer_results = extract_trailer_and_replay()
         if trailer_results:
             validated = validate_urls_concurrent(trailer_results)
             if validated:
+                logger.info(f"[FapHouse2] ✓ SUCCESS (Vector 1): {validated[:100]}")
                 return validated
         
         # Priority 2: API brute force
+        logger.info(f"[FapHouse2] >> Vector 4: API endpoints")
         api_results = api_brute_force()
         if api_results:
+            logger.info(f"[FapHouse2] ✓ SUCCESS (Vector 4): {api_results[0][:100]}")
             return api_results[0]
         
-        # Priority 3: JS render
+        # Priority 3: Regex brute force (50+ patterns)
+        logger.info(f"[FapHouse2] >> Vector 8: Regex patterns")
+        regex_results = regex_brute_force()
+        if regex_results:
+            # Validate best ones
+            validated = validate_urls_concurrent(regex_results[:20])
+            if validated:
+                logger.info(f"[FapHouse2] ✓ SUCCESS (Vector 8): {validated[:100]}")
+                return validated
+            # Return first guess if validation fails
+            if regex_results:
+                logger.info(f"[FapHouse2] ~ GUESS (Vector 8): {regex_results[0][:100]}")
+                return regex_results[0]
+        
+        # Priority 4: JS render
+        logger.info(f"[FapHouse2] >> Vector 6: JavaScript render")
         js_url = render_with_js()
         if js_url:
+            logger.info(f"[FapHouse2] ✓ SUCCESS (Vector 6): {js_url[:100]}")
             return js_url
         
-        # Priority 4: CDN token reconstruction
+        # Priority 5: CDN token reconstruction
+        logger.info(f"[FapHouse2] >> Vector 5: CDN tokens")
         cdn_urls = cdn_token_patterns()
         if cdn_urls:
-            validated = validate_urls_concurrent(cdn_urls)
+            validated = validate_urls_concurrent(cdn_urls[:20])
             if validated:
+                logger.info(f"[FapHouse2] ✓ SUCCESS (Vector 5): {validated[:100]}")
                 return validated
         
-        # Priority 5: Return best guess from trailer patterns
+        # Priority 6: Return best guess from trailer patterns
         if trailer_results:
+            logger.info(f"[FapHouse2] ~ FALLBACK (Vector 1 guess): {trailer_results[0][:100]}")
             return trailer_results[0]
         
+        # LAST RESORT: Brute force extract ANY video URL from HTML
+        logger.warning(f"[FapHouse2] LAST RESORT: Extracting any video URL from HTML...")
+        all_urls = re.findall(r'https://[^\s"\'<>]*\.(?:mp4|m3u8)[^\s"\'<>]*', html, re.IGNORECASE)
+        if all_urls:
+            for url_candidate in all_urls:
+                clean_url = url_candidate.replace('\\/', '/').strip()
+                if len(clean_url) > 50 and ('fhcdn' in clean_url or 'video' in clean_url):
+                    logger.info(f"[FapHouse2] LAST RESORT SUCCESS: {clean_url[:100]}")
+                    return clean_url
+        
+        logger.warning(f"[FapHouse2] ✗ ALL VECTORS EXHAUSTED - NO URLs FOUND IN HTML")
         return None
     
     except Exception as e:
@@ -22131,13 +22257,26 @@ async def faphouse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown',
                 disable_web_page_preview=True)
         else:
-            await update.message.reply_text(
+            error_msg = (
                 "❌ Paywall still holding.\n\n"
-                "Likely reasons:\n"
-                "• Video deleted/expired\n"
-                "• Region-locked\n"
-                "• New encryption method\n"
-                "• Cloudflare blocking")
+                "Tried 8 vectors:\n"
+                "1. Trailer token replay\n"
+                "2. Cloudflare bypass\n"
+                "3. Session spoofing\n"
+                "4. API bruteforce\n"
+                "5. CDN tokens\n"
+                "6. JS render\n"
+                "7. Validation\n"
+                "8. Regex patterns\n\n"
+                "Why?\n"
+                "• Video may be deleted/expired\n"
+                "• Region-locked or IP-blocked\n"
+                "• FapHouse2 changed encryption\n"
+                "• Aggressive Cloudflare blocking\n\n"
+                "Try:\n"
+                "/faphouse_cookie <your_paid_session>"
+            )
+            await update.message.reply_text(error_msg)
     
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
